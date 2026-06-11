@@ -89,7 +89,7 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
     let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
     engine.deploy().unwrap();
 
     let calls = runner.display_calls();
@@ -139,7 +139,7 @@ fn failed_healthcheck_aborts_pre_cutover_and_removes_black() {
     let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
     let err = engine.deploy().unwrap_err();
 
     assert_eq!(err.exit_code(), 1); // pre-cutover, red would still be serving
@@ -166,12 +166,12 @@ fn dry_run_executes_no_mutations() {
     let interrupt = Interrupt::inert();
 
     let mut engine = Engine::new(
-        &cfg,
+        cfg.clone(),
         &runner,
         &fs,
         &clock,
         &reporter,
-        &redactor,
+        redactor.clone(),
         &interrupt,
         State::default(),
         Options {
@@ -210,7 +210,7 @@ fn rollback_deploys_previous_image_without_migrations() {
         st.current = Some("demo-app-2".into());
     }
 
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
     engine.rollback().unwrap();
 
     let calls = runner.display_calls();
@@ -245,7 +245,7 @@ fn resume_runs_only_post_cutover_steps() {
         st.current = Some("demo-app-prev".into());
     }
 
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
     engine.resume().unwrap();
 
     let calls = runner.display_calls();
@@ -276,7 +276,7 @@ fn cutover_persists_pending_to_disk_enabling_resume_after_exit4() {
             "demo-app-7000 migrate after",
             CmdOutput { code: 1, stdout: String::new(), stderr: "boom".into() },
         );
-    let mut e1 = Engine::new(&cfg, &runner1, &fs, &clock, &reporter, &redactor, &interrupt, State::default(), opts());
+    let mut e1 = Engine::new(cfg.clone(), &runner1, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
     let err = e1.deploy().unwrap_err();
     assert_eq!(err.exit_code(), 4); // post-cutover failure, black is live
 
@@ -288,7 +288,7 @@ fn cutover_persists_pending_to_disk_enabling_resume_after_exit4() {
 
     // A fresh engine resumes from the persisted state and finalizes.
     let runner2 = RecordingRunner::new().with_stdout("list-transports", "async");
-    let mut e2 = Engine::new(&cfg, &runner2, &fs, &clock, &reporter, &redactor, &interrupt, persisted, opts());
+    let mut e2 = Engine::new(cfg.clone(), &runner2, &fs, &clock, &reporter, redactor.clone(), &interrupt, persisted, opts());
     e2.resume().unwrap();
     let calls = runner2.display_calls();
     assert!(calls.iter().any(|c| c == "docker exec demo-app-7000 migrate after"));
@@ -308,7 +308,7 @@ fn deploy_refuses_when_a_cutover_pending_exists() {
     let mut state = State::default();
     state.stage_mut("prod").releases.push(release(1, "demo-app-1", "reg:app-1", ReleaseStatus::CutoverPending));
 
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
     let err = engine.deploy().unwrap_err();
     assert_eq!(err.exit_code(), 4);
     assert!(runner.display_calls().is_empty()); // nothing ran
@@ -329,7 +329,7 @@ fn resume_refuses_more_than_one_pending() {
         st.releases.push(release(1, "a", "i1", ReleaseStatus::CutoverPending));
         st.releases.push(release(2, "b", "i2", ReleaseStatus::CutoverPending));
     }
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
     let err = engine.resume().unwrap_err();
     assert_eq!(err.exit_code(), 2);
     assert!(err.to_string().contains("more than one"));
@@ -355,7 +355,7 @@ fn finalize_garbage_collects_evicted_images() {
         st.releases.push(release(5, "demo-app-5", "imgC", ReleaseStatus::Active));
         st.current = Some("demo-app-5".into());
     }
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
     engine.deploy().unwrap();
     let calls = runner.display_calls();
     // after finalize: superseded = img1..img4 + imgC (demo-app-5 demoted); keep 3 -> evict img1,img2
@@ -376,7 +376,7 @@ fn infra_drains_workers_before_recreating_db_and_waits_after() {
     let reporter = Reporter::capture(Mode::Plain);
     let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
     engine.deploy().unwrap();
     let calls = runner.display_calls();
     let idx = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap_or(usize::MAX);
@@ -399,7 +399,7 @@ fn secret_value_in_stderr_is_redacted_in_the_error() {
     let reporter = Reporter::capture(Mode::Plain);
     let redactor = Redactor::new(["s3cr3t-token".to_string()]);
     let interrupt = Interrupt::inert();
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
     let err = engine.deploy().unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("***"));
@@ -447,7 +447,7 @@ stages:
     let reporter = Reporter::capture(Mode::Plain);
     let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
     engine.deploy().unwrap();
     let calls = runner.display_calls();
     assert!(!calls.iter().any(|c| c.contains("migrate"))); // no migrate config -> skipped
@@ -476,10 +476,77 @@ fn lua_after_hook_runs_through_the_engine() {
     let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
-    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, State::default(), opts())
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts())
         .with_plugins(&host);
     engine.deploy().unwrap();
 
     // the Lua after_healthcheck hook ran a ctx.in_release command through the engine
     assert!(runner.display_calls().iter().any(|c| c == "docker exec demo-app-1000 sh -c php warmup demo"));
+}
+
+#[test]
+fn plugin_mutating_cfg_changes_engine_behavior() {
+    // before_finalize lowers retention via plain assignment; finalize must honor it.
+    let cfg = cfg();
+    let plugin = r#"
+        before('finalize', function(ctx) ctx.cfg.retention.keep_releases = 1 end)
+    "#;
+    let host = crate::lua::LuaHost::load(&cfg, &[("p".into(), plugin.into())]).unwrap();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let redactor = Redactor::default();
+    let interrupt = Interrupt::inert();
+    let mut state = State::default();
+    {
+        let st = state.stage_mut("prod");
+        for id in 1..=4 {
+            st.releases.push(release(id, &format!("demo-app-{id}"), &format!("img{id}"), ReleaseStatus::Superseded));
+        }
+        st.releases.push(release(5, "demo-app-5", "imgC", ReleaseStatus::Active));
+        st.current = Some("demo-app-5".into());
+    }
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts())
+        .with_plugins(&host);
+    engine.deploy().unwrap();
+    let calls = runner.display_calls();
+    // default keep_releases is 3 (evicts img1,img2); the plugin lowered it to 1, so the
+    // engine now also evicts img3 and img4 — proof the mutation reached the typed config.
+    assert!(calls.iter().any(|c| c == "docker image rm img3"));
+    assert!(calls.iter().any(|c| c == "docker image rm img4"));
+    assert!(!calls.iter().any(|c| c == "docker image rm imgC")); // newest superseded kept
+}
+
+#[test]
+fn plugin_mutating_state_persists_through_the_engine() {
+    // after_cutover stamps the live release via plain assignment; it must reach disk + state.
+    let cfg = cfg();
+    let plugin = r#"
+        after('cutover', function(ctx)
+          ctx.state.releases[#ctx.state.releases].reason = 'plugin-stamped'
+        end)
+    "#;
+    let host = crate::lua::LuaHost::load(&cfg, &[("p".into(), plugin.into())]).unwrap();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let redactor = Redactor::default();
+    let interrupt = Interrupt::inert();
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts())
+        .with_plugins(&host);
+    engine.deploy().unwrap();
+
+    let persisted = State::from_json(&fs.read(std::path::Path::new("./dcd-state.json")).unwrap()).unwrap();
+    assert_eq!(
+        persisted.stage("prod").unwrap().find("demo-app-1000").unwrap().reason.as_deref(),
+        Some("plugin-stamped"),
+    );
+    let prod = engine.into_state();
+    assert_eq!(prod.stage("prod").unwrap().find("demo-app-1000").unwrap().reason.as_deref(), Some("plugin-stamped"));
 }
