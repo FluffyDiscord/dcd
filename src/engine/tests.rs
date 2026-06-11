@@ -456,3 +456,30 @@ stages:
     assert!(calls.iter().any(|c| c.contains("up -d worker-default worker-mail"))); // static workers
     assert!(calls.iter().any(|c| c == "docker exec blogapp-web sh -c wget -qO- http://blogapp-app-1234:9000/up"));
 }
+
+#[test]
+fn lua_after_hook_runs_through_the_engine() {
+    let cfg = cfg();
+    let plugin = r#"
+        task('warmup', function(ctx)
+          ctx.in_release('php warmup ' .. ctx.cfg.project)
+        end)
+        after('healthcheck', 'warmup')
+    "#;
+    let host = crate::lua::LuaHost::load(&cfg, &[("p".into(), plugin.into())]).unwrap();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let redactor = Redactor::default();
+    let interrupt = Interrupt::inert();
+
+    let mut engine = Engine::new(&cfg, &runner, &fs, &clock, &reporter, &redactor, &interrupt, State::default(), opts())
+        .with_plugins(&host);
+    engine.deploy().unwrap();
+
+    // the Lua after_healthcheck hook ran a ctx.in_release command through the engine
+    assert!(runner.display_calls().iter().any(|c| c == "docker exec demo-app-1000 sh -c php warmup demo"));
+}
