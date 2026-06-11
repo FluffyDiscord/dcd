@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::error::{DcdError, Result};
@@ -20,7 +20,7 @@ pub struct Loaded {
     pub redactor: Redactor,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "one")]
@@ -52,11 +52,11 @@ pub struct Config {
     pub hooks: IndexMap<String, Vec<HookAction>>,
     #[serde(default)]
     pub host: Option<String>,
-    #[serde(skip)]
+    #[serde(default, skip_deserializing)]
     pub stage: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compose {
     #[serde(default)]
@@ -67,14 +67,14 @@ pub struct Compose {
     pub env: IndexMap<String, String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preflight {
     #[serde(default)]
     pub directories: Vec<DirSpec>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirSpec {
     pub path: PathBuf,
@@ -84,7 +84,7 @@ pub struct DirSpec {
     pub mode: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
     #[serde(default)]
@@ -98,7 +98,7 @@ pub struct Service {
     pub wait: Option<WaitGate>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Recreate {
     #[default]
@@ -107,7 +107,7 @@ pub enum Recreate {
     Never,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitGate {
     pub exec_in: String,
@@ -118,7 +118,7 @@ pub struct WaitGate {
     pub interval: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
     pub image: String,
@@ -132,7 +132,7 @@ pub struct Release {
     pub drain: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunSpec {
     #[serde(default)]
@@ -145,7 +145,7 @@ pub struct RunSpec {
     pub volumes: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Healthcheck {
     pub exec_in: String,
@@ -156,7 +156,7 @@ pub struct Healthcheck {
     pub interval: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Migrate {
     #[serde(default)]
@@ -165,7 +165,7 @@ pub struct Migrate {
     pub after: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cutover {
     #[serde(default = "upstream_default")]
@@ -180,14 +180,14 @@ pub struct Cutover {
     pub reload: ExecSpec,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecSpec {
     pub exec_in: String,
     pub cmd: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workers {
     #[serde(default = "worker_prefix")]
@@ -202,7 +202,7 @@ pub struct Workers {
     pub template: WorkerTemplate,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerProvider {
     #[serde(default, rename = "static")]
@@ -213,7 +213,7 @@ pub struct WorkerProvider {
     pub exclude: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerTemplate {
     pub image: String,
@@ -231,7 +231,7 @@ pub struct WorkerTemplate {
     pub volumes: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Retention {
     #[serde(default = "three")]
@@ -249,7 +249,7 @@ impl Default for Retention {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum HookAction {
     Run(String),
@@ -261,14 +261,14 @@ pub enum HookAction {
     CpToRelease { cp_to_release: CpSpec },
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecRef {
     pub service: String,
     pub cmd: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CpSpec {
     pub from: String,
@@ -334,8 +334,23 @@ fn de_secs<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = String::deserialize(deserializer)?;
-    parse_secs(&raw).map_err(serde::de::Error::custom)
+    struct SecsVisitor;
+    impl serde::de::Visitor<'_> for SecsVisitor {
+        type Value = u64;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a duration like \"120s\" or a number of seconds")
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> std::result::Result<u64, E> {
+            Ok(value)
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> std::result::Result<u64, E> {
+            Ok(value.max(0) as u64)
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<u64, E> {
+            parse_secs(value).map_err(E::custom)
+        }
+    }
+    deserializer.deserialize_any(SecsVisitor)
 }
 
 fn parse_secs(raw: &str) -> std::result::Result<u64, String> {
@@ -388,8 +403,26 @@ pub fn load(
         serde_yaml::from_value(base).map_err(|e| DcdError::Config(e.to_string()))?;
     config.stage = stage_name;
     validate(&config)?;
-    let redactor = build_redactor(&config, env);
+    let redactor = build_redactor(&config);
     Ok(Loaded { config, redactor })
+}
+
+/// Re-derive a config after the configure hook by applying `path=value` overrides to
+/// the already-resolved config. Serializing the typed config first means every field
+/// (including defaulted ones) is present and `IndexMap` ordering is preserved.
+pub fn reconfigure(config: &Config, overrides: &[String]) -> Result<Loaded> {
+    let mut value = serde_yaml::to_value(config).map_err(|e| DcdError::Config(format!("serialize config: {e}")))?;
+    for assignment in overrides {
+        apply_set(&mut value, assignment)?;
+    }
+    if let Some(map) = value.as_mapping_mut() {
+        map.remove(Value::String("stage".to_string())); // serialized for ctx.cfg, not a load input
+    }
+    let mut adjusted: Config = serde_yaml::from_value(value).map_err(|e| DcdError::Config(e.to_string()))?;
+    adjusted.stage = config.stage.clone();
+    validate(&adjusted)?;
+    let redactor = build_redactor(&adjusted);
+    Ok(Loaded { config: adjusted, redactor })
 }
 
 fn select_stage(stages: Option<Value>, requested: Option<&str>) -> Result<(String, Value)> {
@@ -497,7 +530,7 @@ fn validate(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn build_redactor(config: &Config, _env: &HashMap<String, String>) -> Redactor {
+fn build_redactor(config: &Config) -> Redactor {
     let redact_keys: HashSet<&str> = config.redact.iter().map(String::as_str).collect();
     let mut values = Vec::new();
     let mut scan = |env: &IndexMap<String, String>| {
