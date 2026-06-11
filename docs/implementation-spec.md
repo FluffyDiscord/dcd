@@ -319,29 +319,40 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 | Global | Signature | Effect |
 |--------|-----------|--------|
 | `task(name, fn)` | `(string, function(ctx))` | register/override a task body |
-| `before(task, hook)` | `(string, string\|function)` | run `hook` in the `before_<task>` slot (string = task name; function = anonymous task) |
+| `before(task, hook)` | `(string, string\|function)` | run `hook` in the `before_<task>` slot (string = task name; function = anonymous) |
 | `after(task, hook)` | `(string, string\|function)` | run `hook` in the `after_<task>` slot |
-| `set(key, value)` / `get(key)` | | shared var store overlaying config |
-| `cfg` | read-only table | the resolved config for the active stage |
+| `configure(fn)` | `(function(ctx))` | register the **configure hook** (§6.5): runs once before the recipe to adjust the initial config |
+| `set(key, value)` / `get(key)` | | scratch var store (the same persistent `vars` table seen by `ctx`) |
+| `set_config(path, value)` | `(string, scalar)` | collect a config override (§6.5), applied to the typed config before the deploy |
+| `cfg` | table | the resolved config for the active stage (read; mutate via `set_config` in `configure`) |
 
-`before`/`after` may only target a recipe task or another registered task; a hook referencing an unknown task → load error. Hook slots run in registration order; the engine still runs a cheap cycle check across the resolved before/after edges and errors on a cycle (a hook task that hooks itself).
+`before`/`after` may only target a recipe task or another registered task; a hook referencing an unknown task → run error.
 
-### 6.2 `ctx` (passed to every task body)
+### 6.2 `ctx` (passed to every hook body)
 
-| Method | Effect | Access |
-|--------|--------|--------|
-| `ctx.run(cmd, opts?)` | shell on host in `deploy_root`; nonzero → error unless `opts.check=false`; returns `{stdout, stderr, code}` | Mutate (unless `opts.read=true`) |
-| `ctx.docker(...args)` | `docker <args>` | per §2.4 |
-| `ctx.compose(...args)` | `docker compose -p {project} --env-file {env_file} -f {files…} <args>` (always fully-qualified) | Mutate |
-| `ctx.in_release(cmd)` | `docker exec {black} sh -c '<cmd>'` | Mutate |
-| `ctx.exec_in(service, cmd)` | `docker exec {service_container} sh -c '<cmd>'` | Mutate |
-| `ctx.cp_from_release(src,dst)` / `ctx.cp_to_release(src,dst)` | `docker cp` to/from black | Mutate |
-| `ctx.log(msg)` / `ctx.warn(msg)` | reporter event | — |
-| `ctx.cfg` / `ctx.get(k)` / `ctx.set(k,v)` | config/var access | — |
-| `ctx.release` | `{ id, container, image, images }` — `images` = map of all resolved tags; id sampled at plan start | — |
-| `ctx.stage` | stage name | — |
+**Effects** (engine-routed → dry-run-safe + redacted; all `Mutate` per §2.4 unless noted):
 
-**Dry-run honesty (Clarity):** a Lua task that branches on `ctx.run(...).stdout` in dry-run gets the empty-output path; the host **cannot** introspect the branch. So in dry-run every `ctx.run` (and the dynamic worker provider) emits a `⚠ data-dependent; live result unknown` event at the call site — the printed plan is explicitly marked as the empty-output projection, not "the real plan". This limitation is stated, not hidden.
+| Method | Effect |
+|--------|--------|
+| `ctx.run(cmd)` | shell on host in `deploy_root`; returns stdout |
+| `ctx.in_release(cmd)` | `docker exec {black} sh -c '<cmd>'`; returns stdout |
+| `ctx.exec_in(service, cmd)` | `docker exec {service} sh -c '<cmd>'`; returns stdout |
+| `ctx.docker(args)` / `ctx.compose(args)` | `docker <args>` / fully-qualified `docker compose … <args>`; returns stdout |
+| `ctx.cp_from_release(src,dst)` / `ctx.cp_to_release(src,dst)` | `docker cp` to/from black |
+| `ctx.read_file(path)` / `ctx.write_file(path, s)` / `ctx.file_exists(path)` | via the fs seam (`write` dry-run-safe; `read`/`exists` execute) |
+| `ctx.env(name)` | process env var → string or nil |
+
+**Utilities** (pure): `ctx.json_decode(s)` / `ctx.json_encode(v)` / `ctx.yaml_decode(s)` / `ctx.yaml_encode(v)`, `ctx.log(msg)` / `ctx.warn(msg)`.
+
+**Debug:** `ctx.inspect(v)` → pretty YAML string; `ctx.dump(v?)` → logs `v` (or, with no arg, `cfg`+`state`) as formatted YAML.
+
+**Data:** `ctx.cfg` (resolved config, read), `ctx.state` (`{current, releases:[{container,status,app_image,ran_migrations}]}`, read-only snapshot), `ctx.vars` + `ctx.set/get` (a **persistent table shared across all hooks in the run** — a write in one hook is visible in the next), `ctx.container`, `ctx.stage`.
+
+**Dry-run honesty (Clarity):** a Lua hook that branches on `ctx.in_release(...)` output gets the stubbed empty result in `--dry-run` (the black isn't started); the host cannot introspect the branch, so the dynamic worker provider and such data-dependent points emit a `⚠ data-dependent` event rather than a fabricated plan. Pure utilities and `cfg`/`state`/`env`/`read_file` resolve for real in dry-run.
+
+### 6.5 The `configure` hook
+
+Registered with `configure(fn)`; fires **once before the recipe**, with a host offering `run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` (no `in_release`/`docker`/`compose`/`cp_*` — there is no release container yet). It adjusts the initial config by calling `ctx.set_config('dotted.path', value)`; collected overrides are applied to the **typed, fully-defaulted** config (serialized → `apply_set` → re-parsed → re-validated), so any field is settable (even defaulted ones) and `IndexMap` ordering is preserved. The engine then runs against the adjusted config; deploy-time `ctx.cfg` reflects it. Mid-deploy `ctx.cfg` is read-only (the plan is fixed after `configure`); use `ctx.vars` for hook-to-hook scratch state.
 
 ### 6.3 YAML hook actions (zero-Lua path)
 
