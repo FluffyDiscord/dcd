@@ -12,6 +12,7 @@ use crate::config::{Config, HookAction, Recreate};
 use crate::docker::Docker;
 use crate::effects::{Access, Argv, Clock, CommandRunner, FileSystem, RunOpts};
 use crate::error::{DcdError, Result};
+use crate::lua::{HookHost, LuaHost, StateView};
 use crate::redact::Redactor;
 use crate::signal::Interrupt;
 use crate::state::{FinalizeKind, Release, ReleaseStatus, State};
@@ -83,6 +84,7 @@ pub struct Engine<'a> {
     reporter: &'a Reporter,
     redactor: &'a Redactor,
     interrupt: &'a Interrupt,
+    lua: Option<&'a LuaHost>,
     docker: Docker<'a>,
     opts: Options,
 
@@ -124,6 +126,7 @@ impl<'a> Engine<'a> {
             reporter,
             redactor,
             interrupt,
+            lua: None,
             docker: Docker::new(cfg),
             opts,
             deploy_root,
@@ -139,6 +142,11 @@ impl<'a> Engine<'a> {
             post_cutover: false,
             black_started: false,
         }
+    }
+
+    pub fn with_plugins(mut self, lua: &'a LuaHost) -> Self {
+        self.lua = Some(lua);
+        self
     }
 
     pub fn into_state(self) -> State {
@@ -581,11 +589,13 @@ impl<'a> Engine<'a> {
 
 
     fn run_hooks(&self, slot: &str) -> Result<()> {
-        let Some(actions) = self.cfg.hooks.get(slot) else {
-            return Ok(());
-        };
-        for action in actions {
-            self.run_action(action)?;
+        if let Some(actions) = self.cfg.hooks.get(slot) {
+            for action in actions {
+                self.run_action(action)?;
+            }
+        }
+        if let Some(lua) = self.lua {
+            lua.fire(self, slot).map_err(|e| self.classify(self.redactor.apply(&e)))?;
         }
         Ok(())
     }
@@ -841,6 +851,82 @@ impl<'a> Engine<'a> {
         } else {
             DcdError::PreCutover(message)
         }
+    }
+}
+
+impl HookHost for Engine<'_> {
+    fn run_host(&self, cmd: &str) -> std::result::Result<String, String> {
+        let full = format!("cd {} && {}", self.deploy_root.display(), cmd);
+        self.exec(&Argv::of(["sh", "-c", &full]), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+    }
+
+    fn in_release(&self, cmd: &str) -> std::result::Result<String, String> {
+        self.exec(&self.docker.exec_sh(&self.container, cmd), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+    }
+
+    fn exec_in(&self, service: &str, cmd: &str) -> std::result::Result<String, String> {
+        self.exec(&self.docker.exec_sh(service, cmd), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+    }
+
+    fn docker(&self, args: Vec<String>) -> std::result::Result<String, String> {
+        let mut argv = vec!["docker".to_string()];
+        argv.extend(args);
+        self.exec(&Argv(argv), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+    }
+
+    fn compose(&self, args: Vec<String>) -> std::result::Result<String, String> {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.exec(&self.docker.compose(&refs, false), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+    }
+
+    fn cp_from_release(&self, from: &str, to: &str) -> std::result::Result<(), String> {
+        let src = format!("{}:{}", self.container, from);
+        let dst = self.resolve(Path::new(to)).display().to_string();
+        self.exec(&self.docker.cp(&src, &dst), Access::Mutate).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn cp_to_release(&self, from: &str, to: &str) -> std::result::Result<(), String> {
+        let src = self.resolve(Path::new(from)).display().to_string();
+        let dst = format!("{}:{}", self.container, to);
+        self.exec(&self.docker.cp(&src, &dst), Access::Mutate).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+        let resolved = self.resolve(Path::new(path));
+        self.fs.read(&resolved).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| e.to_string())
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> std::result::Result<(), String> {
+        let resolved = self.resolve(Path::new(path));
+        self.fs_write(&resolved, content.as_bytes(), None, "plugin write").map_err(|e| e.to_string())
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.fs.exists(&self.resolve(Path::new(path)))
+    }
+
+    fn env(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
+    fn log(&self, message: &str) {
+        self.reporter.log(message);
+    }
+
+    fn warn(&self, message: &str) {
+        self.reporter.warn(message);
+    }
+
+    fn container(&self) -> String {
+        self.container.clone()
+    }
+
+    fn stage(&self) -> String {
+        self.cfg.stage.clone()
+    }
+
+    fn state_view(&self) -> StateView {
+        StateView::from_stage(self.state.stage(&self.cfg.stage))
     }
 }
 
