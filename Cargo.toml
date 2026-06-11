@@ -1,0 +1,31 @@
+[package]
+name = "dcd"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-downtime red-black Docker deploys from a YAML config, extensible via Lua."
+license = "MIT"
+
+[[bin]]
+name = "dcd"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+indexmap = { version = "2", features = ["serde"] }
+thiserror = "2"
+fs2 = "0.4"
+signal-hook = "0.3"
+gethostname = "0.5"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+insta = { version = "1", features = ["yaml"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
