@@ -2,9 +2,12 @@
 //! hooks at load time; at run time a hook fires with a `ctx`. The `ctx` carries
 //! engine-routed effects (run, in_release, exec_in, docker, compose, cp_*,
 //! read_file, write_file, file_exists, env — all dry-run-safe and redacted),
-//! utilities (json/yaml encode+decode, log, warn), and data (`cfg` and a `vars`
-//! scratch space as persistent tables shared across hooks, plus a `state` snapshot).
-//! All effects go through `ctx`, never raw os/io (sandboxed), so they stay observable.
+//! utilities (json/yaml encode+decode, log, warn, dump, inspect), and data: `cfg`,
+//! `state` and a `vars` scratch space — all persistent tables shared across hooks.
+//! `cfg` and `state` are live: the engine `refresh`es them from the typed config and
+//! deploy state before each hook and reads any direct mutation back, so a plugin
+//! assigning `ctx.cfg.x` / `ctx.state.x` changes the deploy itself. All effects go
+//! through `ctx`, never raw os/io (sandboxed), so they stay observable.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,44 +17,7 @@ use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Table, Value};
 use serde::Serialize;
 
 use crate::config::Config;
-
-#[derive(Serialize)]
-pub struct ReleaseView {
-    pub container: String,
-    pub status: String,
-    pub app_image: Option<String>,
-    pub ran_migrations: bool,
-}
-
-#[derive(Serialize)]
-pub struct StateView {
-    pub current: Option<String>,
-    pub releases: Vec<ReleaseView>,
-}
-
-impl StateView {
-    pub fn from_stage(stage: Option<&crate::state::StageState>) -> StateView {
-        match stage {
-            Some(s) => StateView {
-                current: s.current.clone(),
-                releases: s
-                    .releases
-                    .iter()
-                    .map(|r| ReleaseView {
-                        container: r.container.clone(),
-                        status: format!("{:?}", r.status),
-                        app_image: r.app_image().map(String::from),
-                        ran_migrations: r.ran_migrations,
-                    })
-                    .collect(),
-            },
-            None => StateView {
-                current: None,
-                releases: Vec::new(),
-            },
-        }
-    }
-}
+use crate::state::StageState;
 
 /// What a Lua `ctx` can ask the host to do; implemented by the engine (deploy time)
 /// and a lighter host (configure time).
@@ -71,7 +37,6 @@ pub trait HookHost {
     fn warn(&self, message: &str);
     fn container(&self) -> String;
     fn stage(&self) -> String;
-    fn state_view(&self) -> StateView;
 }
 
 enum HookRef {
@@ -83,8 +48,8 @@ pub struct LuaHost {
     lua: Lua,
     tasks: Rc<RefCell<HashMap<String, RegistryKey>>>,
     hooks: Rc<RefCell<HashMap<String, Vec<HookRef>>>>,
-    overrides: Rc<RefCell<Vec<(String, String)>>>,
     cfg_key: RegistryKey,
+    state_key: RegistryKey,
     vars_key: RegistryKey,
 }
 
@@ -93,13 +58,15 @@ impl LuaHost {
         let lua = Lua::new();
         let cfg_value = to_lua(&lua, config).map_err(|e| format!("config to lua: {e}"))?;
         let cfg_key = lua.create_registry_value(cfg_value).map_err(|e| e.to_string())?;
+        let state = lua.create_table().map_err(|e| e.to_string())?;
+        let state_key = lua.create_registry_value(state).map_err(|e| e.to_string())?;
         let vars = lua.create_table().map_err(|e| e.to_string())?;
         let vars_key = lua.create_registry_value(vars).map_err(|e| e.to_string())?;
         let host = LuaHost {
             tasks: Rc::new(RefCell::new(HashMap::new())),
             hooks: Rc::new(RefCell::new(HashMap::new())),
-            overrides: Rc::new(RefCell::new(Vec::new())),
             cfg_key,
+            state_key,
             vars_key,
             lua,
         };
@@ -118,10 +85,41 @@ impl LuaHost {
         self.hooks.borrow().contains_key(slot)
     }
 
-    /// Overrides collected by `ctx.set_config(path, value)` in the configure hook,
-    /// as `path=value` strings fed back through `load()` so ordering + validation hold.
-    pub fn config_overrides(&self) -> Vec<String> {
-        self.overrides.borrow().iter().map(|(path, value)| format!("{path}={value}")).collect()
+    /// Overwrite the live `cfg` and `state` tables (in place, preserving table identity
+    /// so the global `cfg` and any held references stay valid) from the engine's current
+    /// typed config and stage. Called before each hook so plugins read up-to-date data.
+    pub fn refresh(&self, config: &Config, stage: &StageState) -> Result<(), String> {
+        self.overwrite_table(&self.cfg_key, config).map_err(|e| e.to_string())?;
+        self.overwrite_table(&self.state_key, stage).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The live `cfg` table as YAML, for the engine to read back after a hook may have
+    /// mutated it. Compared against the pre-hook value to detect real changes.
+    pub fn read_cfg(&self) -> Result<serde_yaml::Value, String> {
+        self.read_table(&self.cfg_key)
+    }
+
+    /// The live `state` table as YAML (the current stage's deploy state), read back after
+    /// a hook may have mutated it.
+    pub fn read_state(&self) -> Result<serde_yaml::Value, String> {
+        self.read_table(&self.state_key)
+    }
+
+    fn read_table(&self, key: &RegistryKey) -> Result<serde_yaml::Value, String> {
+        let table: Table = self.lua.registry_value(key).map_err(|e| e.to_string())?;
+        self.lua.from_value(Value::Table(table)).map_err(|e| e.to_string())
+    }
+
+    fn overwrite_table(&self, key: &RegistryKey, value: &impl Serialize) -> mlua::Result<()> {
+        let table: Table = self.lua.registry_value(key)?;
+        if let Value::Table(source) = to_lua(&self.lua, value)? {
+            for pair in source.pairs::<Value, Value>() {
+                let (k, v) = pair?;
+                table.set(k, v)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn fire(&self, host: &dyn HookHost, slot: &str) -> Result<(), String> {
@@ -152,9 +150,8 @@ impl LuaHost {
 
     fn call(&self, host: &dyn HookHost, function: &Function) -> Result<(), String> {
         let cfg: Table = self.lua.registry_value(&self.cfg_key).map_err(|e| e.to_string())?;
+        let state: Table = self.lua.registry_value(&self.state_key).map_err(|e| e.to_string())?;
         let vars: Table = self.lua.registry_value(&self.vars_key).map_err(|e| e.to_string())?;
-        let state = to_lua(&self.lua, &host.state_view()).map_err(|e| e.to_string())?;
-        let overrides = Rc::clone(&self.overrides);
         self.lua
             .scope(|scope| {
                 let ctx = self.lua.create_table()?;
@@ -166,10 +163,6 @@ impl LuaHost {
                 ctx.set("container", host.container())?;
                 ctx.set("stage", host.stage())?;
 
-                ctx.set("set_config", scope.create_function(move |_, (path, value): (String, Value)| {
-                    overrides.borrow_mut().push((path, stringify(&value)));
-                    Ok(())
-                })?)?;
                 ctx.set("inspect", scope.create_function(|lua, value: Value| {
                     let yaml: serde_yaml::Value = lua.from_value(value)?;
                     serde_yaml::to_string(&yaml).map_err(runtime)
@@ -275,15 +268,6 @@ impl LuaHost {
         let getter = vars.clone();
         globals.set("get", self.lua.create_function(move |_, k: String| getter.get::<Value>(k))?)?;
 
-        let overrides = Rc::clone(&self.overrides);
-        globals.set(
-            "set_config",
-            self.lua.create_function(move |_, (path, value): (String, Value)| {
-                overrides.borrow_mut().push((path, stringify(&value)));
-                Ok(())
-            })?,
-        )?;
-
         let hooks = Rc::clone(&self.hooks);
         globals.set(
             "configure",
@@ -296,6 +280,8 @@ impl LuaHost {
 
         let cfg: Table = self.lua.registry_value(&self.cfg_key)?;
         globals.set("cfg", cfg)?;
+        let state: Table = self.lua.registry_value(&self.state_key)?;
+        globals.set("state", state)?;
 
         self.sandbox(&globals)?;
         Ok(())
@@ -331,19 +317,11 @@ fn to_lua(lua: &Lua, value: &impl Serialize) -> mlua::Result<Value> {
     lua.to_value_with(value, options)
 }
 
-fn stringify(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
-        Value::Integer(i) => i.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::Boolean(b) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{Release, ReleaseStatus};
+    use indexmap::IndexMap;
     use std::collections::HashMap as Map;
 
     #[derive(Default)]
@@ -403,16 +381,22 @@ mod tests {
         fn stage(&self) -> String {
             "prod".into()
         }
-        fn state_view(&self) -> StateView {
-            StateView {
-                current: Some("black-0".into()),
-                releases: vec![ReleaseView {
-                    container: "black-0".into(),
-                    status: "Active".into(),
-                    app_image: Some("img-0".into()),
-                    ran_migrations: false,
-                }],
-            }
+    }
+
+    fn stage() -> StageState {
+        let mut images = IndexMap::new();
+        images.insert("app".to_string(), "img-0".to_string());
+        StageState {
+            current: Some("black-0".into()),
+            releases: vec![Release {
+                id: 0,
+                container: "black-0".into(),
+                images,
+                created_at: 0,
+                status: ReleaseStatus::Active,
+                ran_migrations: false,
+                reason: None,
+            }],
         }
     }
 
@@ -463,6 +447,7 @@ stages: { prod: {} }
             end)
         "#;
         let host = LuaHost::load(&config(), &[("p".into(), plugin.into())]).unwrap();
+        host.refresh(&config(), &stage()).unwrap();
         let fake = FakeHost::default();
         host.fire(&fake, "after_cutover").unwrap();
         assert_eq!(*fake.calls.borrow(), vec!["run:demo prod black-0".to_string()]);
@@ -482,18 +467,39 @@ stages: { prod: {} }
     }
 
     #[test]
-    fn configure_collects_config_overrides() {
+    fn cfg_mutation_in_hook_flows_back() {
+        // Direct assignment to ctx.cfg is read back as the new typed config — no helper.
         let plugin = r#"
             configure(function(ctx)
               if ctx.cfg.project == 'demo' then
-                ctx.set_config('retention.keep_releases', 7)
+                ctx.cfg.retention.keep_releases = 9
+                ctx.cfg.project = 'renamed'
               end
             end)
         "#;
         let host = LuaHost::load(&config(), &[("p".into(), plugin.into())]).unwrap();
         assert!(host.has_hook("configure"));
+        host.refresh(&config(), &stage()).unwrap();
         host.fire(&FakeHost::default(), "configure").unwrap();
-        assert_eq!(host.config_overrides(), vec!["retention.keep_releases=7".to_string()]);
+        let loaded = crate::config::from_lua_value(host.read_cfg().unwrap(), "prod").unwrap();
+        assert_eq!(loaded.config.retention.keep_releases, 9);
+        assert_eq!(loaded.config.project, "renamed");
+    }
+
+    #[test]
+    fn state_mutation_in_hook_flows_back() {
+        let plugin = r#"
+            after('cutover', function(ctx)
+              ctx.state.current = 'black-1'
+              ctx.state.releases[1].status = 'superseded'
+            end)
+        "#;
+        let host = LuaHost::load(&config(), &[("p".into(), plugin.into())]).unwrap();
+        host.refresh(&config(), &stage()).unwrap();
+        host.fire(&FakeHost::default(), "after_cutover").unwrap();
+        let synced: StageState = serde_yaml::from_value(host.read_state().unwrap()).unwrap();
+        assert_eq!(synced.current.as_deref(), Some("black-1"));
+        assert_eq!(synced.releases[0].status, ReleaseStatus::Superseded);
     }
 
     #[test]
@@ -504,6 +510,7 @@ stages: { prod: {} }
             end)
         "#;
         let host = LuaHost::load(&config(), &[("p".into(), plugin.into())]).unwrap();
+        host.refresh(&config(), &stage()).unwrap();
         let fake = FakeHost::default();
         host.fire(&fake, "after_cutover").unwrap();
         let logged = fake.logs.borrow().join("\n");
