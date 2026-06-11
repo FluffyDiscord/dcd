@@ -20,7 +20,7 @@ pub struct Loaded {
     pub redactor: Redactor,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "one")]
@@ -31,14 +31,14 @@ pub struct Config {
     pub network: String,
     #[serde(default)]
     pub registry: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_map")]
     pub images: IndexMap<String, String>,
     pub compose: Compose,
     #[serde(default)]
     pub redact: Vec<String>,
     #[serde(default)]
     pub preflight: Preflight,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_map")]
     pub services: IndexMap<String, Service>,
     pub release: Release,
     pub cutover: Cutover,
@@ -48,7 +48,7 @@ pub struct Config {
     pub retention: Retention,
     #[serde(default)]
     pub plugins: Vec<PathBuf>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_map")]
     pub hooks: IndexMap<String, Vec<HookAction>>,
     #[serde(default)]
     pub host: Option<String>,
@@ -56,25 +56,25 @@ pub struct Config {
     pub stage: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compose {
     #[serde(default)]
     pub files: Vec<PathBuf>,
     #[serde(default = "compose_env_file")]
     pub env_file: PathBuf,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preflight {
     #[serde(default)]
     pub directories: Vec<DirSpec>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirSpec {
     pub path: PathBuf,
@@ -84,7 +84,7 @@ pub struct DirSpec {
     pub mode: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
     #[serde(default)]
@@ -107,7 +107,7 @@ pub enum Recreate {
     Never,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitGate {
     pub exec_in: String,
@@ -118,7 +118,7 @@ pub struct WaitGate {
     pub interval: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
     pub image: String,
@@ -132,20 +132,20 @@ pub struct Release {
     pub drain: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunSpec {
     #[serde(default)]
     pub network_alias: Option<String>,
     #[serde(default = "unless_stopped")]
     pub restart: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
     #[serde(default)]
     pub volumes: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Healthcheck {
     pub exec_in: String,
@@ -156,7 +156,7 @@ pub struct Healthcheck {
     pub interval: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Migrate {
     #[serde(default)]
@@ -165,7 +165,7 @@ pub struct Migrate {
     pub after: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cutover {
     #[serde(default = "upstream_default")]
@@ -180,14 +180,14 @@ pub struct Cutover {
     pub reload: ExecSpec,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecSpec {
     pub exec_in: String,
     pub cmd: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workers {
     #[serde(default = "worker_prefix")]
@@ -202,7 +202,7 @@ pub struct Workers {
     pub template: WorkerTemplate,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerProvider {
     #[serde(default, rename = "static")]
@@ -213,7 +213,7 @@ pub struct WorkerProvider {
     pub exclude: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerTemplate {
     pub image: String,
@@ -225,13 +225,13 @@ pub struct WorkerTemplate {
     pub stop_grace_period: u64,
     #[serde(default = "unless_stopped")]
     pub restart: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
     #[serde(default)]
     pub volumes: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Retention {
     #[serde(default = "three")]
@@ -249,7 +249,7 @@ impl Default for Retention {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum HookAction {
     Run(String),
@@ -261,14 +261,14 @@ pub enum HookAction {
     CpToRelease { cp_to_release: CpSpec },
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecRef {
     pub service: String,
     pub cmd: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CpSpec {
     pub from: String,
@@ -370,6 +370,38 @@ fn parse_secs(raw: &str) -> std::result::Result<u64, String> {
     s.parse::<u64>().map_err(|_| format!("bad duration `{raw}`"))
 }
 
+/// Deserialize an `IndexMap`, tolerating the empty *sequence* mlua emits for an empty
+/// Lua table. Plain YAML maps and a YAML empty map `{}` deserialize as usual; only an
+/// empty `[]` is coerced to an empty map (a non-empty sequence where a map is expected
+/// is still an error). Needed because direct `ctx.cfg` mutation round-trips through Lua.
+fn de_lenient_map<'de, D, V>(deserializer: D) -> std::result::Result<IndexMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: serde::Deserialize<'de>,
+{
+    struct MapOrEmptySeq<V>(std::marker::PhantomData<V>);
+    impl<'de, V: serde::Deserialize<'de>> serde::de::Visitor<'de> for MapOrEmptySeq<V> {
+        type Value = IndexMap<String, V>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map (or an empty sequence)")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut access: A) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = IndexMap::new();
+            while let Some((key, value)) = access.next_entry::<String, V>()? {
+                out.insert(key, value);
+            }
+            Ok(out)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut access: A) -> std::result::Result<Self::Value, A::Error> {
+            if access.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("expected a map, found a non-empty sequence"));
+            }
+            Ok(IndexMap::new())
+        }
+    }
+    deserializer.deserialize_any(MapOrEmptySeq(std::marker::PhantomData))
+}
+
 pub fn load(
     source: &str,
     requested_stage: Option<&str>,
@@ -407,22 +439,18 @@ pub fn load(
     Ok(Loaded { config, redactor })
 }
 
-/// Re-derive a config after the configure hook by applying `path=value` overrides to
-/// the already-resolved config. Serializing the typed config first means every field
-/// (including defaulted ones) is present and `IndexMap` ordering is preserved.
-pub fn reconfigure(config: &Config, overrides: &[String]) -> Result<Loaded> {
-    let mut value = serde_yaml::to_value(config).map_err(|e| DcdError::Config(format!("serialize config: {e}")))?;
-    for assignment in overrides {
-        apply_set(&mut value, assignment)?;
-    }
+/// Rebuild a typed config from a value produced by a plugin mutating `ctx.cfg` (the live
+/// Lua table read back as YAML). The `stage` key is engine-owned, so it is stripped and
+/// reapplied rather than trusted from Lua; the result is fully validated.
+pub fn from_lua_value(mut value: Value, stage: &str) -> Result<Loaded> {
     if let Some(map) = value.as_mapping_mut() {
-        map.remove(Value::String("stage".to_string())); // serialized for ctx.cfg, not a load input
+        map.remove(Value::String("stage".to_string())); // engine-owned, not plugin-settable
     }
-    let mut adjusted: Config = serde_yaml::from_value(value).map_err(|e| DcdError::Config(e.to_string()))?;
-    adjusted.stage = config.stage.clone();
-    validate(&adjusted)?;
-    let redactor = build_redactor(&adjusted);
-    Ok(Loaded { config: adjusted, redactor })
+    let mut config: Config = serde_yaml::from_value(value).map_err(|e| DcdError::Config(e.to_string()))?;
+    config.stage = stage.to_string();
+    validate(&config)?;
+    let redactor = build_redactor(&config);
+    Ok(Loaded { config, redactor })
 }
 
 fn select_stage(stages: Option<Value>, requested: Option<&str>) -> Result<(String, Value)> {
