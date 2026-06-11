@@ -321,10 +321,9 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 | `task(name, fn)` | `(string, function(ctx))` | register/override a task body |
 | `before(task, hook)` | `(string, string\|function)` | run `hook` in the `before_<task>` slot (string = task name; function = anonymous) |
 | `after(task, hook)` | `(string, string\|function)` | run `hook` in the `after_<task>` slot |
-| `configure(fn)` | `(function(ctx))` | register the **configure hook** (§6.5): runs once before the recipe to adjust the initial config |
+| `configure(fn)` | `(function(ctx))` | register the **configure hook** (§6.5): runs once before the recipe to adjust `cfg` (reads `state`/`env` to decide) |
 | `set(key, value)` / `get(key)` | | scratch var store (the same persistent `vars` table seen by `ctx`) |
-| `set_config(path, value)` | `(string, scalar)` | collect a config override (§6.5), applied to the typed config before the deploy |
-| `cfg` | table | the resolved config for the active stage (read; mutate via `set_config` in `configure`) |
+| `cfg` / `state` | table | the live config / current-stage state — the same **mutable** tables as `ctx.cfg` / `ctx.state` (§6.2) |
 
 `before`/`after` may only target a recipe task or another registered task; a hook referencing an unknown task → run error.
 
@@ -346,13 +345,13 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 
 **Debug:** `ctx.inspect(v)` → pretty YAML string; `ctx.dump(v?)` → logs `v` (or, with no arg, `cfg`+`state`) as formatted YAML.
 
-**Data:** `ctx.cfg` (resolved config, read), `ctx.state` (`{current, releases:[{container,status,app_image,ran_migrations}]}`, read-only snapshot), `ctx.vars` + `ctx.set/get` (a **persistent table shared across all hooks in the run** — a write in one hook is visible in the next), `ctx.container`, `ctx.stage`.
+**Data:** `ctx.cfg` (resolved config) and `ctx.state` (current stage: `{current, releases:[{id,container,status,images,ran_migrations,reason}]}`) are **live, mutable tables** — the engine refreshes them from the typed config/state before each hook and reads any direct assignment back (no setter function), so a plugin mutation changes the deploy: `cfg` for steps not yet run, `state` read back into deploy state and persisted past cutover. Full power — a `state` rewrite can violate the §4.3 invariants the engine relies on. `ctx.vars` + `ctx.set/get` is a **persistent scratch table shared across all hooks in the run** (not part of cfg/state). Plus `ctx.container`, `ctx.stage`. Structural values fixed at deploy start (`images`, container name, `deploy_root`) are snapshots, not re-read.
 
 **Dry-run honesty (Clarity):** a Lua hook that branches on `ctx.in_release(...)` output gets the stubbed empty result in `--dry-run` (the black isn't started); the host cannot introspect the branch, so the dynamic worker provider and such data-dependent points emit a `⚠ data-dependent` event rather than a fabricated plan. Pure utilities and `cfg`/`state`/`env`/`read_file` resolve for real in dry-run.
 
 ### 6.5 The `configure` hook
 
-Registered with `configure(fn)`; fires **once before the recipe**, with a host offering `run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` (no `in_release`/`docker`/`compose`/`cp_*` — there is no release container yet). It adjusts the initial config by calling `ctx.set_config('dotted.path', value)`; collected overrides are applied to the **typed, fully-defaulted** config (serialized → `apply_set` → re-parsed → re-validated), so any field is settable (even defaulted ones) and `IndexMap` ordering is preserved. The engine then runs against the adjusted config; deploy-time `ctx.cfg` reflects it. Mid-deploy `ctx.cfg` is read-only (the plan is fixed after `configure`); use `ctx.vars` for hook-to-hook scratch state.
+Registered with `configure(fn)`; fires **once before the recipe**, with a host offering `run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` (no `in_release`/`docker`/`compose`/`cp_*` — there is no release container yet). It adjusts the initial config by **mutating `ctx.cfg` directly** (`ctx.cfg.retention.keep_releases = 5`); the mutated table is read back, re-parsed and re-validated into the typed config the engine then runs against. The **same live read-back applies to every hook mid-deploy** (§6.2), not just `configure`: a `before_`/`after_` hook may mutate `ctx.cfg` (honored for any step not yet run) or `ctx.state` (read back into deploy state, persisted once past cutover). Implementation: before firing a slot's hooks the engine `refresh`es the `cfg`/`state` tables from the typed values; after, it re-reads them and, if changed, re-parses (`cfg` re-validated; a failure aborts the deploy). The round-trip goes through Lua, so an empty map serializes as an empty table and is parsed back as an empty map (`de_lenient_map`); map ordering (`images`/`env`/`services`) is not guaranteed across a mutated round-trip but does not affect correctness. `ctx.vars` remains for scratch state that is not part of cfg/state.
 
 ### 6.3 YAML hook actions (zero-Lua path)
 
