@@ -12,7 +12,7 @@ use crate::effects::{
 };
 use crate::engine::{Engine, Options, DEPLOY_STEPS};
 use crate::error::{DcdError, Result};
-use crate::lua::{HookHost, LuaHost, StateView};
+use crate::lua::{HookHost, LuaHost};
 use crate::redact::Redactor;
 use crate::signal::Interrupt;
 use crate::state::State;
@@ -104,13 +104,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                 Run::Deploy
             };
             let plugins = load_plugins(&loaded.config)?;
-            let mut lua_host = if plugins.is_empty() {
+            let lua_host = if plugins.is_empty() {
                 None
             } else {
                 Some(LuaHost::load(&loaded.config, &plugins).map_err(DcdError::Lua)?)
             };
             if let Some(host) = &lua_host {
                 if host.has_hook("configure") {
+                    let state = load_state(&loaded.config.deploy_root)?;
+                    let stage = state.stage(&loaded.config.stage).cloned().unwrap_or_default();
+                    host.refresh(&loaded.config, &stage).map_err(DcdError::Lua)?;
+                    let before = host.read_cfg().map_err(DcdError::Lua)?;
                     let configure_host = ConfigureHost {
                         reporter: &reporter,
                         redactor: loaded.redactor.clone(),
@@ -118,10 +122,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                         stage: loaded.config.stage.clone(),
                     };
                     host.fire(&configure_host, "configure").map_err(DcdError::Lua)?;
-                    let overrides = host.config_overrides();
-                    if !overrides.is_empty() {
-                        loaded = config::reconfigure(&loaded.config, &overrides)?;
-                        lua_host = Some(LuaHost::load(&loaded.config, &plugins).map_err(DcdError::Lua)?);
+                    let after = host.read_cfg().map_err(DcdError::Lua)?;
+                    if after != before {
+                        loaded = config::from_lua_value(after, &loaded.config.stage)?;
                     }
                 }
             }
@@ -165,7 +168,7 @@ fn execute(loaded: &Loaded, cli: &Cli, reporter: &Reporter, run: Run, lua: Optio
     };
     let fs = SystemFs;
 
-    let mut engine = Engine::new(cfg, runner.as_ref(), &fs, &clock, reporter, &loaded.redactor, &interrupt, state, opts);
+    let mut engine = Engine::new(loaded.config.clone(), runner.as_ref(), &fs, &clock, reporter, loaded.redactor.clone(), &interrupt, state, opts);
     if let Some(host) = lua {
         engine = engine.with_plugins(host);
     }
@@ -406,10 +409,6 @@ impl HookHost for ConfigureHost<'_> {
     fn stage(&self) -> String {
         self.stage.clone()
     }
-    fn state_view(&self) -> StateView {
-        let state = load_state(&self.deploy_root).unwrap_or_default();
-        StateView::from_stage(state.stage(&self.stage))
-    }
 }
 
 const SCAFFOLD: &str = r#"version: 1
@@ -462,15 +461,17 @@ stages:
 
 const PLUGIN_STUB: &str = r#"-- Plugins (loaded at startup) register tasks and hooks.
 --
--- Adjust the config before the deploy, based on runtime truths:
+-- Adjust the config before the deploy, based on runtime truths. cfg is mutable: just
+-- assign to it — the change flows back into the deploy (no helper function):
 -- configure(function(ctx)
---   if ctx.env('CANARY') == '1' then ctx.set_config('retention.keep_releases', 5) end
+--   if ctx.env('CANARY') == '1' then ctx.cfg.retention.keep_releases = 5 end
 -- end)
 --
 -- ctx available inside hooks:
 --   effects: run, in_release, exec_in, docker, compose, cp_from_release, cp_to_release
 --   files:   read_file, write_file, file_exists, env
---   data:    cfg (parsed config), state (current + history), vars (scratch, shared across hooks)
+--   data:    cfg (config) and state (current + history) are LIVE — assign to them and the
+--            engine reads it back; vars is scratch shared across hooks
 --   utils:   json_decode/encode, yaml_decode/encode, log, warn, dump, inspect
 --
 -- task('myapp:warmup', function(ctx)
