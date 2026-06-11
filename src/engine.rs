@@ -12,7 +12,7 @@ use crate::config::{Config, HookAction, Recreate};
 use crate::docker::Docker;
 use crate::effects::{Access, Argv, Clock, CommandRunner, FileSystem, RunOpts};
 use crate::error::{DcdError, Result};
-use crate::lua::{HookHost, LuaHost, StateView};
+use crate::lua::{HookHost, LuaHost};
 use crate::redact::Redactor;
 use crate::signal::Interrupt;
 use crate::state::{FinalizeKind, Release, ReleaseStatus, State};
@@ -77,15 +77,14 @@ impl Default for Options {
 }
 
 pub struct Engine<'a> {
-    cfg: &'a Config,
+    cfg: Config,
     runner: &'a dyn CommandRunner,
     fs: &'a dyn FileSystem,
     clock: &'a dyn Clock,
     reporter: &'a Reporter,
-    redactor: &'a Redactor,
+    redactor: Redactor,
     interrupt: &'a Interrupt,
     lua: Option<&'a LuaHost>,
-    docker: Docker<'a>,
     opts: Options,
 
     deploy_root: PathBuf,
@@ -106,12 +105,12 @@ pub struct Engine<'a> {
 impl<'a> Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cfg: &'a Config,
+        cfg: Config,
         runner: &'a dyn CommandRunner,
         fs: &'a dyn FileSystem,
         clock: &'a dyn Clock,
         reporter: &'a Reporter,
-        redactor: &'a Redactor,
+        redactor: Redactor,
         interrupt: &'a Interrupt,
         state: State,
         opts: Options,
@@ -127,7 +126,6 @@ impl<'a> Engine<'a> {
             redactor,
             interrupt,
             lua: None,
-            docker: Docker::new(cfg),
             opts,
             deploy_root,
             state_path,
@@ -151,6 +149,12 @@ impl<'a> Engine<'a> {
 
     pub fn into_state(self) -> State {
         self.state
+    }
+
+    /// Built on demand (not stored) so it always reflects the current `cfg`, which a
+    /// plugin can mutate between steps.
+    fn docker(&self) -> Docker<'_> {
+        Docker::new(&self.cfg)
     }
 
     fn full_ref(&self, tag: &str) -> String {
@@ -214,7 +218,7 @@ impl<'a> Engine<'a> {
             }
             let inspect = Argv::of(["docker", "image", "inspect", tag]);
             if !self.try_run(&inspect, Access::Read)?.success() {
-                let pull = self.docker.pull(tag);
+                let pull = self.docker().pull(tag);
                 if !self.try_run(&pull, Access::Mutate)?.success() {
                     return Err(DcdError::PreCutover(format!("target image {tag} not present and not pullable")));
                 }
@@ -266,7 +270,7 @@ impl<'a> Engine<'a> {
 
     fn run_step(&mut self, name: &str) -> Result<()> {
         let key = name.replace(':', "_");
-        self.run_hooks(&format!("before_{key}"))?;
+        self.fire_hooks(&format!("before_{key}"))?;
         let started = Instant::now();
         let outcome = self.dispatch(name)?;
         let ms = started.elapsed().as_millis() as u64;
@@ -274,7 +278,7 @@ impl<'a> Engine<'a> {
             Outcome::Done(detail) => self.reporter.task(name, Status::Ok, ms, detail.as_deref()),
             Outcome::Skipped => self.reporter.task(name, Status::Skip, ms, None),
         }
-        self.run_hooks(&format!("after_{key}"))?;
+        self.fire_hooks(&format!("after_{key}"))?;
         Ok(())
     }
 
@@ -298,9 +302,9 @@ impl<'a> Engine<'a> {
 
 
     fn preflight(&mut self) -> Result<Outcome> {
-        let inspect = self.docker.network_inspect();
+        let inspect = self.docker().network_inspect();
         if !self.read(&inspect)?.success() {
-            let create = self.docker.network_create();
+            let create = self.docker().network_create();
             self.exec(&create, Access::Mutate)?;
         }
         let dirs = self.cfg.preflight.directories.iter().map(|d| (d.path.clone(), d.owner.clone())).collect::<Vec<_>>();
@@ -323,7 +327,7 @@ impl<'a> Engine<'a> {
         let current = self.stage().and_then(|s| s.current.clone());
         let dead = match &current {
             Some(container) => {
-                let argv = self.docker.is_running(container);
+                let argv = self.docker().is_running(container);
                 self.read(&argv)?.stdout.trim().is_empty()
             }
             None => true,
@@ -343,7 +347,7 @@ impl<'a> Engine<'a> {
 
     fn pull(&mut self) -> Result<Outcome> {
         let app = self.images.get("app").cloned().unwrap_or_default();
-        let pull_app = self.docker.pull(&app);
+        let pull_app = self.docker().pull(&app);
         self.exec(&pull_app, Access::Mutate)?;
         let managed: Vec<String> = self
             .cfg
@@ -353,7 +357,7 @@ impl<'a> Engine<'a> {
             .filter_map(|logical| self.images.get(logical).cloned())
             .collect();
         for tag in managed {
-            let argv = self.docker.pull(&tag);
+            let argv = self.docker().pull(&tag);
             self.exec(&argv, Access::Mutate)?;
         }
         Ok(Outcome::Done(None))
@@ -372,7 +376,7 @@ impl<'a> Engine<'a> {
                 Recreate::Always => true,
                 Recreate::Never => false,
                 Recreate::OnImageChange => {
-                    let inspect = self.docker.inspect_image(&container);
+                    let inspect = self.docker().inspect_image(&container);
                     let current = self.read(&inspect)?;
                     let current_image = current.stdout.trim();
                     desired.as_deref().map(|d| d != current_image).unwrap_or(false)
@@ -383,9 +387,9 @@ impl<'a> Engine<'a> {
                 self.drain_workers()?;
             }
             let argv = if needs_recreate {
-                self.docker.compose(&["up", "-d", name], false)
+                self.docker().compose(&["up", "-d", name], false)
             } else {
-                self.docker.compose(&["up", "-d", "--no-recreate", name], false)
+                self.docker().compose(&["up", "-d", "--no-recreate", name], false)
             };
             self.exec(&argv, Access::Mutate)?;
         }
@@ -399,7 +403,7 @@ impl<'a> Engine<'a> {
             let cmd = wait.cmd.clone();
             let retries = wait.retries;
             let interval = wait.interval;
-            let argv = self.docker.exec_sh(&exec_in, &cmd);
+            let argv = self.docker().exec_sh(&exec_in, &cmd);
             self.poll(&argv, Access::Read, retries, interval, &format!("{name} not ready"))?;
         }
         Ok(Outcome::Done(None))
@@ -412,18 +416,18 @@ impl<'a> Engine<'a> {
         let name = format!("{}-migrate-{}", self.cfg.project, self.release_id);
         let app = self.images.get("app").cloned().unwrap_or_default();
         let args: Vec<String> = command.split_whitespace().map(String::from).collect();
-        let argv = self.docker.run_throwaway(&name, &app, &args);
+        let argv = self.docker().run_throwaway(&name, &app, &args);
         self.exec(&argv, Access::Mutate)?;
         Ok(Outcome::Done(None))
     }
 
     fn start_black(&mut self) -> Result<Outcome> {
-        let exists = self.docker.ps_names(&self.container, true);
+        let exists = self.docker().ps_names(&self.container, true);
         if !self.read(&exists)?.stdout.trim().is_empty() {
             return Err(DcdError::PreCutover(format!("container {} already exists", self.container)));
         }
         let app = self.images.get("app").cloned().unwrap_or_default();
-        let argv = self.docker.run_black(&self.container, &app);
+        let argv = self.docker().run_black(&self.container, &app);
         self.exec(&argv, Access::Mutate)?;
         self.black_started = true;
         Ok(Outcome::Done(Some(self.container.clone())))
@@ -435,7 +439,7 @@ impl<'a> Engine<'a> {
         let exec_in = hc.exec_in.clone();
         let retries = hc.retries;
         let interval = hc.interval;
-        let argv = self.docker.exec_sh(&exec_in, &cmd);
+        let argv = self.docker().exec_sh(&exec_in, &cmd);
         let mut last_stderr = String::new();
         for attempt in 1..=retries {
             if self.interrupt.triggered() {
@@ -465,7 +469,7 @@ impl<'a> Engine<'a> {
         self.fs_write(&upstream, rendered.as_bytes(), None, "upstream cutover")?;
 
         if let Some(validate) = &self.cfg.cutover.validate {
-            let argv = self.docker.exec_sh(&validate.exec_in, &validate.cmd);
+            let argv = self.docker().exec_sh(&validate.exec_in, &validate.cmd);
             let out = self.try_run(&argv, Access::Mutate)?;
             if !out.success() {
                 self.restore_upstream(&upstream, previous);
@@ -476,7 +480,7 @@ impl<'a> Engine<'a> {
             }
         }
 
-        let reload = self.docker.exec_sh(&self.cfg.cutover.reload.exec_in, &self.cfg.cutover.reload.cmd);
+        let reload = self.docker().exec_sh(&self.cfg.cutover.reload.exec_in, &self.cfg.cutover.reload.cmd);
         let out = self.try_run(&reload, Access::Mutate)?;
         if !out.success() {
             self.restore_upstream(&upstream, previous);
@@ -504,7 +508,7 @@ impl<'a> Engine<'a> {
 
     fn drain_red(&mut self) -> Result<Outcome> {
         let prefix = format!("{}-", self.cfg.release.container_prefix);
-        let argv = self.docker.ps_names(&prefix, false);
+        let argv = self.docker().ps_names(&prefix, false);
         let running = self.read(&argv)?.stdout;
         let drain_cmd = self.cfg.release.drain.clone();
         let targets: Vec<String> = running
@@ -515,10 +519,10 @@ impl<'a> Engine<'a> {
             .collect();
         for target in targets {
             if let Some(cmd) = &drain_cmd {
-                let drain = self.docker.exec_sh(&target, cmd);
+                let drain = self.docker().exec_sh(&target, cmd);
                 let _ = self.try_run(&drain, Access::Mutate);
             }
-            let rm = self.docker.rm_f(&target);
+            let rm = self.docker().rm_f(&target);
             let _ = self.try_run(&rm, Access::Mutate);
         }
         if !self.drained {
@@ -532,7 +536,7 @@ impl<'a> Engine<'a> {
             return Ok(Outcome::Skipped);
         };
         let args: Vec<String> = command.split_whitespace().map(String::from).collect();
-        let argv = self.docker.exec_args(&self.container, &args);
+        let argv = self.docker().exec_args(&self.container, &args);
         self.exec(&argv, Access::Mutate)?;
         Ok(Outcome::Done(None))
     }
@@ -553,7 +557,7 @@ impl<'a> Engine<'a> {
             args.push(format!("{}{}", workers.name_filter, name));
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let argv = self.docker.compose(&arg_refs, true);
+        let argv = self.docker().compose(&arg_refs, true);
         self.exec(&argv, Access::Mutate)?;
         Ok(Outcome::Done(Some(format!("{} worker(s)", names.len()))))
     }
@@ -577,25 +581,63 @@ impl<'a> Engine<'a> {
             .unwrap_or_default();
         self.persist_state()?;
         for container in &evictions {
-            let rm = self.docker.rm_f(container);
+            let rm = self.docker().rm_f(container);
             let _ = self.try_run(&rm, Access::Mutate);
         }
         for image in &images {
-            let rm = self.docker.image_rm(image);
+            let rm = self.docker().image_rm(image);
             let _ = self.try_run(&rm, Access::Mutate);
         }
         Ok(Outcome::Done(Some(format!("current = {}", self.container))))
     }
 
 
-    fn run_hooks(&self, slot: &str) -> Result<()> {
-        if let Some(actions) = self.cfg.hooks.get(slot) {
-            for action in actions {
-                self.run_action(action)?;
-            }
+    /// Fire a slot's YAML actions, then its Lua hooks. Lua hooks see a `ctx.cfg`/`ctx.state`
+    /// refreshed from the engine's current state; any direct mutation is read back into the
+    /// typed config/state so subsequent steps honor it (plugins get full, transparent power).
+    fn fire_hooks(&mut self, slot: &str) -> Result<()> {
+        for action in self.cfg.hooks.get(slot).into_iter().flatten() {
+            self.run_action(action)?;
         }
-        if let Some(lua) = self.lua {
-            lua.fire(self, slot).map_err(|e| self.classify(self.redactor.apply(&e)))?;
+        let Some(lua) = self.lua else { return Ok(()) };
+        if !lua.has_hook(slot) {
+            return Ok(());
+        }
+        let stage = self.state.stage(&self.cfg.stage).cloned().unwrap_or_default();
+        lua.refresh(&self.cfg, &stage).map_err(|e| self.classify(self.redactor.apply(&e)))?;
+        let cfg_before = lua.read_cfg().map_err(|e| self.classify(e))?;
+        let state_before = lua.read_state().map_err(|e| self.classify(e))?;
+        lua.fire(self, slot).map_err(|e| self.classify(self.redactor.apply(&e)))?;
+        let cfg_after = lua.read_cfg().map_err(|e| self.classify(e))?;
+        let state_after = lua.read_state().map_err(|e| self.classify(e))?;
+        if cfg_after != cfg_before {
+            self.apply_synced_cfg(cfg_after)?;
+        }
+        if state_after != state_before {
+            self.apply_synced_state(state_after)?;
+        }
+        Ok(())
+    }
+
+    /// Adopt a `ctx.cfg` a plugin mutated: re-derive and re-validate the typed config (and
+    /// its redactor) from the live Lua table. A validation failure aborts the deploy.
+    fn apply_synced_cfg(&mut self, value: serde_yaml::Value) -> Result<()> {
+        let loaded = crate::config::from_lua_value(value, &self.cfg.stage)
+            .map_err(|e| self.classify(self.redactor.apply(&e.to_string())))?;
+        self.cfg = loaded.config;
+        self.redactor = loaded.redactor;
+        Ok(())
+    }
+
+    /// Adopt a `ctx.state` a plugin mutated into the current stage. Persisted immediately
+    /// once past cutover so the change survives a crash (matching INV-3).
+    fn apply_synced_state(&mut self, value: serde_yaml::Value) -> Result<()> {
+        let stage: crate::state::StageState =
+            serde_yaml::from_value(value).map_err(|e| self.classify(format!("ctx.state: {e}")))?;
+        let key = self.cfg.stage.clone();
+        *self.state.stage_mut(&key) = stage;
+        if self.post_cutover {
+            self.persist_state()?;
         }
         Ok(())
     }
@@ -607,10 +649,10 @@ impl<'a> Engine<'a> {
                 self.exec(&Argv::of(["sh", "-c", &full]), Access::Mutate)
             }
             HookAction::ExecIn { exec_in } => {
-                self.exec(&self.docker.exec_sh(&exec_in.service, &exec_in.cmd), Access::Mutate)
+                self.exec(&self.docker().exec_sh(&exec_in.service, &exec_in.cmd), Access::Mutate)
             }
             HookAction::ExecInRelease { exec_in_release } => {
-                self.exec(&self.docker.exec_sh(&self.container, exec_in_release), Access::Mutate)
+                self.exec(&self.docker().exec_sh(&self.container, exec_in_release), Access::Mutate)
             }
             HookAction::Docker { docker } => {
                 let mut argv = vec!["docker".to_string()];
@@ -619,17 +661,17 @@ impl<'a> Engine<'a> {
             }
             HookAction::Compose { compose } => {
                 let refs: Vec<&str> = compose.iter().map(String::as_str).collect();
-                self.exec(&self.docker.compose(&refs, false), Access::Mutate)
+                self.exec(&self.docker().compose(&refs, false), Access::Mutate)
             }
             HookAction::CpFromRelease { cp_from_release } => {
                 let src = format!("{}:{}", self.container, cp_from_release.from);
                 let dst = self.resolve(Path::new(&cp_from_release.to)).display().to_string();
-                self.exec(&self.docker.cp(&src, &dst), Access::Mutate)
+                self.exec(&self.docker().cp(&src, &dst), Access::Mutate)
             }
             HookAction::CpToRelease { cp_to_release } => {
                 let src = self.resolve(Path::new(&cp_to_release.from)).display().to_string();
                 let dst = format!("{}:{}", self.container, cp_to_release.to);
-                self.exec(&self.docker.cp(&src, &dst), Access::Mutate)
+                self.exec(&self.docker().cp(&src, &dst), Access::Mutate)
             }
         }
         .map(|_| ())
@@ -652,7 +694,7 @@ impl<'a> Engine<'a> {
                 .warn("worker set is dynamic (provider command); not resolvable in dry-run");
             return Ok(Vec::new());
         }
-        let argv = self.docker.exec_sh(&self.container, command);
+        let argv = self.docker().exec_sh(&self.container, command);
         let out = self.try_run(&argv, Access::Mutate)?;
         Ok(out
             .stdout
@@ -701,7 +743,7 @@ impl<'a> Engine<'a> {
         let name_filter = workers.name_filter.clone();
         let drain_cmd = workers.drain.clone();
         let timeout = workers.stop_timeout;
-        let argv = self.docker.worker_ps_names(&name_filter);
+        let argv = self.docker().worker_ps_names(&name_filter);
         let names: Vec<String> = self
             .read(&argv)?
             .stdout
@@ -716,11 +758,11 @@ impl<'a> Engine<'a> {
         }
         if let Some(cmd) = &drain_cmd {
             for name in &names {
-                let drain = self.docker.exec_sh(name, cmd);
+                let drain = self.docker().exec_sh(name, cmd);
                 let _ = self.try_run(&drain, Access::Mutate);
             }
         }
-        let stop = self.docker.stop(&names, timeout);
+        let stop = self.docker().stop(&names, timeout);
         let _ = self.try_run(&stop, Access::Mutate);
         self.drained = true;
         Ok(())
@@ -728,7 +770,7 @@ impl<'a> Engine<'a> {
 
     fn reap_orphans(&mut self) -> Result<()> {
         let prefix = format!("{}-", self.cfg.release.container_prefix);
-        let argv = self.docker.ps_names(&prefix, true);
+        let argv = self.docker().ps_names(&prefix, true);
         let out = self.read(&argv)?;
         let known: HashSet<String> = self
             .stage()
@@ -742,7 +784,7 @@ impl<'a> Engine<'a> {
             .map(String::from)
             .collect();
         for orphan in orphans {
-            let rm = self.docker.rm_f(&orphan);
+            let rm = self.docker().rm_f(&orphan);
             let _ = self.try_run(&rm, Access::Mutate);
         }
         Ok(())
@@ -771,7 +813,7 @@ impl<'a> Engine<'a> {
 
     fn cleanup_black(&self) {
         if self.black_started {
-            let rm = self.docker.rm_f(&self.container);
+            let rm = self.docker().rm_f(&self.container);
             let _ = self.try_run(&rm, Access::Mutate);
         }
     }
@@ -861,11 +903,11 @@ impl HookHost for Engine<'_> {
     }
 
     fn in_release(&self, cmd: &str) -> std::result::Result<String, String> {
-        self.exec(&self.docker.exec_sh(&self.container, cmd), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+        self.exec(&self.docker().exec_sh(&self.container, cmd), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
     }
 
     fn exec_in(&self, service: &str, cmd: &str) -> std::result::Result<String, String> {
-        self.exec(&self.docker.exec_sh(service, cmd), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+        self.exec(&self.docker().exec_sh(service, cmd), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
     }
 
     fn docker(&self, args: Vec<String>) -> std::result::Result<String, String> {
@@ -876,19 +918,19 @@ impl HookHost for Engine<'_> {
 
     fn compose(&self, args: Vec<String>) -> std::result::Result<String, String> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.exec(&self.docker.compose(&refs, false), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+        self.exec(&self.docker().compose(&refs, false), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
     }
 
     fn cp_from_release(&self, from: &str, to: &str) -> std::result::Result<(), String> {
         let src = format!("{}:{}", self.container, from);
         let dst = self.resolve(Path::new(to)).display().to_string();
-        self.exec(&self.docker.cp(&src, &dst), Access::Mutate).map(|_| ()).map_err(|e| e.to_string())
+        self.exec(&self.docker().cp(&src, &dst), Access::Mutate).map(|_| ()).map_err(|e| e.to_string())
     }
 
     fn cp_to_release(&self, from: &str, to: &str) -> std::result::Result<(), String> {
         let src = self.resolve(Path::new(from)).display().to_string();
         let dst = format!("{}:{}", self.container, to);
-        self.exec(&self.docker.cp(&src, &dst), Access::Mutate).map(|_| ()).map_err(|e| e.to_string())
+        self.exec(&self.docker().cp(&src, &dst), Access::Mutate).map(|_| ()).map_err(|e| e.to_string())
     }
 
     fn read_file(&self, path: &str) -> std::result::Result<String, String> {
@@ -923,10 +965,6 @@ impl HookHost for Engine<'_> {
 
     fn stage(&self) -> String {
         self.cfg.stage.clone()
-    }
-
-    fn state_view(&self) -> StateView {
-        StateView::from_stage(self.state.stage(&self.cfg.stage))
     }
 }
 
