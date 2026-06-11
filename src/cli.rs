@@ -2,14 +2,18 @@
 //! and the engine. Command bodies are thin; the work lives in the typed modules.
 
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
 use crate::config::{self, Loaded};
-use crate::effects::{CommandRunner, DryRunRunner, SystemClock, SystemFs, SystemRunner};
+use crate::effects::{
+    Access, Argv, CommandRunner, DryRunRunner, FileSystem, RunOpts, SystemClock, SystemFs, SystemRunner,
+};
 use crate::engine::{Engine, Options, DEPLOY_STEPS};
 use crate::error::{DcdError, Result};
+use crate::lua::{HookHost, LuaHost, StateView};
+use crate::redact::Redactor;
 use crate::signal::Interrupt;
 use crate::state::State;
 use crate::ui::Reporter;
@@ -89,12 +93,40 @@ fn dispatch(cli: Cli) -> Result<()> {
 
     let source = std::fs::read_to_string(&cli.config)
         .map_err(|e| DcdError::Config(format!("cannot read {}: {e}", cli.config.display())))?;
-    let loaded = config::load(&source, stage_of(&cli.command), &sets, &env)?;
+    let mut loaded = config::load(&source, stage_of(&cli.command), &sets, &env)?;
     let reporter = Reporter::auto(cli.json, loaded.redactor.clone());
 
     match &cli.command {
-        Command::Deploy { .. } => execute(&loaded, &cli, &reporter, Run::Deploy),
-        Command::Rollback { .. } => execute(&loaded, &cli, &reporter, Run::Rollback),
+        Command::Deploy { .. } | Command::Rollback { .. } => {
+            let run = if matches!(cli.command, Command::Rollback { .. }) {
+                Run::Rollback
+            } else {
+                Run::Deploy
+            };
+            let plugins = load_plugins(&loaded.config)?;
+            let mut lua_host = if plugins.is_empty() {
+                None
+            } else {
+                Some(LuaHost::load(&loaded.config, &plugins).map_err(DcdError::Lua)?)
+            };
+            if let Some(host) = &lua_host {
+                if host.has_hook("configure") {
+                    let configure_host = ConfigureHost {
+                        reporter: &reporter,
+                        redactor: loaded.redactor.clone(),
+                        deploy_root: loaded.config.deploy_root.clone(),
+                        stage: loaded.config.stage.clone(),
+                    };
+                    host.fire(&configure_host, "configure").map_err(DcdError::Lua)?;
+                    let overrides = host.config_overrides();
+                    if !overrides.is_empty() {
+                        loaded = config::reconfigure(&loaded.config, &overrides)?;
+                        lua_host = Some(LuaHost::load(&loaded.config, &plugins).map_err(DcdError::Lua)?);
+                    }
+                }
+            }
+            execute(&loaded, &cli, &reporter, run, lua_host.as_ref())
+        }
         Command::Status { .. } => status(&loaded, &reporter),
         Command::Tasks { .. } => tasks(&loaded, &reporter),
         Command::Check { .. } => {
@@ -110,7 +142,7 @@ enum Run {
     Rollback,
 }
 
-fn execute(loaded: &Loaded, cli: &Cli, reporter: &Reporter, run: Run) -> Result<()> {
+fn execute(loaded: &Loaded, cli: &Cli, reporter: &Reporter, run: Run, lua: Option<&LuaHost>) -> Result<()> {
     let cfg = &loaded.config;
     host_guard(cfg)?;
 
@@ -134,6 +166,9 @@ fn execute(loaded: &Loaded, cli: &Cli, reporter: &Reporter, run: Run) -> Result<
     let fs = SystemFs;
 
     let mut engine = Engine::new(cfg, runner.as_ref(), &fs, &clock, reporter, &loaded.redactor, &interrupt, state, opts);
+    if let Some(host) = lua {
+        engine = engine.with_plugins(host);
+    }
 
     match run {
         Run::Deploy if cli.resume => engine.resume(),
@@ -269,6 +304,114 @@ fn hhmmss(epoch: u64) -> String {
     format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
 }
 
+fn load_plugins(cfg: &config::Config) -> Result<Vec<(String, String)>> {
+    let mut plugins = Vec::new();
+    for path in &cfg.plugins {
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            cfg.deploy_root.join(path)
+        };
+        let content = std::fs::read_to_string(&resolved)
+            .map_err(|e| DcdError::Config(format!("cannot read plugin {}: {e}", resolved.display())))?;
+        plugins.push((path.display().to_string(), content));
+    }
+    Ok(plugins)
+}
+
+/// The host backing the `configure` hook — runs before the engine, so it offers
+/// host-level effects (run/files/env) but no release-container operations.
+struct ConfigureHost<'a> {
+    reporter: &'a Reporter,
+    redactor: Redactor,
+    deploy_root: PathBuf,
+    stage: String,
+}
+
+impl ConfigureHost<'_> {
+    fn resolve(&self, path: &str) -> PathBuf {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.deploy_root.join(path)
+        }
+    }
+
+    fn no_container(&self, what: &str) -> String {
+        format!("ctx.{what} is unavailable in the configure hook (no release container yet)")
+    }
+}
+
+impl HookHost for ConfigureHost<'_> {
+    fn run_host(&self, cmd: &str) -> std::result::Result<String, String> {
+        let full = format!("cd {} && {}", self.deploy_root.display(), cmd);
+        SystemRunner
+            .run(&Argv::of(["sh", "-c", &full]), Access::Mutate, &RunOpts::default())
+            .map(|o| o.stdout)
+            .map_err(|e| self.redactor.apply(&e.to_string()))
+    }
+
+    fn in_release(&self, _cmd: &str) -> std::result::Result<String, String> {
+        Err(self.no_container("in_release"))
+    }
+    fn exec_in(&self, service: &str, cmd: &str) -> std::result::Result<String, String> {
+        let argv = Argv::of(["docker", "exec", service, "sh", "-c", cmd]);
+        SystemRunner
+            .run(&argv, Access::Mutate, &RunOpts::default())
+            .map(|o| o.stdout)
+            .map_err(|e| self.redactor.apply(&e.to_string()))
+    }
+    fn docker(&self, args: Vec<String>) -> std::result::Result<String, String> {
+        let mut argv = vec!["docker".to_string()];
+        argv.extend(args);
+        SystemRunner
+            .run(&Argv(argv), Access::Mutate, &RunOpts::default())
+            .map(|o| o.stdout)
+            .map_err(|e| self.redactor.apply(&e.to_string()))
+    }
+    fn compose(&self, _args: Vec<String>) -> std::result::Result<String, String> {
+        Err(self.no_container("compose"))
+    }
+    fn cp_from_release(&self, _from: &str, _to: &str) -> std::result::Result<(), String> {
+        Err(self.no_container("cp_from_release"))
+    }
+    fn cp_to_release(&self, _from: &str, _to: &str) -> std::result::Result<(), String> {
+        Err(self.no_container("cp_to_release"))
+    }
+    fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+        SystemFs
+            .read(&self.resolve(path))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .map_err(|e| e.to_string())
+    }
+    fn write_file(&self, path: &str, content: &str) -> std::result::Result<(), String> {
+        SystemFs.write(&self.resolve(path), content.as_bytes(), None).map_err(|e| e.to_string())
+    }
+    fn file_exists(&self, path: &str) -> bool {
+        SystemFs.exists(&self.resolve(path))
+    }
+    fn env(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+    fn log(&self, message: &str) {
+        self.reporter.log(message);
+    }
+    fn warn(&self, message: &str) {
+        self.reporter.warn(message);
+    }
+    fn container(&self) -> String {
+        String::new()
+    }
+    fn stage(&self) -> String {
+        self.stage.clone()
+    }
+    fn state_view(&self) -> StateView {
+        let state = load_state(&self.deploy_root).unwrap_or_default();
+        StateView::from_stage(state.stage(&self.stage))
+    }
+}
+
 const SCAFFOLD: &str = r#"version: 1
 project: myapp
 network: myapp_net
@@ -317,8 +460,21 @@ stages:
     host: prod.example.internal   # dcd refuses to run on the wrong host
 "#;
 
-const PLUGIN_STUB: &str = r#"-- Custom tasks and hooks (loaded at startup).
+const PLUGIN_STUB: &str = r#"-- Plugins (loaded at startup) register tasks and hooks.
+--
+-- Adjust the config before the deploy, based on runtime truths:
+-- configure(function(ctx)
+--   if ctx.env('CANARY') == '1' then ctx.set_config('retention.keep_releases', 5) end
+-- end)
+--
+-- ctx available inside hooks:
+--   effects: run, in_release, exec_in, docker, compose, cp_from_release, cp_to_release
+--   files:   read_file, write_file, file_exists, env
+--   data:    cfg (parsed config), state (current + history), vars (scratch, shared across hooks)
+--   utils:   json_decode/encode, yaml_decode/encode, log, warn, dump, inspect
+--
 -- task('myapp:warmup', function(ctx)
+--   ctx.log('warming up ' .. ctx.container)
 --   ctx.in_release('php bin/console cache:warmup')
 -- end)
 -- after('healthcheck', 'myapp:warmup')
