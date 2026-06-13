@@ -11,14 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::error::{DcdError, Result};
-use crate::redact::{is_secret_key, Redactor};
 use value_ops::{apply_set, get_sequence, interpolate, merge_value, set_sequence};
-
-#[derive(Debug)]
-pub struct Loaded {
-    pub config: Config,
-    pub redactor: Redactor,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,20 +19,15 @@ pub struct Config {
     #[serde(default = "one")]
     pub version: u32,
     pub project: String,
+    pub network: String,
     #[serde(default = "dot")]
     pub deploy_root: PathBuf,
-    pub network: String,
     #[serde(default)]
     pub registry: Option<String>,
-    #[serde(default, deserialize_with = "de_lenient_map")]
-    pub images: IndexMap<String, String>,
+    pub docker: DockerConfig,
     pub compose: Compose,
     #[serde(default)]
-    pub redact: Vec<String>,
-    #[serde(default)]
-    pub preflight: Preflight,
-    #[serde(default, deserialize_with = "de_lenient_map")]
-    pub services: IndexMap<String, Service>,
+    pub directories: Vec<DirSpec>,
     pub release: Release,
     pub cutover: Cutover,
     #[serde(default)]
@@ -56,6 +44,15 @@ pub struct Config {
     pub stage: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DockerConfig {
+    #[serde(default, deserialize_with = "de_lenient_map")]
+    pub images: IndexMap<String, String>,
+    #[serde(default, deserialize_with = "de_lenient_map")]
+    pub services: IndexMap<String, Service>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compose {
@@ -65,13 +62,6 @@ pub struct Compose {
     pub env_file: PathBuf,
     #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Preflight {
-    #[serde(default)]
-    pub directories: Vec<DirSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,7 +397,7 @@ pub fn load(
     requested_stage: Option<&str>,
     sets: &[String],
     env: &HashMap<String, String>,
-) -> Result<Loaded> {
+) -> Result<Config> {
     let mut doc: Value =
         serde_yaml::from_str(source).map_err(|e| DcdError::Config(format!("parse: {e}")))?;
     interpolate(&mut doc, env)?;
@@ -427,6 +417,10 @@ pub fn load(
         set_sequence(&mut base, &["compose", "files"], combined);
     }
 
+    // Conventional env defaults, so a minimal config can omit them (CI usually sets both).
+    inject_env_default(&mut base, "registry", env, &["REGISTRY", "CI_REGISTRY_IMAGE"]);
+    inject_env_default(&mut base, "deploy_root", env, &["DEPLOY_ROOT"]);
+
     for assignment in sets {
         apply_set(&mut base, assignment)?;
     }
@@ -435,22 +429,35 @@ pub fn load(
         serde_yaml::from_value(base).map_err(|e| DcdError::Config(e.to_string()))?;
     config.stage = stage_name;
     validate(&config)?;
-    let redactor = build_redactor(&config);
-    Ok(Loaded { config, redactor })
+    Ok(config)
+}
+
+/// Set a top-level key from the first env var present, only if the config did not already
+/// provide it — `--set` still wins (it is applied after).
+fn inject_env_default(base: &mut Value, key: &str, env: &HashMap<String, String>, vars: &[&str]) {
+    let Some(map) = base.as_mapping_mut() else { return };
+    if map.contains_key(Value::String(key.to_string())) {
+        return;
+    }
+    for var in vars {
+        if let Some(value) = env.get(*var) {
+            map.insert(Value::String(key.to_string()), Value::String(value.clone()));
+            return;
+        }
+    }
 }
 
 /// Rebuild a typed config from a value produced by a plugin mutating `ctx.cfg` (the live
 /// Lua table read back as YAML). The `stage` key is engine-owned, so it is stripped and
 /// reapplied rather than trusted from Lua; the result is fully validated.
-pub fn from_lua_value(mut value: Value, stage: &str) -> Result<Loaded> {
+pub fn from_lua_value(mut value: Value, stage: &str) -> Result<Config> {
     if let Some(map) = value.as_mapping_mut() {
         map.remove(Value::String("stage".to_string())); // engine-owned, not plugin-settable
     }
     let mut config: Config = serde_yaml::from_value(value).map_err(|e| DcdError::Config(e.to_string()))?;
     config.stage = stage.to_string();
     validate(&config)?;
-    let redactor = build_redactor(&config);
-    Ok(Loaded { config, redactor })
+    Ok(config)
 }
 
 fn select_stage(stages: Option<Value>, requested: Option<&str>) -> Result<(String, Value)> {
@@ -494,20 +501,20 @@ fn validate(config: &Config) -> Result<()> {
         )));
     }
 
-    let images: HashSet<&str> = config.images.keys().map(String::as_str).collect();
+    let images: HashSet<&str> = config.docker.images.keys().map(String::as_str).collect();
     let require_image = |logical: &str, owner: &str| -> Result<()> {
         if images.contains(logical) {
             Ok(())
         } else {
             Err(DcdError::Config(format!(
-                "{owner} references image '{logical}' which is not declared in images:"
+                "{owner} references image '{logical}' which is not declared in docker.images:"
             )))
         }
     };
     require_image(&config.release.image, "release.image")?;
-    for (name, service) in &config.services {
+    for (name, service) in &config.docker.services {
         if let Some(logical) = &service.image {
-            require_image(logical, &format!("services.{name}.image"))?;
+            require_image(logical, &format!("docker.services.{name}.image"))?;
         }
     }
     if let Some(workers) = &config.workers {
@@ -515,6 +522,7 @@ fn validate(config: &Config) -> Result<()> {
     }
 
     let containers: HashSet<&str> = config
+        .docker
         .services
         .values()
         .map(|s| s.container.as_str())
@@ -533,9 +541,9 @@ fn validate(config: &Config) -> Result<()> {
     if let Some(validate) = &config.cutover.validate {
         require_container(&validate.exec_in, "cutover.validate")?;
     }
-    for (name, service) in &config.services {
+    for (name, service) in &config.docker.services {
         if let Some(wait) = &service.wait {
-            require_container(&wait.exec_in, &format!("services.{name}.wait"))?;
+            require_container(&wait.exec_in, &format!("docker.services.{name}.wait"))?;
         }
     }
 
@@ -556,24 +564,6 @@ fn validate(config: &Config) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn build_redactor(config: &Config) -> Redactor {
-    let redact_keys: HashSet<&str> = config.redact.iter().map(String::as_str).collect();
-    let mut values = Vec::new();
-    let mut scan = |env: &IndexMap<String, String>| {
-        for (key, value) in env {
-            if is_secret_key(key) || redact_keys.contains(key.as_str()) {
-                values.push(value.clone());
-            }
-        }
-    };
-    scan(&config.compose.env);
-    scan(&config.release.run.env);
-    if let Some(workers) = &config.workers {
-        scan(&workers.template.env);
-    }
-    Redactor::new(values)
 }
 
 #[cfg(test)]
