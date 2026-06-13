@@ -173,8 +173,11 @@ mod tests {
 version: 1
 project: demo
 network: demo_net
-images:
-  app: app-1
+docker:
+  images:
+    app: app-1
+  services:
+    nginx: { container: demo-nginx, recreate: never }
 compose:
   files: [base.yml, extra.yml]
   env_file: compose.env
@@ -189,14 +192,12 @@ release:
 cutover:
   backend_port: 8080
   reload: { exec_in: demo-nginx, cmd: 'nginx -s reload' }
-services:
-  nginx: { container: demo-nginx, recreate: never }
 workers:
   compose_file: workers.yml
   provider: { static: [async] }
   template: { image: app, entrypoint: [php], command: ['{name}'] }
 "#;
-        crate::config::load(src, None, &[], &HashMap::new()).unwrap().config
+        crate::config::load(src, None, &[], &HashMap::new()).unwrap()
     }
 
     #[test]

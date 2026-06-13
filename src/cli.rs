@@ -6,35 +6,55 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{self, Loaded};
+use crate::config::{self, Config};
 use crate::effects::{
     Access, Argv, CommandRunner, DryRunRunner, FileSystem, RunOpts, SystemClock, SystemFs, SystemRunner,
 };
 use crate::engine::{Engine, Options, DEPLOY_STEPS};
 use crate::error::{DcdError, Result};
 use crate::lua::{HookHost, LuaHost};
-use crate::redact::Redactor;
 use crate::signal::Interrupt;
 use crate::state::State;
 use crate::ui::Reporter;
 
 #[derive(Parser)]
-#[command(name = "dcd", version, about = "Zero-downtime red-black Docker deploys from a YAML config")]
+#[command(
+    name = "dcd",
+    version,
+    about = "Zero-downtime red-black Docker deploys from a YAML config",
+    long_about = "dcd runs a zero-downtime red-black Docker deploy on the server from a \
+dcd.yaml: it builds the new container next to the live one, health-checks it, flips the \
+nginx upstream over to it, then drains the old one.\n\n\
+Author a config with `dcd init`, validate it with `dcd check <stage>`, and preview the \
+exact plan with `dcd deploy <stage> --dry-run` before committing.",
+    after_help = "Config help:\n  \
+docs/examples/all_in_one/dcd.yaml  every field, described, with defaults\n  \
+docs/examples/roadrunner_app/             a real, lean config\n  \
+AGENTS.md                          a guide for authoring one from scratch"
+)]
 pub struct Cli {
+    /// Path to the config file
     #[arg(short, long, global = true, default_value = "dcd.yaml")]
     config: std::path::PathBuf,
+    /// Emit machine-readable JSON events instead of human output
     #[arg(long, global = true)]
     json: bool,
+    /// Print every action without running it (read-only probes still execute)
     #[arg(long, global = true)]
     dry_run: bool,
+    /// With `deploy`: finish an incomplete release that died after cutover
     #[arg(long, global = true)]
     resume: bool,
+    /// Override a config value by dotted path, e.g. retention.keep_releases=5 (repeatable)
     #[arg(long = "set", global = true, value_name = "PATH=VALUE")]
     sets: Vec<String>,
+    /// Override an image tag — sets docker.images.<logical> (repeatable)
     #[arg(long = "image", global = true, value_name = "LOGICAL=TAG")]
     images: Vec<String>,
+    /// Skip confirmation prompts (e.g. for rollback)
     #[arg(short = 'y', long, global = true)]
     yes: bool,
+    /// Record a reason on the release (kept in deploy state)
     #[arg(long, global = true)]
     reason: Option<String>,
     #[command(subcommand)]
@@ -44,19 +64,36 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the red-black deploy (use --resume to recover an incomplete release).
-    Deploy { stage: Option<String> },
+    Deploy {
+        /// Stage to deploy (omit if the config defines exactly one)
+        stage: Option<String>,
+    },
     /// Roll back to the previous release (code only; no migrations).
-    Rollback { stage: Option<String> },
+    Rollback {
+        /// Stage to roll back (omit if the config defines exactly one)
+        stage: Option<String>,
+    },
     /// Show the current release and history.
-    Status { stage: Option<String> },
+    Status {
+        /// Stage to inspect (omit if the config defines exactly one)
+        stage: Option<String>,
+    },
     /// Print the resolved task plan without executing.
-    Tasks { stage: Option<String> },
-    /// Validate the config (and stage merge, interpolation, overrides).
-    Check { stage: Option<String> },
-    /// Scaffold a starter dcd.yaml.
+    Tasks {
+        /// Stage to plan (omit if the config defines exactly one)
+        stage: Option<String>,
+    },
+    /// Validate the config — stage merge, interpolation, overrides, and all rules.
+    Check {
+        /// Stage to validate (omit if the config defines exactly one)
+        stage: Option<String>,
+    },
+    /// Scaffold a starter dcd.yaml (optionally with a Lua plugin stub).
     Init {
+        /// Overwrite an existing dcd.yaml
         #[arg(long)]
         force: bool,
+        /// Also write plugins/app.lua (a commented hook stub)
         #[arg(long)]
         with_plugin: bool,
     },
@@ -88,13 +125,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         let (logical, tag) = image
             .split_once('=')
             .ok_or_else(|| DcdError::Config(format!("--image `{image}` must be logical=tag")))?;
-        sets.push(format!("images.{logical}={tag}"));
+        sets.push(format!("docker.images.{logical}={tag}"));
     }
 
     let source = std::fs::read_to_string(&cli.config)
         .map_err(|e| DcdError::Config(format!("cannot read {}: {e}", cli.config.display())))?;
-    let mut loaded = config::load(&source, stage_of(&cli.command), &sets, &env)?;
-    let reporter = Reporter::auto(cli.json, loaded.redactor.clone());
+    let mut cfg = config::load(&source, stage_of(&cli.command), &sets, &env)?;
+    let reporter = Reporter::auto(cli.json);
 
     match &cli.command {
         Command::Deploy { .. } | Command::Rollback { .. } => {
@@ -103,37 +140,36 @@ fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 Run::Deploy
             };
-            let plugins = load_plugins(&loaded.config)?;
+            let plugins = load_plugins(&cfg)?;
             let lua_host = if plugins.is_empty() {
                 None
             } else {
-                Some(LuaHost::load(&loaded.config, &plugins).map_err(DcdError::Lua)?)
+                Some(LuaHost::load(&cfg, &plugins).map_err(DcdError::Lua)?)
             };
             if let Some(host) = &lua_host {
                 if host.has_hook("configure") {
-                    let state = load_state(&loaded.config.deploy_root)?;
-                    let stage = state.stage(&loaded.config.stage).cloned().unwrap_or_default();
-                    host.refresh(&loaded.config, &stage).map_err(DcdError::Lua)?;
+                    let state = load_state(&cfg.deploy_root)?;
+                    let stage = state.stage(&cfg.stage).cloned().unwrap_or_default();
+                    host.refresh(&cfg, &stage).map_err(DcdError::Lua)?;
                     let before = host.read_cfg().map_err(DcdError::Lua)?;
                     let configure_host = ConfigureHost {
                         reporter: &reporter,
-                        redactor: loaded.redactor.clone(),
-                        deploy_root: loaded.config.deploy_root.clone(),
-                        stage: loaded.config.stage.clone(),
+                        deploy_root: cfg.deploy_root.clone(),
+                        stage: cfg.stage.clone(),
                     };
                     host.fire(&configure_host, "configure").map_err(DcdError::Lua)?;
                     let after = host.read_cfg().map_err(DcdError::Lua)?;
                     if after != before {
-                        loaded = config::from_lua_value(after, &loaded.config.stage)?;
+                        cfg = config::from_lua_value(after, &cfg.stage)?;
                     }
                 }
             }
-            execute(&loaded, &cli, &reporter, run, lua_host.as_ref())
+            execute(&cfg, &cli, &reporter, run, lua_host.as_ref())
         }
-        Command::Status { .. } => status(&loaded, &reporter),
-        Command::Tasks { .. } => tasks(&loaded, &reporter),
+        Command::Status { .. } => status(&cfg, &reporter),
+        Command::Tasks { .. } => tasks(&cfg, &reporter),
         Command::Check { .. } => {
-            reporter.log(&format!("config ok ({} stage '{}')", loaded.config.project, loaded.config.stage));
+            reporter.log(&format!("config ok ({} stage '{}')", cfg.project, cfg.stage));
             Ok(())
         }
         Command::Init { .. } => unreachable!("handled above"),
@@ -145,8 +181,7 @@ enum Run {
     Rollback,
 }
 
-fn execute(loaded: &Loaded, cli: &Cli, reporter: &Reporter, run: Run, lua: Option<&LuaHost>) -> Result<()> {
-    let cfg = &loaded.config;
+fn execute(cfg: &Config, cli: &Cli, reporter: &Reporter, run: Run, lua: Option<&LuaHost>) -> Result<()> {
     host_guard(cfg)?;
 
     let clock = SystemClock;
@@ -168,7 +203,7 @@ fn execute(loaded: &Loaded, cli: &Cli, reporter: &Reporter, run: Run, lua: Optio
     };
     let fs = SystemFs;
 
-    let mut engine = Engine::new(loaded.config.clone(), runner.as_ref(), &fs, &clock, reporter, loaded.redactor.clone(), &interrupt, state, opts);
+    let mut engine = Engine::new(cfg.clone(), runner.as_ref(), &fs, &clock, reporter, &interrupt, state, opts);
     if let Some(host) = lua {
         engine = engine.with_plugins(host);
     }
@@ -185,9 +220,9 @@ fn execute(loaded: &Loaded, cli: &Cli, reporter: &Reporter, run: Run, lua: Optio
     }
 }
 
-fn status(loaded: &Loaded, reporter: &Reporter) -> Result<()> {
-    let state = load_state(&loaded.config.deploy_root)?;
-    let stage = &loaded.config.stage;
+fn status(cfg: &Config, reporter: &Reporter) -> Result<()> {
+    let state = load_state(&cfg.deploy_root)?;
+    let stage = &cfg.stage;
     match state.stage(stage) {
         None => reporter.log(&format!("{stage}: no deploys recorded")),
         Some(s) => {
@@ -213,15 +248,15 @@ fn status(loaded: &Loaded, reporter: &Reporter) -> Result<()> {
     Ok(())
 }
 
-fn tasks(loaded: &Loaded, reporter: &Reporter) -> Result<()> {
-    reporter.log(&format!("plan for {} stage '{}':", loaded.config.project, loaded.config.stage));
+fn tasks(cfg: &Config, reporter: &Reporter) -> Result<()> {
+    reporter.log(&format!("plan for {} stage '{}':", cfg.project, cfg.stage));
     for step in DEPLOY_STEPS {
         let key = step.replace(':', "_");
-        for hook in loaded.config.hooks.get(&format!("before_{key}")).into_iter().flatten() {
+        for hook in cfg.hooks.get(&format!("before_{key}")).into_iter().flatten() {
             reporter.plan(&format!("before {step}: {}", describe_hook(hook)));
         }
         reporter.log(&format!("- {step}"));
-        for hook in loaded.config.hooks.get(&format!("after_{key}")).into_iter().flatten() {
+        for hook in cfg.hooks.get(&format!("after_{key}")).into_iter().flatten() {
             reporter.plan(&format!("after {step}: {}", describe_hook(hook)));
         }
     }
@@ -326,7 +361,6 @@ fn load_plugins(cfg: &config::Config) -> Result<Vec<(String, String)>> {
 /// host-level effects (run/files/env) but no release-container operations.
 struct ConfigureHost<'a> {
     reporter: &'a Reporter,
-    redactor: Redactor,
     deploy_root: PathBuf,
     stage: String,
 }
@@ -352,7 +386,7 @@ impl HookHost for ConfigureHost<'_> {
         SystemRunner
             .run(&Argv::of(["sh", "-c", &full]), Access::Mutate, &RunOpts::default())
             .map(|o| o.stdout)
-            .map_err(|e| self.redactor.apply(&e.to_string()))
+            .map_err(|e| e.to_string())
     }
 
     fn in_release(&self, _cmd: &str) -> std::result::Result<String, String> {
@@ -363,7 +397,7 @@ impl HookHost for ConfigureHost<'_> {
         SystemRunner
             .run(&argv, Access::Mutate, &RunOpts::default())
             .map(|o| o.stdout)
-            .map_err(|e| self.redactor.apply(&e.to_string()))
+            .map_err(|e| e.to_string())
     }
     fn docker(&self, args: Vec<String>) -> std::result::Result<String, String> {
         let mut argv = vec!["docker".to_string()];
@@ -371,7 +405,7 @@ impl HookHost for ConfigureHost<'_> {
         SystemRunner
             .run(&Argv(argv), Access::Mutate, &RunOpts::default())
             .map(|o| o.stdout)
-            .map_err(|e| self.redactor.apply(&e.to_string()))
+            .map_err(|e| e.to_string())
     }
     fn compose(&self, _args: Vec<String>) -> std::result::Result<String, String> {
         Err(self.no_container("compose"))
@@ -414,26 +448,26 @@ impl HookHost for ConfigureHost<'_> {
 const SCAFFOLD: &str = r#"version: 1
 project: myapp
 network: myapp_net
-registry: ${REGISTRY}
+# registry + deploy_root default from $REGISTRY / $CI_REGISTRY_IMAGE and $DEPLOY_ROOT.
 
-# Block style (not flow) is required for ${VAR} values.
-images:
-  app: ${APP_TAG}
+# Images dcd pulls/runs, plus long-lived side containers. Block style for ${VAR} values.
+docker:
+  images:
+    app: ${APP_TAG}
+  services:
+    nginx:
+      image: ~          # pinned in compose; dcd never recreates it
+      container: myapp-nginx
+      recreate: never
+      wait: { exec_in: myapp-nginx, cmd: 'test -f /var/run/nginx.pid', retries: 30 }
 
 compose:
   files: [docker-compose.prod.yml]
-  env_file: compose.env
   env:
     REGISTRY: ${REGISTRY}
     APP_TAG: ${APP_TAG}
 
-services:
-  nginx:
-    image: ~          # upstream image pinned in compose; dcd never recreates it
-    container: myapp-nginx
-    recreate: never
-    wait: { exec_in: myapp-nginx, cmd: 'test -f /var/run/nginx.pid', retries: 30, interval: 1s }
-
+# The app — built, health-checked, then cut over to.
 release:
   image: app
   container_prefix: myapp-app
@@ -443,16 +477,11 @@ release:
   healthcheck:
     exec_in: myapp-nginx
     cmd: 'curl -sf http://{container}:8080/health'   # {container}, never the alias
-    retries: 60
-    interval: 2s
   # migrate: { before: '...', after: '...' }   # optional, expand-contract
 
 cutover:
-  upstream_file: nginx-upstream.conf
   backend_port: 8080
   reload: { exec_in: myapp-nginx, cmd: 'nginx -s reload' }
-
-retention: { keep_releases: 3 }
 
 stages:
   prod:
@@ -498,7 +527,7 @@ mod tests {
     fn scaffold_parses_and_validates() {
         let env: std::collections::HashMap<String, String> =
             [("REGISTRY", "reg"), ("APP_TAG", "t")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        let loaded = config::load(SCAFFOLD, Some("prod"), &[], &env).unwrap();
-        assert_eq!(loaded.config.project, "myapp");
+        let cfg = config::load(SCAFFOLD, Some("prod"), &[], &env).unwrap();
+        assert_eq!(cfg.project, "myapp");
     }
 }
