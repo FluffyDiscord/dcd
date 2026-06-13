@@ -34,16 +34,17 @@ impl Fixture {
             r#"version: 1
 project: {project}
 network: {project}_net
-images:
-  app: nginx:alpine
+docker:
+  images:
+    app: nginx:alpine
+  services:
+    nginx:
+      container: {project}-nginx
+      recreate: never
+      wait: {{ exec_in: {project}-nginx, cmd: 'wget -qO- -T 2 http://localhost/ >/dev/null 2>&1 || true', retries: 10, interval: 1s }}
 compose:
   files: [compose.prod.yml]
   env_file: compose.env
-services:
-  nginx:
-    container: {project}-nginx
-    recreate: never
-    wait: {{ exec_in: {project}-nginx, cmd: 'wget -qO- -T 2 http://localhost/ >/dev/null 2>&1 || true', retries: 10, interval: 1s }}
 release:
   image: app
   container_prefix: {project}-app

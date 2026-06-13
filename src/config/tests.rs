@@ -6,7 +6,6 @@ fn env() -> HashMap<String, String> {
         ("APP_TAG", "app-123"),
         ("DB_TAG", "db-abc"),
         ("DEPLOY_ROOT", "/opt/app"),
-        ("MAXMIND_LICENSE_KEY", "s3cr3t-key"),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -20,24 +19,24 @@ project: demo
 deploy_root: ${DEPLOY_ROOT}
 network: demo_net
 registry: ${REGISTRY}
-images:
-  app: ${APP_TAG}
-  database: ${DB_TAG}
+docker:
+  images:
+    app: ${APP_TAG}
+    database: ${DB_TAG}
+  services:
+    postgres:
+      image: database
+      container: demo-postgres
+      on_recreate_drain_workers: true
+      wait: { exec_in: demo-postgres, cmd: 'pg_isready', retries: 30, interval: 1s }
+    nginx:
+      image: ~
+      container: demo-nginx
+      recreate: never
 compose:
   files: [base.yml]
   env:
     REGISTRY: ${REGISTRY}
-    MAXMIND_LICENSE_KEY: ${MAXMIND_LICENSE_KEY}
-services:
-  postgres:
-    image: database
-    container: demo-postgres
-    on_recreate_drain_workers: true
-    wait: { exec_in: demo-postgres, cmd: 'pg_isready', retries: 30, interval: 1s }
-  nginx:
-    image: ~
-    container: demo-nginx
-    recreate: never
 release:
   image: app
   container_prefix: demo-app
@@ -68,36 +67,60 @@ stages:
 
 #[test]
 fn loads_and_merges_selected_stage() {
-    let loaded = load(sample(), Some("prod"), &[], &env()).unwrap();
-    let c = loaded.config;
+    let c = load(sample(), Some("prod"), &[], &env()).unwrap();
     assert_eq!(c.stage, "prod");
     assert_eq!(c.project, "demo");
     assert_eq!(c.deploy_root, PathBuf::from("/opt/app"));
     assert_eq!(c.registry.as_deref(), Some("reg.example.com/app"));
-    assert_eq!(c.images["app"], "app-123");
+    assert_eq!(c.docker.images["app"], "app-123");
     assert_eq!(c.host.as_deref(), Some("prod.host"));
     assert_eq!(c.retention.keep_releases, 5); // stage override
     assert_eq!(c.compose.env["APP_ENV"], "prod"); // stage env merged in
     assert_eq!(c.compose.env["REGISTRY"], "reg.example.com/app"); // base env kept
     // service order preserved (postgres before nginx)
-    let names: Vec<&str> = c.services.keys().map(String::as_str).collect();
+    let names: Vec<&str> = c.docker.services.keys().map(String::as_str).collect();
     assert_eq!(names, vec!["postgres", "nginx"]);
 }
 
 #[test]
 fn compose_files_append_on_stage() {
-    let beta = load(sample(), Some("beta"), &[], &env()).unwrap().config;
+    let beta = load(sample(), Some("beta"), &[], &env()).unwrap();
     assert_eq!(beta.compose.files, vec![PathBuf::from("base.yml"), PathBuf::from("beta.yml")]);
-    let prod = load(sample(), Some("prod"), &[], &env()).unwrap().config;
+    let prod = load(sample(), Some("prod"), &[], &env()).unwrap();
     assert_eq!(prod.compose.files, vec![PathBuf::from("base.yml")]); // prod adds none
 }
 
 #[test]
 fn set_override_applies_after_interpolation() {
-    let c = load(sample(), Some("prod"), &["retention.keep_releases=9".to_string()], &env())
-        .unwrap()
-        .config;
+    let c = load(sample(), Some("prod"), &["retention.keep_releases=9".to_string()], &env()).unwrap();
     assert_eq!(c.retention.keep_releases, 9);
+}
+
+#[test]
+fn registry_and_deploy_root_default_from_env() {
+    // A config that omits both still resolves them from conventional env vars.
+    let minimal = r#"
+version: 1
+project: demo
+network: demo_net
+docker:
+  images: { app: app-1 }
+  services:
+    nginx: { container: demo-nginx, recreate: never }
+compose: { files: [base.yml] }
+release:
+  image: app
+  container_prefix: demo-app
+  healthcheck: { exec_in: demo-nginx, cmd: 'curl {container}' }
+cutover: { backend_port: 80, reload: { exec_in: demo-nginx, cmd: 'r' } }
+"#;
+    let extra: HashMap<String, String> = [("REGISTRY", "reg.io/app"), ("DEPLOY_ROOT", "/srv/x")]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let c = load(minimal, None, &[], &extra).unwrap();
+    assert_eq!(c.registry.as_deref(), Some("reg.io/app"));
+    assert_eq!(c.deploy_root, PathBuf::from("/srv/x"));
 }
 
 #[test]
@@ -146,16 +169,9 @@ fn ambiguous_and_missing_stage_errors() {
 }
 
 #[test]
-fn redactor_collects_secret_values_by_key() {
-    let loaded = load(sample(), Some("prod"), &[], &env()).unwrap();
-    let masked = loaded.redactor.apply("token=s3cr3t-key in command");
-    assert_eq!(masked, "token=*** in command");
-}
-
-#[test]
 fn durations_parse_suffixes() {
-    let c = load(sample(), Some("prod"), &[], &env()).unwrap().config;
-    let pg = &c.services["postgres"];
+    let c = load(sample(), Some("prod"), &[], &env()).unwrap();
+    let pg = &c.docker.services["postgres"];
     assert_eq!(pg.wait.as_ref().unwrap().interval, 1);
     assert_eq!(c.workers.as_ref().unwrap().stop_timeout, 120); // default 120s
 }

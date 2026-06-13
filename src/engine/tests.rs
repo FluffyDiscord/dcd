@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use super::*;
 use crate::config;
 use crate::effects::{CmdOutput, FixedClock, MemoryFs, RecordingRunner};
-use crate::redact::Redactor;
 use crate::signal::Interrupt;
 use crate::state::{Release, ReleaseStatus, State};
 use crate::ui::{Mode, Reporter};
@@ -29,26 +28,26 @@ version: 1
 project: demo
 network: demo_net
 registry: reg
-images:
-  app: app-1
-  database: db-1
+docker:
+  images:
+    app: app-1
+    database: db-1
+  services:
+    postgres:
+      image: database
+      container: demo-postgres
+      on_recreate_drain_workers: true
+      wait: { exec_in: demo-postgres, cmd: 'pg_isready', retries: 3, interval: 1s }
+    nginx:
+      container: demo-nginx
+      recreate: never
 compose:
   files: [base.yml]
   env_file: compose.env
   env:
     REGISTRY: reg
-preflight:
-  directories:
-    - { path: .docker/logs }
-services:
-  postgres:
-    image: database
-    container: demo-postgres
-    on_recreate_drain_workers: true
-    wait: { exec_in: demo-postgres, cmd: 'pg_isready', retries: 3, interval: 1s }
-  nginx:
-    container: demo-nginx
-    recreate: never
+directories:
+  - { path: .docker/logs }
 release:
   image: app
   container_prefix: demo-app
@@ -66,7 +65,7 @@ workers:
 stages:
   prod: {}
 "#;
-    config::load(src, Some("prod"), &[], &HashMap::new()).unwrap().config
+    config::load(src, Some("prod"), &[], &HashMap::new()).unwrap()
 }
 
 fn opts() -> Options {
@@ -86,10 +85,9 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
     let fs = MemoryFs::new();
     let clock = FixedClock(1000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
     engine.deploy().unwrap();
 
     let calls = runner.display_calls();
@@ -136,10 +134,9 @@ fn failed_healthcheck_aborts_pre_cutover_and_removes_black() {
     let fs = MemoryFs::new();
     let clock = FixedClock(2000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
     let err = engine.deploy().unwrap_err();
 
     assert_eq!(err.exit_code(), 1); // pre-cutover, red would still be serving
@@ -162,7 +159,6 @@ fn dry_run_executes_no_mutations() {
     let fs = MemoryFs::new();
     let clock = FixedClock(3000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
     let mut engine = Engine::new(
@@ -171,7 +167,6 @@ fn dry_run_executes_no_mutations() {
         &fs,
         &clock,
         &reporter,
-        redactor.clone(),
         &interrupt,
         State::default(),
         Options {
@@ -199,7 +194,6 @@ fn rollback_deploys_previous_image_without_migrations() {
     let fs = MemoryFs::new();
     let clock = FixedClock(5000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
     let mut state = State::default();
@@ -210,7 +204,7 @@ fn rollback_deploys_previous_image_without_migrations() {
         st.current = Some("demo-app-2".into());
     }
 
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
     engine.rollback().unwrap();
 
     let calls = runner.display_calls();
@@ -234,7 +228,6 @@ fn resume_runs_only_post_cutover_steps() {
     let fs = MemoryFs::new();
     let clock = FixedClock(6000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
     let mut state = State::default();
@@ -245,7 +238,7 @@ fn resume_runs_only_post_cutover_steps() {
         st.current = Some("demo-app-prev".into());
     }
 
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
     engine.resume().unwrap();
 
     let calls = runner.display_calls();
@@ -266,7 +259,6 @@ fn cutover_persists_pending_to_disk_enabling_resume_after_exit4() {
     let fs = MemoryFs::new();
     let clock = FixedClock(7000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
     // Deploy that fails AFTER cutover (migrate:after errors) -> exit 4.
@@ -276,7 +268,7 @@ fn cutover_persists_pending_to_disk_enabling_resume_after_exit4() {
             "demo-app-7000 migrate after",
             CmdOutput { code: 1, stdout: String::new(), stderr: "boom".into() },
         );
-    let mut e1 = Engine::new(cfg.clone(), &runner1, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
+    let mut e1 = Engine::new(cfg.clone(), &runner1, &fs, &clock, &reporter, &interrupt, State::default(), opts());
     let err = e1.deploy().unwrap_err();
     assert_eq!(err.exit_code(), 4); // post-cutover failure, black is live
 
@@ -288,7 +280,7 @@ fn cutover_persists_pending_to_disk_enabling_resume_after_exit4() {
 
     // A fresh engine resumes from the persisted state and finalizes.
     let runner2 = RecordingRunner::new().with_stdout("list-transports", "async");
-    let mut e2 = Engine::new(cfg.clone(), &runner2, &fs, &clock, &reporter, redactor.clone(), &interrupt, persisted, opts());
+    let mut e2 = Engine::new(cfg.clone(), &runner2, &fs, &clock, &reporter, &interrupt, persisted, opts());
     e2.resume().unwrap();
     let calls = runner2.display_calls();
     assert!(calls.iter().any(|c| c == "docker exec demo-app-7000 migrate after"));
@@ -303,12 +295,11 @@ fn deploy_refuses_when_a_cutover_pending_exists() {
     let fs = MemoryFs::new();
     let clock = FixedClock(8000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
     let mut state = State::default();
     state.stage_mut("prod").releases.push(release(1, "demo-app-1", "reg:app-1", ReleaseStatus::CutoverPending));
 
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
     let err = engine.deploy().unwrap_err();
     assert_eq!(err.exit_code(), 4);
     assert!(runner.display_calls().is_empty()); // nothing ran
@@ -321,7 +312,6 @@ fn resume_refuses_more_than_one_pending() {
     let fs = MemoryFs::new();
     let clock = FixedClock(8100);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
     let mut state = State::default();
     {
@@ -329,7 +319,7 @@ fn resume_refuses_more_than_one_pending() {
         st.releases.push(release(1, "a", "i1", ReleaseStatus::CutoverPending));
         st.releases.push(release(2, "b", "i2", ReleaseStatus::CutoverPending));
     }
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
     let err = engine.resume().unwrap_err();
     assert_eq!(err.exit_code(), 2);
     assert!(err.to_string().contains("more than one"));
@@ -344,7 +334,6 @@ fn finalize_garbage_collects_evicted_images() {
     let fs = MemoryFs::new();
     let clock = FixedClock(1000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
     let mut state = State::default();
     {
@@ -355,7 +344,7 @@ fn finalize_garbage_collects_evicted_images() {
         st.releases.push(release(5, "demo-app-5", "imgC", ReleaseStatus::Active));
         st.current = Some("demo-app-5".into());
     }
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
     engine.deploy().unwrap();
     let calls = runner.display_calls();
     // after finalize: superseded = img1..img4 + imgC (demo-app-5 demoted); keep 3 -> evict img1,img2
@@ -374,9 +363,8 @@ fn infra_drains_workers_before_recreating_db_and_waits_after() {
     let fs = MemoryFs::new();
     let clock = FixedClock(9000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
     engine.deploy().unwrap();
     let calls = runner.display_calls();
     let idx = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap_or(usize::MAX);
@@ -388,43 +376,25 @@ fn infra_drains_workers_before_recreating_db_and_waits_after() {
 }
 
 #[test]
-fn secret_value_in_stderr_is_redacted_in_the_error() {
-    let cfg = cfg();
-    let runner = RecordingRunner::new().with_response(
-        "docker pull reg:app-1",
-        CmdOutput { code: 1, stdout: String::new(), stderr: "denied for key s3cr3t-token".into() },
-    );
-    let fs = MemoryFs::new();
-    let clock = FixedClock(9100);
-    let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::new(["s3cr3t-token".to_string()]);
-    let interrupt = Interrupt::inert();
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
-    let err = engine.deploy().unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("***"));
-    assert!(!msg.contains("s3cr3t-token"));
-}
-
-#[test]
 fn second_synthetic_config_drives_plan_with_zero_core_changes() {
     let src = r#"
 version: 1
 project: blogapp
 network: blogapp_net
-images:
-  app: app1
-  web: web1
+docker:
+  images:
+    app: app1
+    web: web1
+  services:
+    web:
+      image: web
+      container: blogapp-web
+      recreate: on-image-change
+      wait: { exec_in: blogapp-web, cmd: 'wget -qO- localhost/up', retries: 2, interval: 1s }
 compose:
   files: [compose.prod.yml]
   env_file: compose.env
   env: { COMPOSE_PROJECT_NAME: blogapp }
-services:
-  web:
-    image: web
-    container: blogapp-web
-    recreate: on-image-change
-    wait: { exec_in: blogapp-web, cmd: 'wget -qO- localhost/up', retries: 2, interval: 1s }
 release:
   image: app
   container_prefix: blogapp-app
@@ -440,14 +410,13 @@ workers:
 stages:
   prod: {}
 "#;
-    let cfg = config::load(src, Some("prod"), &[], &HashMap::new()).unwrap().config;
+    let cfg = config::load(src, Some("prod"), &[], &HashMap::new()).unwrap();
     let runner = RecordingRunner::new().with_stdout("inspect blogapp-web", "web1");
     let fs = MemoryFs::new();
     let clock = FixedClock(1234);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts());
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
     engine.deploy().unwrap();
     let calls = runner.display_calls();
     assert!(!calls.iter().any(|c| c.contains("migrate"))); // no migrate config -> skipped
@@ -473,10 +442,9 @@ fn lua_after_hook_runs_through_the_engine() {
     let fs = MemoryFs::new();
     let clock = FixedClock(1000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
 
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts())
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts())
         .with_plugins(&host);
     engine.deploy().unwrap();
 
@@ -498,7 +466,6 @@ fn plugin_mutating_cfg_changes_engine_behavior() {
     let fs = MemoryFs::new();
     let clock = FixedClock(1000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
     let mut state = State::default();
     {
@@ -509,7 +476,7 @@ fn plugin_mutating_cfg_changes_engine_behavior() {
         st.releases.push(release(5, "demo-app-5", "imgC", ReleaseStatus::Active));
         st.current = Some("demo-app-5".into());
     }
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, state, opts())
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts())
         .with_plugins(&host);
     engine.deploy().unwrap();
     let calls = runner.display_calls();
@@ -536,9 +503,8 @@ fn plugin_mutating_state_persists_through_the_engine() {
     let fs = MemoryFs::new();
     let clock = FixedClock(1000);
     let reporter = Reporter::capture(Mode::Plain);
-    let redactor = Redactor::default();
     let interrupt = Interrupt::inert();
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, redactor.clone(), &interrupt, State::default(), opts())
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts())
         .with_plugins(&host);
     engine.deploy().unwrap();
 
