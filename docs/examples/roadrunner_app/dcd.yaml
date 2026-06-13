@@ -1,22 +1,43 @@
-# A full translation of a hand-rolled deploy script into dcd config.
-# Drop this at $DEPLOY_ROOT on the prod server (alongside docker-compose.prod.yml).
-# CI overrides the image tags with --image app=… --image database=… --image nginx=…
-# and exports REGISTRY / DEPLOY_ROOT / MAXMIND_* into the environment.
+# A hand-rolled red-black deploy script, as a dcd config.
+#
+# Lives at $DEPLOY_ROOT on the prod server next to docker-compose.prod.yml. CI passes the
+# image tags (--image app=… --image database=… --image nginx=…) and exports REGISTRY /
+# DEPLOY_ROOT / MAXMIND_* — `registry` and `deploy_root` are picked up from the environment
+# automatically, so they aren't repeated here.
+#
+# Only the fields acme customizes are shown; anything left at its default (timeouts,
+# recreate strategy, the nginx upstream/template, worker stop signals, retention…) is
+# omitted. See ../all_in_one/dcd.yaml for every field and its default.
 
 version: 1
 project: acme
-deploy_root: ${DEPLOY_ROOT}
 network: acme_default
 
-registry: ${REGISTRY}
-images:
-  app: ${APP_TAG:-app-latest}
-  database: ${DB_TAG:-database-latest}
-  nginx: ${NGINX_TAG:-nginx-latest}
+# Images dcd pulls/runs, plus the long-lived side containers beside the app.
+docker:
+  images:
+    app: ${APP_TAG:-app-latest}
+    database: ${DB_TAG:-database-latest}
+    nginx: ${NGINX_TAG:-nginx-latest}
+  services:
+    postgres:
+      image: database
+      container: acme-postgres
+      on_recreate_drain_workers: true
+      wait: { exec_in: acme-postgres, cmd: 'pg_isready -U app -h 127.0.0.1' }
+    nginx:
+      image: nginx
+      container: acme-nginx
+      wait: { exec_in: acme-nginx, cmd: 'test -f /var/run/nginx.pid', retries: 30 }
+    valkey:
+      container: acme-valkey
+      recreate: never
+      wait: { exec_in: acme-valkey, cmd: 'valkey-cli ping', retries: 30 }
 
+# Rendered to compose.env and passed to every `docker compose` call (so the tags reach
+# docker-compose.prod.yml too).
 compose:
   files: [docker-compose.prod.yml]
-  env_file: compose.env
   env:
     COMPOSE_PROJECT_NAME: acme
     COMPOSE_IGNORE_ORPHANS: 'true'
@@ -28,81 +49,49 @@ compose:
     MAXMIND_LICENSE_KEY: ${MAXMIND_LICENSE_KEY}
     DEPLOY_ROOT: ${DEPLOY_ROOT}
 
-redact: [MAXMIND_LICENSE_KEY]
+# Created (and chowned) before the deploy runs.
+directories:
+  - { path: .docker/logs/symfony, owner: '1000:1000' }
+  - { path: .docker/valkey/data }
+  - { path: .docker/centrifugo }
 
-preflight:
-  directories:
-    - { path: .docker/logs/symfony, owner: '1000:1000' }
-    - { path: .docker/valkey/data }
-    - { path: .docker/centrifugo }
-
-services:
-  postgres:
-    image: database
-    container: acme-postgres
-    recreate: on-image-change
-    on_recreate_drain_workers: true
-    wait: { exec_in: acme-postgres, cmd: 'pg_isready -U app -h 127.0.0.1', retries: 60, interval: 1s }
-  nginx:
-    image: nginx
-    container: acme-nginx
-    recreate: on-image-change
-    wait: { exec_in: acme-nginx, cmd: 'test -f /var/run/nginx.pid', retries: 30, interval: 1s }
-  valkey:
-    container: acme-valkey
-    recreate: never
-    wait: { exec_in: acme-valkey, cmd: 'valkey-cli ping', retries: 30, interval: 1s }
-
+# The app — built, health-checked, then cut over to.
 release:
   image: app
   container_prefix: acme-app-rr
   run:
     network_alias: app-rr
-    restart: unless-stopped
     env: { TZ: UTC }
     volumes:
       - '${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log'
   healthcheck:
     exec_in: acme-nginx
-    cmd: 'curl -sf http://{container}:2114/health?plugin=http'
-    retries: 60
-    interval: 2s
+    cmd: 'curl -sf http://{container}:2114/health?plugin=http'   # {container}, never the alias
   migrate:
     before: 'php bin/console app:db:migrate before --no-interaction'
     after: 'php bin/console app:db:migrate after --no-interaction'
   drain: 'bin/graceful-stop.sh'
 
+# Point nginx at the new container (writes the upstream file, reloads).
 cutover:
-  upstream_file: nginx-upstream.conf
-  template: 'set $backend "{backend}";'
   backend_port: 8080
-  fallback_backend: '127.0.0.1:8080'
   reload: { exec_in: acme-nginx, cmd: 'nginx -s reload' }
 
+# messenger workers: names come from the running app, then dcd renders them into a
+# compose file using `template`.
 workers:
-  name_filter: 'worker-'
   drain: 'php bin/console messenger:stop-workers --env=prod'
-  stop_timeout: 120s
-  compose_file: docker-compose.workers.yml
   provider:
     command_in_release: 'php bin/console app:worker:list --no-ansi --env=prod'
   template:
     image: app
     entrypoint: ['php', 'bin/console', 'messenger:consume']
     command: ['{name}', '--memory-limit=256M', '--time-limit=3600']
-    stop_signal: SIGTERM
-    stop_grace_period: 120s
-    restart: unless-stopped
     env: { TZ: UTC }
     volumes:
       - '${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log'
 
-retention:
-  keep_releases: 3
-  keep_managed_images: 2
-
-# Centrifugo config is generated from the app, copied out, and the service started —
-# the one project-specific step, done in pure YAML hooks (no Lua needed).
+# Generate centrifugo's config from the freshly-healthy app, copy it out, (re)start it.
 hooks:
   after_healthcheck:
     - exec_in_release: 'php bin/console app:realtime:config --output=/tmp/centrifugo-config.json --no-interaction --env=prod'
@@ -110,5 +99,4 @@ hooks:
     - compose: ['up', '-d', 'centrifugo']
 
 stages:
-  prod: {}
-  # To guard against running on the wrong box, add:  prod: { host: your-prod-hostname }
+  prod: {}   # add `host: <prod-hostname>` to make dcd refuse to run on the wrong box

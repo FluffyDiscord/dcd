@@ -9,8 +9,8 @@ stage changes — it ships the `dcd` binary + `dcd.yaml` and runs `dcd deploy pr
 | the original script did | `dcd` does |
 |---------------------|------------|
 | red-black `docker run` + nginx-upstream cutover | the built-in `docker-redblack` recipe |
-| conditional postgres/nginx recreate on image change | `services.*.recreate: on-image-change` |
-| drain workers before DB recreate | `services.postgres.on_recreate_drain_workers: true` |
+| conditional postgres/nginx recreate on image change | `docker.services.*.recreate: on-image-change` |
+| drain workers before DB recreate | `docker.services.postgres.on_recreate_drain_workers: true` |
 | `app:db:migrate before/after` | `release.migrate.before/after` |
 | `app:worker:list` → workers compose | `workers.provider.command_in_release` + `template` |
 | `app:realtime:config` + `docker cp` + start | the `hooks.after_healthcheck` block |
