@@ -61,7 +61,7 @@ Hook steps you can target with `before_`/`after_`:
 
 ### `ctx` — effects
 
-Routed through the engine, so they're **dry-run-safe and secret-redacted**.
+Routed through the engine, so they're **dry-run-safe** (and observable in `--dry-run`).
 
 | Call | Returns | Does |
 |------|---------|------|
@@ -107,7 +107,7 @@ fields fixed at deploy start — `images`, the container name, `deploy_root` —
 > can break rollback/resume (≤1 `cutover_pending`, etc.) — the engine trusts what you write.
 
 > Raw `os.execute` / `io.open` / `io.popen` are sandboxed out — use `ctx.run(...)` so the
-> action shows up in `--dry-run` and gets secret-redacted. `ctx.run('jq …')`,
+> action shows up in `--dry-run`. `ctx.run('jq …')`,
 > `ctx.run('bash script.sh')`, etc. are all fair game.
 
 ### Examples
