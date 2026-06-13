@@ -1,7 +1,7 @@
 //! Embedded-Lua plugin host (spec §6). Plugins register tasks and before/after
 //! hooks at load time; at run time a hook fires with a `ctx`. The `ctx` carries
 //! engine-routed effects (run, in_release, exec_in, docker, compose, cp_*,
-//! read_file, write_file, file_exists, env — all dry-run-safe and redacted),
+//! read_file, write_file, file_exists, env — all dry-run-safe),
 //! utilities (json/yaml encode+decode, log, warn, dump, inspect), and data: `cfg`,
 //! `state` and a `vars` scratch space — all persistent tables shared across hooks.
 //! `cfg` and `state` are live: the engine `refresh`es them from the typed config and
@@ -405,17 +405,18 @@ mod tests {
 version: 1
 project: demo
 network: net
-images: { app: a }
+docker:
+  images: { app: a }
+  services: { x: { container: x, recreate: never } }
 compose: { files: [c.yml], env_file: e }
 release:
   image: app
   container_prefix: demo-app
   healthcheck: { exec_in: x, cmd: 'curl {container}' }
 cutover: { backend_port: 80, reload: { exec_in: x, cmd: 'r' } }
-services: { x: { container: x, recreate: never } }
 stages: { prod: {} }
 "#;
-        crate::config::load(src, Some("prod"), &[], &Map::new()).unwrap().config
+        crate::config::load(src, Some("prod"), &[], &Map::new()).unwrap()
     }
 
     #[test]
@@ -481,9 +482,9 @@ stages: { prod: {} }
         assert!(host.has_hook("configure"));
         host.refresh(&config(), &stage()).unwrap();
         host.fire(&FakeHost::default(), "configure").unwrap();
-        let loaded = crate::config::from_lua_value(host.read_cfg().unwrap(), "prod").unwrap();
-        assert_eq!(loaded.config.retention.keep_releases, 9);
-        assert_eq!(loaded.config.project, "renamed");
+        let synced = crate::config::from_lua_value(host.read_cfg().unwrap(), "prod").unwrap();
+        assert_eq!(synced.retention.keep_releases, 9);
+        assert_eq!(synced.project, "renamed");
     }
 
     #[test]

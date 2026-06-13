@@ -13,7 +13,6 @@ use crate::docker::Docker;
 use crate::effects::{Access, Argv, Clock, CommandRunner, FileSystem, RunOpts};
 use crate::error::{DcdError, Result};
 use crate::lua::{HookHost, LuaHost};
-use crate::redact::Redactor;
 use crate::signal::Interrupt;
 use crate::state::{FinalizeKind, Release, ReleaseStatus, State};
 use crate::ui::{Reporter, Status};
@@ -82,7 +81,6 @@ pub struct Engine<'a> {
     fs: &'a dyn FileSystem,
     clock: &'a dyn Clock,
     reporter: &'a Reporter,
-    redactor: Redactor,
     interrupt: &'a Interrupt,
     lua: Option<&'a LuaHost>,
     opts: Options,
@@ -110,7 +108,6 @@ impl<'a> Engine<'a> {
         fs: &'a dyn FileSystem,
         clock: &'a dyn Clock,
         reporter: &'a Reporter,
-        redactor: Redactor,
         interrupt: &'a Interrupt,
         state: State,
         opts: Options,
@@ -123,7 +120,6 @@ impl<'a> Engine<'a> {
             fs,
             clock,
             reporter,
-            redactor,
             interrupt,
             lua: None,
             opts,
@@ -166,6 +162,7 @@ impl<'a> Engine<'a> {
 
     fn resolved_images(&self) -> IndexMap<String, String> {
         self.cfg
+            .docker
             .images
             .iter()
             .map(|(logical, tag)| (logical.clone(), self.full_ref(tag)))
@@ -307,7 +304,7 @@ impl<'a> Engine<'a> {
             let create = self.docker().network_create();
             self.exec(&create, Access::Mutate)?;
         }
-        let dirs = self.cfg.preflight.directories.iter().map(|d| (d.path.clone(), d.owner.clone())).collect::<Vec<_>>();
+        let dirs = self.cfg.directories.iter().map(|d| (d.path.clone(), d.owner.clone())).collect::<Vec<_>>();
         for (path, owner) in dirs {
             let resolved = self.resolve(&path);
             self.mkdir(&resolved)?;
@@ -351,6 +348,7 @@ impl<'a> Engine<'a> {
         self.exec(&pull_app, Access::Mutate)?;
         let managed: Vec<String> = self
             .cfg
+            .docker
             .services
             .values()
             .filter_map(|s| s.image.as_ref())
@@ -364,9 +362,9 @@ impl<'a> Engine<'a> {
     }
 
     fn infra(&mut self) -> Result<Outcome> {
-        let services: Vec<String> = self.cfg.services.keys().cloned().collect();
+        let services: Vec<String> = self.cfg.docker.services.keys().cloned().collect();
         for name in &services {
-            let service = &self.cfg.services[name];
+            let service = &self.cfg.docker.services[name];
             let container = service.container.clone();
             let recreate = service.recreate;
             let drain_first = service.on_recreate_drain_workers;
@@ -395,7 +393,7 @@ impl<'a> Engine<'a> {
         }
 
         for name in &services {
-            let wait = match &self.cfg.services[name].wait {
+            let wait = match &self.cfg.docker.services[name].wait {
                 Some(wait) => wait,
                 None => continue,
             };
@@ -457,7 +455,7 @@ impl<'a> Engine<'a> {
         }
         Err(DcdError::PreCutover(format!(
             "healthcheck failed after {retries} attempts: {}",
-            self.redactor.apply(last_stderr.trim())
+            last_stderr.trim()
         )))
     }
 
@@ -475,7 +473,7 @@ impl<'a> Engine<'a> {
                 self.restore_upstream(&upstream, previous);
                 return Err(DcdError::PreCutover(format!(
                     "cutover config validation failed: {}",
-                    self.redactor.apply(out.stderr.trim())
+                    out.stderr.trim()
                 )));
             }
         }
@@ -486,7 +484,7 @@ impl<'a> Engine<'a> {
             self.restore_upstream(&upstream, previous);
             return Err(DcdError::PreCutover(format!(
                 "router reload failed; restored previous upstream: {}",
-                self.redactor.apply(out.stderr.trim())
+                out.stderr.trim()
             )));
         }
 
@@ -572,7 +570,7 @@ impl<'a> Engine<'a> {
         let serving_before = self.serving_before.clone();
         let keep = self.cfg.retention.keep_releases;
         let keep_managed = self.cfg.retention.keep_managed_images;
-        let managed: Vec<String> = self.cfg.services.values().filter_map(|s| s.image.clone()).collect();
+        let managed: Vec<String> = self.cfg.docker.services.values().filter_map(|s| s.image.clone()).collect();
         self.state.stage_mut(&stage).finalize(&container, kind, serving_before.as_deref());
         let (evictions, images) = self
             .state
@@ -604,10 +602,10 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         let stage = self.state.stage(&self.cfg.stage).cloned().unwrap_or_default();
-        lua.refresh(&self.cfg, &stage).map_err(|e| self.classify(self.redactor.apply(&e)))?;
+        lua.refresh(&self.cfg, &stage).map_err(|e| self.classify(e))?;
         let cfg_before = lua.read_cfg().map_err(|e| self.classify(e))?;
         let state_before = lua.read_state().map_err(|e| self.classify(e))?;
-        lua.fire(self, slot).map_err(|e| self.classify(self.redactor.apply(&e)))?;
+        lua.fire(self, slot).map_err(|e| self.classify(e))?;
         let cfg_after = lua.read_cfg().map_err(|e| self.classify(e))?;
         let state_after = lua.read_state().map_err(|e| self.classify(e))?;
         if cfg_after != cfg_before {
@@ -619,13 +617,10 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Adopt a `ctx.cfg` a plugin mutated: re-derive and re-validate the typed config (and
-    /// its redactor) from the live Lua table. A validation failure aborts the deploy.
+    /// Adopt a `ctx.cfg` a plugin mutated: re-derive and re-validate the typed config from
+    /// the live Lua table. A validation failure aborts the deploy.
     fn apply_synced_cfg(&mut self, value: serde_yaml::Value) -> Result<()> {
-        let loaded = crate::config::from_lua_value(value, &self.cfg.stage)
-            .map_err(|e| self.classify(self.redactor.apply(&e.to_string())))?;
-        self.cfg = loaded.config;
-        self.redactor = loaded.redactor;
+        self.cfg = crate::config::from_lua_value(value, &self.cfg.stage).map_err(|e| self.classify(e.to_string()))?;
         Ok(())
     }
 
@@ -868,11 +863,11 @@ impl<'a> Engine<'a> {
 
     fn run_argv(&self, argv: &Argv, access: Access, check: bool) -> Result<crate::effects::CmdOutput> {
         if self.opts.dry_run && access == Access::Mutate {
-            self.reporter.plan(&self.redactor.apply(&argv.display()));
+            self.reporter.plan(&argv.display());
         }
         self.runner
             .run(argv, access, &RunOpts { check })
-            .map_err(|e| self.classify(self.redactor.apply(&e.to_string())))
+            .map_err(|e| self.classify(e.to_string()))
     }
 
     fn exec(&self, argv: &Argv, access: Access) -> Result<crate::effects::CmdOutput> {

@@ -6,7 +6,6 @@ pub mod engine;
 pub mod error;
 pub mod lock;
 pub mod lua;
-pub mod redact;
 pub mod signal;
 pub mod state;
 pub mod ui;

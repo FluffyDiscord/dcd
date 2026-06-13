@@ -1,10 +1,8 @@
 //! Adaptive reporter (spec §8.2): rich on a TTY, plain otherwise, `--json` on
-//! request — one event stream, rendered per environment, every string redacted.
+//! request — one event stream, rendered per environment.
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
-
-use crate::redact::Redactor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -37,12 +35,11 @@ enum Sink {
 
 pub struct Reporter {
     mode: Mode,
-    redactor: Redactor,
     sink: Sink,
 }
 
 impl Reporter {
-    pub fn auto(json: bool, redactor: Redactor) -> Reporter {
+    pub fn auto(json: bool) -> Reporter {
         let mode = if json {
             Mode::Json
         } else if std::io::stdout().is_terminal() {
@@ -52,7 +49,6 @@ impl Reporter {
         };
         Reporter {
             mode,
-            redactor,
             sink: Sink::Stdout,
         }
     }
@@ -60,7 +56,6 @@ impl Reporter {
     pub fn capture(mode: Mode) -> Reporter {
         Reporter {
             mode,
-            redactor: Redactor::default(),
             sink: Sink::Capture(RefCell::new(Vec::new())),
         }
     }
@@ -73,7 +68,7 @@ impl Reporter {
     }
 
     pub fn task(&self, task: &str, status: Status, ms: u64, detail: Option<&str>) {
-        let detail = detail.map(|d| self.redactor.apply(d));
+        let detail = detail.map(|d| d.to_string());
         let line = match self.mode {
             Mode::Json => {
                 let value = serde_json::json!({
@@ -111,15 +106,13 @@ impl Reporter {
     }
 
     pub fn log(&self, message: &str) {
-        let message = self.redactor.apply(message);
         match self.mode {
             Mode::Json => self.write(serde_json::json!({ "log": message }).to_string()),
-            _ => self.write(message),
+            _ => self.write(message.to_string()),
         }
     }
 
     pub fn warn(&self, message: &str) {
-        let message = self.redactor.apply(message);
         match self.mode {
             Mode::Json => self.write(serde_json::json!({ "warn": message }).to_string()),
             _ => self.write(format!("\u{26a0} {message}")),
@@ -127,7 +120,6 @@ impl Reporter {
     }
 
     pub fn plan(&self, line: &str) {
-        let line = self.redactor.apply(line);
         match self.mode {
             Mode::Json => self.write(serde_json::json!({ "plan": line }).to_string()),
             _ => self.write(format!("  {line}")),
@@ -164,13 +156,5 @@ mod tests {
         r.task("healthcheck", Status::Ok, 6000, Some("3/60"));
         r.task("migrate:before", Status::Skip, 0, None);
         assert_eq!(r.lines(), vec!["healthcheck: ok 3/60", "migrate:before: skip"]);
-    }
-
-    #[test]
-    fn detail_is_redacted() {
-        let mut r = Reporter::capture(Mode::Plain);
-        r.redactor = Redactor::new(["s3cr3t".to_string()]);
-        r.task("pull", Status::Fail, 10, Some("auth failed with s3cr3t"));
-        assert_eq!(r.lines(), vec!["pull: FAIL auth failed with ***"]);
     }
 }
