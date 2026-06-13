@@ -57,7 +57,7 @@ keeping it (without an over-built task graph) gives extensibility at low weight.
 | Extensibility | **Embedded Lua (mlua)**, sandboxed; PHP-Deployer-style globals + `ctx` | ADR-003 |
 | Docker interface | **Shell out to `docker` / `docker compose` CLI** | ADR-004 |
 | Rollback semantics | **Code-only; migrations forward-only (expand-contract)** | ADR-005 |
-| Secrets | **Env-var `${VAR}` interpolation**, two-layer redaction, `0600` on disk | ADR-006 |
+| Secrets | **Env-var `${VAR}` interpolation**; rendered env file `0600` on disk | ADR-006 |
 | Multi-stage | **One config file, stages merged over a shared base** + host guard | ADR-007 |
 | Common-case Lua | **Zero Lua required** — YAML drives the recipe | ADR-008 |
 | Output | **Adaptive**: rich TTY / plain non-TTY / `--json` opt-in | ADR-009 |

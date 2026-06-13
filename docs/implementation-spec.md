@@ -33,7 +33,6 @@
 | INV-4 | The stage lock is a `flock(2)` advisory lock: the OS releases it on process exit **including SIGKILL**. SIGINT/SIGTERM are caught and run orderly cleanup (pre-cutover: remove black; release lock). A dead-holder lock is reclaimable. |
 | INV-5 | Rollback never runs migrations (ADR-005); it re-deploys the previous release's images. |
 | INV-6 | Rollback to the **immediately previous** release is available while `keep_releases ≥ 1`; its images are retained (never pruned). Deeper/repeated rollback is bounded by `keep_releases` + registry retention; §4 verifies the target's images exist before acting. |
-| INV-7 | Secrets are redacted in **every** human/JSON output by **two layers** — env-var-name heuristic *and* literal resolved-value masking — so a secret echoed inside captured stderr is still masked. The on-disk env file is `0600`. |
 | INV-8 | If a stage declares `host:` and the machine hostname does not match, `dcd` refuses to act (exit `5`). |
 | INV-9 | If `state.current` is set but that container is **not running**, the upstream file is reset to `cutover.fallback_backend` **before** any managed-service recreate, so a recreated nginx never points at a dead container (self-heal; mirrors the original script). |
 | INV-10 | **At most one `cutover_pending` release exists at any time.** The cutover append (§7.8) demotes any pre-existing `cutover_pending` → `rolled_back` in the same atomic state write, so a crash during a recovery run can never leave two. `serving` is therefore unambiguous. |
@@ -62,7 +61,6 @@ parse args ─▶ load+merge config ─▶ resolve stage ─▶ host guard ─�
 | `effects::real` | production impls | `SystemRunner`, `SystemFs`, `SystemClock` |
 | `effects::record` | recording / read-pass-through impls for tests + `--dry-run` | `RecordingRunner`, `MemoryFs`, `FixedClock` |
 | `docker` | typed helpers building docker/compose argv over `CommandRunner`; tags each call read-only or mutating | `Docker`, `Compose` |
-| `redact` | two-layer secret masking over any emitted string | `Redactor` |
 | `engine` | fixed ordered recipe + before/after hook slots, expansion, execution | `Engine`, `Task`, `HookSlot`, `Plan`, `Context` |
 | `recipe` | the `docker-redblack` recipe: registers tasks from `Config` | `redblack::register` |
 | `lua` | sandboxed mlua host: globals + `ctx` userdata, plugin loading | `LuaHost` |
@@ -183,14 +181,33 @@ Because finalize always demotes the **run-start `current`** (not merely "the pre
 version: 1
 project: acme                       # naming prefix for containers/lock/state
 
-deploy_root: ${DEPLOY_ROOT}            # abs path on server (default: cwd)
+deploy_root: ${DEPLOY_ROOT}            # abs path on server (default: $DEPLOY_ROOT, else cwd; omittable)
 network: acme_default               # external docker network (created if absent)
 
-registry: ${REGISTRY}
-images:                                # logical name -> tag (tags usually from --image / env)
-  app: ${APP_TAG}
-  database: ${DB_TAG}
-  nginx: ${NGINX_TAG}
+registry: ${REGISTRY}                  # default: $REGISTRY or $CI_REGISTRY_IMAGE (omittable)
+
+docker:
+  images:                              # logical name -> tag (tags usually from --image / env)
+    app: ${APP_TAG}
+    database: ${DB_TAG}
+    nginx: ${NGINX_TAG}
+
+  services:                            # managed services, reconciled in THIS declared order
+    postgres:
+      image: database
+      container: acme-postgres
+      recreate: on-image-change        # on-image-change | always | never
+      on_recreate_drain_workers: true  # drain workers before recreating this service
+      wait: { exec_in: acme-postgres, cmd: 'pg_isready -U app -h 127.0.0.1', retries: 60, interval: 1s }
+    nginx:
+      image: nginx
+      container: acme-nginx
+      recreate: on-image-change
+      wait: { exec_in: acme-nginx, cmd: 'test -f /var/run/nginx.pid', retries: 30, interval: 1s }
+    valkey:
+      container: acme-valkey        # no `image:` -> dcd never owns its tag (recreate: never)
+      recreate: never
+      wait: { exec_in: acme-valkey, cmd: 'valkey-cli ping', retries: 30, interval: 1s }
 
 compose:
   files: [docker-compose.prod.yml]     # -f files; stage compose.files APPENDS (additive, see §5.1)
@@ -206,29 +223,9 @@ compose:
     MAXMIND_LICENSE_KEY: ${MAXMIND_LICENSE_KEY}
     DEPLOY_ROOT: ${DEPLOY_ROOT}
 
-redact: [MAXMIND_LICENSE_KEY]          # extra keys to redact (auto: names matching SECRET|PASSWORD|KEY|TOKEN|CREDENTIAL)
-
-preflight:
-  directories:
-    - { path: .docker/logs/symfony, owner: '1000:1000' }
-    - { path: .docker/valkey/data }
-
-services:                              # managed services, reconciled in THIS declared order
-  postgres:
-    image: database
-    container: acme-postgres
-    recreate: on-image-change          # on-image-change | always | never
-    on_recreate_drain_workers: true    # drain workers before recreating this service
-    wait: { exec_in: acme-postgres, cmd: 'pg_isready -U app -h 127.0.0.1', retries: 60, interval: 1s }
-  nginx:
-    image: nginx
-    container: acme-nginx
-    recreate: on-image-change
-    wait: { exec_in: acme-nginx, cmd: 'test -f /var/run/nginx.pid', retries: 30, interval: 1s }
-  valkey:
-    container: acme-valkey          # no `image:` -> dcd never owns its tag (recreate: never)
-    recreate: never
-    wait: { exec_in: acme-valkey, cmd: 'valkey-cli ping', retries: 30, interval: 1s }
+directories:
+  - { path: .docker/logs/symfony, owner: '1000:1000' }
+  - { path: .docker/valkey/data }
 
 release:                               # the red-black app
   image: app
@@ -296,7 +293,7 @@ stages:                                # merged over the base above
     retention: { keep_releases: 5 }
 ```
 
-### 5.1 Merge, interpolation, override, redaction (each tested, §10)
+### 5.1 Merge, interpolation, override (each tested, §10)
 
 | Rule | Behaviour |
 |------|-----------|
@@ -304,9 +301,8 @@ stages:                                # merged over the base above
 | Stage merge — scalars | stage replaces base |
 | Stage merge — lists | stage list **replaces** base list — **except `compose.files`, which APPENDS** (compose `-f` is additive; the one ergonomic exception, demonstrated by the `beta` stage) |
 | Interpolation | `${VAR}` / `${VAR:-default}` from process env at load; unresolved + no default → `ConfigError` |
-| `--set path=value` | applied **after** interpolation, **before** validation; may override **existing scalar paths only** (a new path → error, preserving no-laundered-defaults); dotted grammar with `[i]` list indices; a value whose final path segment matches the redaction heuristic is redacted |
-| Redaction (INV-7) | layer 1: a value is redacted if its source env-var name matches `(?i)(SECRET\|PASSWORD\|KEY\|TOKEN\|CREDENTIAL)` or the key is in `redact:`; layer 2: every resolved secret **value** is masked on literal occurrence in any emitted string (argv, stdout, stderr, errors). Over-masking a real secret value is acceptable |
-| Validation | unknown keys → error (typo guard); referenced `image:` must exist in `images:`; `exec_in`/`wait.exec_in` must name a declared `services:` container; `healthcheck.cmd` must reference `{container}` (guard against accidental alias use) |
+| `--set path=value` | applied **after** interpolation, **before** validation; may override **existing scalar paths only** (a new path → error, preserving no-laundered-defaults); dotted grammar with `[i]` list indices |
+| Validation | unknown keys → error (typo guard); referenced `image:` must exist in `docker.images`; `exec_in`/`wait.exec_in` must name a declared `docker.services` container; `healthcheck.cmd` must reference `{container}` (guard against accidental alias use) |
 
 ---
 
@@ -329,7 +325,7 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 
 ### 6.2 `ctx` (passed to every hook body)
 
-**Effects** (engine-routed → dry-run-safe + redacted; all `Mutate` per §2.4 unless noted):
+**Effects** (engine-routed → dry-run-safe; all `Mutate` per §2.4 unless noted):
 
 | Method | Effect |
 |--------|--------|
@@ -345,13 +341,13 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 
 **Debug:** `ctx.inspect(v)` → pretty YAML string; `ctx.dump(v?)` → logs `v` (or, with no arg, `cfg`+`state`) as formatted YAML.
 
-**Data:** `ctx.cfg` (resolved config) and `ctx.state` (current stage: `{current, releases:[{id,container,status,images,ran_migrations,reason}]}`) are **live, mutable tables** — the engine refreshes them from the typed config/state before each hook and reads any direct assignment back (no setter function), so a plugin mutation changes the deploy: `cfg` for steps not yet run, `state` read back into deploy state and persisted past cutover. Full power — a `state` rewrite can violate the §4.3 invariants the engine relies on. `ctx.vars` + `ctx.set/get` is a **persistent scratch table shared across all hooks in the run** (not part of cfg/state). Plus `ctx.container`, `ctx.stage`. Structural values fixed at deploy start (`images`, container name, `deploy_root`) are snapshots, not re-read.
+**Data:** `ctx.cfg` (resolved config) and `ctx.state` (current stage: `{current, releases:[{id,container,status,images,ran_migrations,reason}]}`) are **live, mutable tables** — the engine refreshes them from the typed config/state before each hook and reads any direct assignment back (no setter function), so a plugin mutation changes the deploy: `cfg` for steps not yet run, `state` read back into deploy state and persisted past cutover. Full power — a `state` rewrite can violate the §4.3 invariants the engine relies on. `ctx.vars` + `ctx.set/get` is a **persistent scratch table shared across all hooks in the run** (not part of cfg/state). Plus `ctx.container`, `ctx.stage`. Structural values fixed at deploy start (`docker.images`, container name, `deploy_root`) are snapshots, not re-read.
 
 **Dry-run honesty (Clarity):** a Lua hook that branches on `ctx.in_release(...)` output gets the stubbed empty result in `--dry-run` (the black isn't started); the host cannot introspect the branch, so the dynamic worker provider and such data-dependent points emit a `⚠ data-dependent` event rather than a fabricated plan. Pure utilities and `cfg`/`state`/`env`/`read_file` resolve for real in dry-run.
 
 ### 6.5 The `configure` hook
 
-Registered with `configure(fn)`; fires **once before the recipe**, with a host offering `run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` (no `in_release`/`docker`/`compose`/`cp_*` — there is no release container yet). It adjusts the initial config by **mutating `ctx.cfg` directly** (`ctx.cfg.retention.keep_releases = 5`); the mutated table is read back, re-parsed and re-validated into the typed config the engine then runs against. The **same live read-back applies to every hook mid-deploy** (§6.2), not just `configure`: a `before_`/`after_` hook may mutate `ctx.cfg` (honored for any step not yet run) or `ctx.state` (read back into deploy state, persisted once past cutover). Implementation: before firing a slot's hooks the engine `refresh`es the `cfg`/`state` tables from the typed values; after, it re-reads them and, if changed, re-parses (`cfg` re-validated; a failure aborts the deploy). The round-trip goes through Lua, so an empty map serializes as an empty table and is parsed back as an empty map (`de_lenient_map`); map ordering (`images`/`env`/`services`) is not guaranteed across a mutated round-trip but does not affect correctness. `ctx.vars` remains for scratch state that is not part of cfg/state.
+Registered with `configure(fn)`; fires **once before the recipe**, with a host offering `run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` (no `in_release`/`docker`/`compose`/`cp_*` — there is no release container yet). It adjusts the initial config by **mutating `ctx.cfg` directly** (`ctx.cfg.retention.keep_releases = 5`); the mutated table is read back, re-parsed and re-validated into the typed config the engine then runs against. The **same live read-back applies to every hook mid-deploy** (§6.2), not just `configure`: a `before_`/`after_` hook may mutate `ctx.cfg` (honored for any step not yet run) or `ctx.state` (read back into deploy state, persisted once past cutover). Implementation: before firing a slot's hooks the engine `refresh`es the `cfg`/`state` tables from the typed values; after, it re-reads them and, if changed, re-parses (`cfg` re-validated; a failure aborts the deploy). The round-trip goes through Lua, so an empty map serializes as an empty table and is parsed back as an empty map (`de_lenient_map`); map ordering (`docker.images`/`env`/`docker.services`) is not guaranteed across a mutated round-trip but does not affect correctness. `ctx.vars` remains for scratch state that is not part of cfg/state.
 
 ### 6.3 YAML hook actions (zero-Lua path)
 
@@ -359,7 +355,7 @@ A `hooks.<slot>` entry is one typed action (a bare string = `run`), each mapping
 
 ### 6.4 Sandboxing
 
-mlua with stdlib minus process/file escapes: `os.execute`, `os.exit`, `os.getenv`, `io.popen`, `io.open`, `dofile`, `loadfile`, `require` of arbitrary paths are removed/replaced. All process/file effects must go through `ctx` (so they honour `--dry-run`, redaction, and the seam). Plugin load/runtime error → exit `10` with the Lua traceback (redacted).
+mlua with stdlib minus process/file escapes: `os.execute`, `os.exit`, `os.getenv`, `io.popen`, `io.open`, `dofile`, `loadfile`, `require` of arbitrary paths are removed/replaced. All process/file effects must go through `ctx` (so they honour `--dry-run` and the seam). Plugin load/runtime error → exit `10` with the Lua traceback.
 
 ---
 
@@ -369,7 +365,7 @@ Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values
 
 ### 7.1 `preflight`
 - `docker network inspect {network}` *(Read)* → on failure `docker network create {network}` *(Mutate)*.
-- For each `preflight.directories[]`: `fs.create_dir_all(path)`; if `owner` → `docker run --rm -v {deploy_root}:/wd busybox chown {owner} /wd/{path}` (unprivileged-safe chown; resolves OQ-1).
+- For each `directories[]`: `fs.create_dir_all(path)`; if `owner` → `docker run --rm -v {deploy_root}:/wd busybox chown {owner} /wd/{path}` (unprivileged-safe chown; resolves OQ-1).
 - **Orphan reaping:** `docker ps -a --filter name={release.container_prefix}- --format '{{.Names}}'` *(Read)*; for each not present in `state.releases` → `docker rm -f {name}` *(Mutate)* (clears crashed-deploy leftovers; §2.6).
 - Render `compose.env` from `compose.env` map (interpolated) → `fs.write(env_file, …, 0600)`.
 - Failure → abort, red untouched.
@@ -379,11 +375,11 @@ Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values
 - Mirrors the original script; runs before `infra` so a recreated nginx never points at a corpse.
 
 ### 7.3 `pull`
-- `docker pull {images.app}` *(Mutate)*; for each managed service with an `image:` → `docker pull {tag}`.
+- `docker pull {docker.images.app}` *(Mutate)*; for each managed service with an `image:` → `docker pull {tag}`.
 - Failure → abort (red untouched).
 
 ### 7.4 `infra` (ordered; mirrors the original script)
-- For each service in **declared order**: desired = `images[service.image]`; current = `docker inspect {container} --format '{{.Config.Image}}'` *(Read; missing ⇒ `none`)*.
+- For each service in **declared order**: desired = `docker.images[service.image]`; current = `docker inspect {container} --format '{{.Config.Image}}'` *(Read; missing ⇒ `none`)*.
   - `recreate: never` → `compose up -d --no-recreate {service}`.
   - `recreate: always` → `compose up -d {service}`.
   - `recreate: on-image-change` → if current≠desired: if `on_recreate_drain_workers` and not yet `drained` → **worker drain** (§7.9), set `drained`; then `compose up -d {service}`; else `compose up -d --no-recreate {service}`.
@@ -391,12 +387,12 @@ Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values
 - **Ordering contract (tested):** worker drain (if any) precedes the first recreate; wait-gates run after all recreates.
 
 ### 7.5 `migrate:before`
-- Skip if unset. `docker run --rm --network {network} --name {project}-migrate-{release_id} {images.app} php bin/console app:db:migrate before --no-interaction` — argv passed **directly** (no `sh -c`), matching the original script. The throwaway container carries **only** image-baked env + `--network` (same env policy as the script; not `release.run.env`).
+- Skip if unset. `docker run --rm --network {network} --name {project}-migrate-{release_id} {docker.images.app} php bin/console app:db:migrate before --no-interaction` — argv passed **directly** (no `sh -c`), matching the original script. The throwaway container carries **only** image-baked env + `--network` (same env policy as the script; not `release.run.env`).
 - Failure → abort (red untouched). Note: migrations are not guaranteed atomic — expand-contract discipline must keep even a partially-applied `before` migration backward-compatible with red (§11, §9).
 
 ### 7.6 `start:black`
 - `container = {container_prefix}-{release_id}` (stored id, §2.6); fail if it already exists (defence behind the lock; orphan-reaping in 7.1 clears stale ones).
-- `docker run -d --name {container} --network {network} --network-alias {run.network_alias} --restart {run.restart} {-e K=V…} {-v vol…} {images.app}`. Mirrors the original script.
+- `docker run -d --name {container} --network {network} --network-alias {run.network_alias} --restart {run.restart} {-e K=V…} {-v vol…} {docker.images.app}`. Mirrors the original script.
 
 ### 7.7 `healthcheck`
 - Repeat up to `retries`, sleeping `interval`: substitute the black **container name** into `healthcheck.cmd` (`{container}`), run `docker exec {healthcheck.exec_in} sh -c '<cmd>'` *(Mutate — execs into the black, which exists only after `start:black`; stubbed-OK in `--dry-run` like any post-`start:black` step)*; success on exit 0.
@@ -459,7 +455,7 @@ dcd <command> [stage] [flags]
 | `--resume` | (deploy) recover a post-cutover-incomplete release |
 | `--dry-run` | read-pass-through plan; mutations stubbed (§2.3/§2.4) |
 | `--json` | newline-delimited JSON events |
-| `--image <logical>=<tag>` | override an `images:` entry (repeatable; CI passes app/db/nginx) |
+| `--image <logical>=<tag>` | override a `docker.images.<logical>` entry (repeatable; CI passes app/db/nginx) |
 | `--set <path>=<value>` | override an existing config scalar (repeatable; §5.1 semantics) |
 | `-v/--verbose`, `-q/--quiet`, `--no-color` | output control |
 | `-y/--yes` | assume yes (rollback / refuse prompts) |
@@ -480,7 +476,7 @@ dcd <command> [stage] [flags]
 
 ### 8.2 Output modes (ADR-009)
 
-One `Event` stream → reporter renders by environment: **rich** (TTY: per-task status + elapsed + summary), **plain** (no TTY: `[HH:MM:SS] <task>: <status>` — matches today's `log()`), **`--json`** (`{ts,stage,task,status,ms,detail}` per line). All failures print the failing argv (redacted, INV-7) + captured stderr.
+One `Event` stream → reporter renders by environment: **rich** (TTY: per-task status + elapsed + summary), **plain** (no TTY: `[HH:MM:SS] <task>: <status>` — matches today's `log()`), **`--json`** (`{ts,stage,task,status,ms,detail}` per line). All failures print the failing argv + captured stderr.
 
 ### 8.3 CI integration (replaces the existing CI deploy stage)
 
@@ -490,12 +486,12 @@ ssh server "cd $DEPLOY_ROOT && ./dcd deploy prod \
   --image app=$DOCKER_IMAGE_TAG_APP \
   --image database=$DOCKER_IMAGE_TAG_DATABASE \
   --image nginx=$DOCKER_IMAGE_TAG_NGINX"
-# MAXMIND_* / REGISTRY exported as CI env → ${VAR} interpolation; secrets redacted
+# MAXMIND_* / REGISTRY exported as CI env → ${VAR} interpolation
 ```
 
 ### 8.4 `dcd init`
 
-Writes `./dcd.yaml` (a single-stage runnable skeleton: `project`, `network`, `registry`, `images`, one managed `service`, a `release` block with healthcheck/migrate, `cutover`, `retention`). Refuses if `dcd.yaml` exists unless `--force`. `--with-plugin` also writes `plugins/app.lua` (a commented `after('healthcheck', …)` stub). The emitted skeleton is fixed (snapshot-tested, §10) so two runs are identical.
+Writes `./dcd.yaml` (a single-stage runnable skeleton: `project`, `network`, `registry`, a `docker:` block with `images` + one managed `services` entry, a `release` block with healthcheck/migrate, `cutover`, `retention`). Refuses if `dcd.yaml` exists unless `--force`. `--with-plugin` also writes `plugins/app.lua` (a commented `after('healthcheck', …)` stub). The emitted skeleton is fixed (snapshot-tested, §10) so two runs are identical.
 
 ### 8.5 Code quality requirements (pre-empts comment churn)
 
@@ -516,7 +512,6 @@ Generated Rust MUST be dumb-simple and readable: intention-revealing names, smal
 | Compose calls without `-p {project} --env-file -f{files}` | the fully-qualified `compose(...)` helper, always | else compose derives a different project name and targets nothing (the original script uses explicit `-p`) |
 | Re-sample the clock for `release_id` mid-run | sample once at plan start, store on `Context` (§2.6) | the migrate/black/healthcheck names must all share one id |
 | Build docker argv as one interpolated string | `Argv` as `Vec<String>`; `sh -c` only when an action needs a shell | injection/quoting bugs; argv is also what `--dry-run` prints |
-| Name-only secret redaction | two-layer: name heuristic + literal value masking (INV-7) | a secret echoed in docker stderr would otherwise leak |
 | Rely on Rust `Drop` to release the lock on a signal | catch SIGINT/SIGTERM; use `flock(2)` (OS-released on SIGKILL) (§2.5) | `Drop` doesn't run on default-terminating signals |
 | Silently default an unknown/missing config key | unknown → error; missing required → error | a laundered default produces a confident wrong deploy |
 | Parse container names to find the rollback target | read typed `state.releases` (§4.1) | names are display, state is truth |
@@ -534,8 +529,7 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | TC-001 | config merge | base + `prod` | scalars overridden, maps deep-merged, lists replaced | empty stage; stage absent → error |
 | TC-002 | `compose.files` append | base `[a]` + stage `[b]` | `[a,b]` (additive exception) | stage absent → `[a]` |
 | TC-003 | interpolation | `${X}`,`${Y:-d}`,missing `${Z}` | X from env, Y default, Z → error | `${}`, nested, value with `$` |
-| TC-004 | `--set` | existing scalar / new path / list `[i]` | override / error / index set | redacted if heuristic matches; runs after interp, before validate |
-| TC-005 | redaction (2-layer) | env `MAXMIND_LICENSE_KEY`; that value inside a fake stderr | name redacted **and** value masked in stderr | `redact:` key; non-secret untouched |
+| TC-004 | `--set` | existing scalar / new path / list `[i]` | override / error / index set | runs after interp, before validate |
 | TC-006 | config validation | unknown key; `image: ghost`; bad `exec_in`; healthcheck without `{container}` | each → distinct error | valid → ok |
 | TC-007 | plan build | tasks + before/after + anon fn hooks | exact ordered plan incl. hook slots | self/mutual cycle → error |
 | TC-008 | `infra` recreate | current==/≠desired / `never` | `--no-recreate` / recreate / `--no-recreate` argv (with `-p`) | `none` current |
@@ -583,7 +577,6 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | INV-4 | TC-023, IT-005 |
 | INV-5 | TC-019 |
 | INV-6 | TC-017, TC-019 |
-| INV-7 | TC-005 |
 | INV-8 | TC-022 |
 | INV-9 | TC-011 |
 
@@ -619,7 +612,7 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | host guard mismatch | `stage prod expects host prod.example.internal, this is beta-box` | 5 | run on right host |
 | deploy finds `cutover_pending` | `prod has an incomplete release <c>; run 'dcd deploy --resume prod' or 'dcd rollback prod'` | 4 | resume/rollback |
 | rollback no previous / images gone | `no previous release for prod` / `target image <tag> not present and not pullable` | 1 | — |
-| Lua error | plugin path + redacted traceback | 10 | fix plugin |
+| Lua error | plugin path + traceback | 10 | fix plugin |
 
 ---
 
@@ -632,7 +625,7 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | 003 | **Embedded Lua (mlua), sandboxed** | proven, liked, no system Lua; effects only via `ctx` | native Rust plugins (recompile), WASM (heavy) |
 | 004 | **Shell out to `docker` CLI** | parity; `--dry-run` prints real cmds; `compose` has no API | Bollard, hybrid |
 | 005 | **Code-only rollback; forward-only migrations** | expand-contract; down-migrations lossy | down-migrations; block-on-migrate |
-| 006 | **Env-var `${VAR}` secrets, two-layer redaction, 0600** | CI-native, no new dependency; value-masking closes stderr leaks | sops/age, Vault/SSM |
+| 006 | **Env-var `${VAR}` secrets, `compose.env` 0600 on disk** | CI-native, no new dependency | sops/age, Vault/SSM |
 | 007 | **One config, stages over base** + host guard | DRY, single source; server = CI SSH target | file-per-stage; independent stages |
 | 008 | **Zero Lua for the common case** | best DX; YAML drives the recipe | Lua-first; scaffolded recipe |
 | 009 | **Adaptive output** (TTY/plain/json) | right output everywhere from one stream | plain-only; json-only |
@@ -680,7 +673,14 @@ version: 1
 project: blogapp
 network: blogapp_net
 registry: ${REGISTRY}
-images: { app: ${APP_TAG}, web: ${WEB_TAG} }
+docker:
+  images: { app: ${APP_TAG}, web: ${WEB_TAG} }
+  services:
+    web:
+      image: web
+      container: blogapp-web
+      recreate: on-image-change
+      wait: { exec_in: blogapp-web, cmd: 'wget -qO- localhost/up', retries: 20, interval: 1s }
 compose:
   files: [compose.prod.yml]
   env_file: compose.env
@@ -690,12 +690,6 @@ compose:
     REGISTRY: ${REGISTRY}
     APP_TAG: ${APP_TAG}
     WEB_TAG: ${WEB_TAG}
-services:
-  web:
-    image: web
-    container: blogapp-web
-    recreate: on-image-change
-    wait: { exec_in: blogapp-web, cmd: 'wget -qO- localhost/up', retries: 20, interval: 1s }
 release:
   image: app
   container_prefix: blogapp-app
