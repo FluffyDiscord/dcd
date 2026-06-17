@@ -135,10 +135,7 @@ impl<'a> Docker<'a> {
         }
         argv.push("--restart".into());
         argv.push(run.restart.clone());
-        for (key, value) in &run.env {
-            argv.push("-e".into());
-            argv.push(format!("{key}={value}"));
-        }
+        self.push_run_env(&mut argv, run);
         for volume in &run.volumes {
             argv.push("-v".into());
             argv.push(volume.clone());
@@ -156,10 +153,29 @@ impl<'a> Docker<'a> {
             self.cfg.network.clone(),
             "--name".into(),
             name.to_string(),
-            image.to_string(),
         ];
+        self.push_run_env(&mut argv, &self.cfg.release.run);
+        argv.push(image.to_string());
         argv.extend(command.iter().cloned());
         Argv(argv)
+    }
+
+    /// Appends `--env-file <path>` (resolved against `deploy_root`) then the `-e KEY=VALUE` pairs from a
+    /// release `run` spec. The file comes first so an explicit `env:` entry overrides the same key in it.
+    fn push_run_env(&self, argv: &mut Vec<String>, run: &crate::config::RunSpec) {
+        if let Some(env_file) = &run.env_file {
+            let path = if env_file.is_absolute() {
+                env_file.clone()
+            } else {
+                self.cfg.deploy_root.join(env_file)
+            };
+            argv.push("--env-file".into());
+            argv.push(path.display().to_string());
+        }
+        for (key, value) in &run.env {
+            argv.push("-e".into());
+            argv.push(format!("{key}={value}"));
+        }
     }
 }
 
@@ -234,7 +250,44 @@ workers:
             .collect();
         assert_eq!(
             d.run_throwaway("demo-migrate-42", "reg/app:app-1", &cmd).display(),
-            "docker run --rm --network demo_net --name demo-migrate-42 reg/app:app-1 php bin/console app:db:migrate before"
+            "docker run --rm --network demo_net --name demo-migrate-42 -e TZ=UTC reg/app:app-1 php bin/console app:db:migrate before"
+        );
+    }
+
+    #[test]
+    fn env_file_is_passed_to_run_and_throwaway_resolved_against_deploy_root() {
+        let src = r#"
+version: 1
+project: demo
+network: demo_net
+deploy_root: /srv/demo
+docker:
+  images: { app: app-1 }
+  services:
+    nginx: { container: demo-nginx, recreate: never }
+compose:
+  files: [base.yml]
+release:
+  image: app
+  container_prefix: demo-app
+  run:
+    env_file: app.env
+    env: { TZ: UTC }
+  healthcheck: { exec_in: demo-nginx, cmd: 'curl {container}' }
+cutover:
+  backend_port: 8080
+  reload: { exec_in: demo-nginx, cmd: 'nginx -s reload' }
+"#;
+        let cfg = crate::config::load(src, None, &[], &HashMap::new()).unwrap();
+        let d = Docker::new(&cfg);
+        assert_eq!(
+            d.run_black("demo-app-7", "reg/app:app-1").display(),
+            "docker run -d --name demo-app-7 --network demo_net --restart unless-stopped --env-file /srv/demo/app.env -e TZ=UTC reg/app:app-1"
+        );
+        let cmd: Vec<String> = ["php", "bin/console", "doctrine:migrations:migrate"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            d.run_throwaway("demo-migrate-7", "reg/app:app-1", &cmd).display(),
+            "docker run --rm --network demo_net --name demo-migrate-7 --env-file /srv/demo/app.env -e TZ=UTC reg/app:app-1 php bin/console doctrine:migrations:migrate"
         );
     }
 
