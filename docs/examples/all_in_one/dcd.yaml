@@ -20,8 +20,11 @@
 # Identity and where things run.
 
 version: 1             # config schema version — only 1 exists.   (default: 1)
-project: allinone      # names the deploy: the compose project, the state file, …
-network: allinone_net  # the external docker network every container joins.
+project: allinone      # names the deploy: compose project, state file, … (default: the deploy_root folder name)
+network: allinone_net  # the docker network every container joins.   (default: <project>_default)
+# Both are optional. Omit them and dcd derives project from the deploy_root folder and network as
+# <project>_default, and injects compose.env.COMPOSE_PROJECT_NAME. The {project} token is then expanded
+# everywhere — e.g. `container: '{project}-nginx'` namespaces per stage (prod vs beta on one host).
 
 # registry + deploy_root are read from the environment when omitted, so CI almost
 # never sets them. Shown here only for completeness:
@@ -107,6 +110,10 @@ release:
   run:                            # how the container is `docker run`
     network_alias: app            # alias other containers reach it by      (optional)
     restart: unless-stopped       # docker restart policy                   (default: unless-stopped)
+    env_file: app.env             # --env-file for `docker run`: a host env-file (KEY=VALUE), resolved
+                                  # against deploy_root. Also fed to the migrate:before container, so
+                                  # runtime secrets reach migrations too. An explicit `env:` key below
+                                  # overrides the same key in the file.        (optional, default: none)
     env: { TZ: UTC }              # extra -e VARS                           (default: none)
     volumes:                      # -v bind mounts                          (default: none)
       - '${DEPLOY_ROOT:-/srv/allinone}/.docker/logs:/var/log/app'

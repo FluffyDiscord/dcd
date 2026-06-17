@@ -35,8 +35,8 @@ app? how does traffic get **cut over** (which container runs `nginx -s reload`)?
 
 ```yaml
 version: 1                 # default: 1 — optional
-project: myapp             # required — names state + the compose project
-network: myapp_net         # required — the external docker network
+project: myapp             # optional — defaults to the deploy_root folder name; names state + compose project
+network: myapp_net         # optional — defaults to <project>_default (the compose default network)
 registry: …                # optional — defaults from $REGISTRY / $CI_REGISTRY_IMAGE
 deploy_root: …             # optional — defaults from $DEPLOY_ROOT, else "."
 
@@ -127,9 +127,16 @@ dcd deploy <stage> --dry-run      # the exact docker/compose argv, nothing execu
 
 ## 5. Required-fields checklist + what `check` enforces
 
-Required, or `check` fails: `project`, `network`, `docker.images`, `compose`,
-`release.image`, `release.container_prefix`, `release.healthcheck` (`exec_in` + `cmd`),
-`cutover.backend_port`, `cutover.reload`.
+Required, or `check` fails: `docker.images`, `compose`, `release.image`,
+`release.container_prefix`, `release.healthcheck` (`exec_in` + `cmd`), `cutover.backend_port`,
+`cutover.reload`. (`project` and `network` are optional — see defaults below.)
+
+**Identity defaults (so a lean, multi-stage config can omit them):**
+- `project` defaults to the **`deploy_root` folder name**; `network` to **`<project>_default`**;
+  `compose.env.COMPOSE_PROJECT_NAME` to the project. An explicit value always wins.
+- The **`{project}` token** is expanded everywhere after defaulting. Because `deploy_root` differs
+  per stage, writing container names / `exec_in` / `network_alias` as `{project}-foo` namespaces every
+  container and network per stage — prod and beta run side-by-side on one host with no repetition.
 
 Validation rules (all reported by `check` with the offending path):
 
@@ -157,7 +164,11 @@ Validation rules (all reported by `check` with the offending path):
 - **`--image app=<tag>`** is the CI override; it sets `docker.images.app`. `--set
   <path>=<value>` overrides any existing scalar path (a *new* path is an error).
 - **Migrations are expand-contract:** `release.migrate.before` runs pre-cutover in a
-  throwaway container (additive only); `after` runs in the live container.
+  throwaway container (additive only); `after` runs in the live container. The throwaway
+  inherits `release.run.env` + `release.run.env_file`, so runtime `DATABASE_URL`/secrets reach it.
+- **`release.run.env_file`** points `docker run --env-file` at a host env-file (`KEY=VALUE`,
+  resolved vs `deploy_root`) — one 0600 file instead of enumerating each secret as `${VAR}`; an
+  explicit `release.run.env` key overrides the same key in the file. Also feeds `migrate:before`.
 - **Rollback runs no migrations** and re-deploys the previous release's images.
 
 ---

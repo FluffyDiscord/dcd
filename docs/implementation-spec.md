@@ -56,7 +56,7 @@ parse args ─▶ load+merge config ─▶ resolve stage ─▶ host guard ─�
 | Module | Responsibility | Key types |
 |--------|----------------|-----------|
 | `cli` | clap commands/flags → `Action` | `Cli`, `Command`, `Action` |
-| `config` | parse `dcd.yaml`, stage-merge, `${VAR}` interpolation, `--set` overrides, validation | `Config`, `Stage`, `RawConfig`, `ConfigError` |
+| `config` | parse `dcd.yaml`, stage-merge, `${VAR}` interpolation, `--set` overrides, identity defaults (project from deploy_root folder, network `<project>_default`, `{project}` token expansion), validation | `Config`, `Stage`, `RawConfig`, `ConfigError` |
 | `effects` | the testability seam: all side effects behind traits | `CommandRunner`, `FileSystem`, `Clock` |
 | `effects::real` | production impls | `SystemRunner`, `SystemFs`, `SystemClock` |
 | `effects::record` | recording / read-pass-through impls for tests + `--dry-run` | `RecordingRunner`, `MemoryFs`, `FixedClock` |
@@ -233,7 +233,8 @@ release:                               # the red-black app
   run:
     network_alias: app-rr              # SHARED by red & black; never used for healthcheck (§7.7 / §9)
     restart: unless-stopped
-    env: { TZ: UTC }
+    env_file: .env.deploy              # optional --env-file (resolved vs deploy_root); also fed to migrate:before
+    env: { TZ: UTC }                   # -e pairs; an explicit key here overrides the same key in env_file
     volumes: ['${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log']
   healthcheck:
     exec_in: acme-nginx             # check runs from nginx; {container} = black NAME (not the alias)
@@ -387,12 +388,12 @@ Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values
 - **Ordering contract (tested):** worker drain (if any) precedes the first recreate; wait-gates run after all recreates.
 
 ### 7.5 `migrate:before`
-- Skip if unset. `docker run --rm --network {network} --name {project}-migrate-{release_id} {docker.images.app} php bin/console app:db:migrate before --no-interaction` — argv passed **directly** (no `sh -c`), matching the original script. The throwaway container carries **only** image-baked env + `--network` (same env policy as the script; not `release.run.env`).
+- Skip if unset. `docker run --rm --network {network} --name {project}-migrate-{release_id} {--env-file run.env_file} {-e K=V…} {docker.images.app} php bin/console app:db:migrate before --no-interaction` — argv passed **directly** (no `sh -c`), matching the original script. The throwaway carries the **release `run.env_file` + `run.env`** (so runtime-injected DB/secret env reaches migrations) plus image-baked env + `--network`; no volumes.
 - Failure → abort (red untouched). Note: migrations are not guaranteed atomic — expand-contract discipline must keep even a partially-applied `before` migration backward-compatible with red (§11, §9).
 
 ### 7.6 `start:black`
 - `container = {container_prefix}-{release_id}` (stored id, §2.6); fail if it already exists (defence behind the lock; orphan-reaping in 7.1 clears stale ones).
-- `docker run -d --name {container} --network {network} --network-alias {run.network_alias} --restart {run.restart} {-e K=V…} {-v vol…} {docker.images.app}`. Mirrors the original script.
+- `docker run -d --name {container} --network {network} --network-alias {run.network_alias} --restart {run.restart} {--env-file run.env_file} {-e K=V…} {-v vol…} {docker.images.app}`. `--env-file` (resolved vs deploy_root) precedes `-e`, so an explicit `env:` key overrides the file. Mirrors the original script.
 
 ### 7.7 `healthcheck`
 - Repeat up to `retries`, sleeping `interval`: substitute the black **container name** into `healthcheck.cmd` (`{container}`), run `docker exec {healthcheck.exec_in} sh -c '<cmd>'` *(Mutate — execs into the black, which exists only after `start:black`; stubbed-OK in `--dry-run` like any post-`start:black` step)*; success on exit 0.
