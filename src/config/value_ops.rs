@@ -173,6 +173,77 @@ fn parse_scalar(raw: &str) -> Value {
     serde_yaml::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
+/// Derive identity so a lean, multi-stage config can omit it: `project` defaults to the
+/// `deploy_root` folder name, `network` to `<project>_default`, `compose.env.COMPOSE_PROJECT_NAME`
+/// to the project; then the `{project}` token is expanded everywhere. Because `deploy_root` differs
+/// per stage, every container/network namespaces per stage with no repetition (e.g. prod vs beta on
+/// one host). An explicit value always wins — this only fills what is absent.
+pub fn default_identity(base: &mut Value) {
+    let project = resolve_project(base);
+    if let Value::Mapping(map) = base {
+        map.insert(Value::String("project".into()), Value::String(project.clone()));
+        if !map.contains_key(Value::String("network".into())) {
+            map.insert(Value::String("network".into()), Value::String(format!("{project}_default")));
+        }
+    }
+    inject_compose_project_name(base, &project);
+    expand_token(base, "{project}", &project);
+}
+
+fn resolve_project(base: &Value) -> String {
+    if let Some(explicit) = base.get("project").and_then(Value::as_str) {
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
+    }
+    let deploy_root = base.get("deploy_root").and_then(Value::as_str).unwrap_or(".");
+    folder_name(deploy_root)
+}
+
+fn folder_name(path: &str) -> String {
+    let named = std::path::Path::new(path.trim_end_matches('/'))
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != ".");
+    match named {
+        Some(name) => name.to_string(),
+        None => std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "app".to_string()),
+    }
+}
+
+fn inject_compose_project_name(base: &mut Value, project: &str) {
+    let Some(root) = base.as_mapping_mut() else { return };
+    let Some(compose) = ensure_map(root, "compose") else { return };
+    let Some(env) = ensure_map(compose, "env") else { return };
+    if !env.contains_key(Value::String("COMPOSE_PROJECT_NAME".into())) {
+        env.insert(
+            Value::String("COMPOSE_PROJECT_NAME".into()),
+            Value::String(project.to_string()),
+        );
+    }
+}
+
+/// Ensure `parent[key]` is a mapping, creating it if missing, and return it.
+fn ensure_map<'a>(parent: &'a mut serde_yaml::Mapping, key: &str) -> Option<&'a mut serde_yaml::Mapping> {
+    let slot = Value::String(key.to_string());
+    if !parent.contains_key(slot.clone()) {
+        parent.insert(slot.clone(), Value::Mapping(Default::default()));
+    }
+    parent.get_mut(slot).and_then(Value::as_mapping_mut)
+}
+
+fn expand_token(value: &mut Value, token: &str, replacement: &str) {
+    match value {
+        Value::String(s) if s.contains(token) => *s = s.replace(token, replacement),
+        Value::Sequence(items) => items.iter_mut().for_each(|v| expand_token(v, token, replacement)),
+        Value::Mapping(map) => map.iter_mut().for_each(|(_, v)| expand_token(v, token, replacement)),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +254,40 @@ mod tests {
 
     fn yaml(s: &str) -> Value {
         serde_yaml::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn default_identity_fills_from_deploy_root_and_expands_token() {
+        let mut v = yaml(
+            "deploy_root: /var/www/beta-app\ncompose:\n  files: [c.yml]\nrelease:\n  container_prefix: '{project}-app'\n  healthcheck: { exec_in: '{project}-router', cmd: x }",
+        );
+        default_identity(&mut v);
+        assert_eq!(v.get("project").and_then(Value::as_str), Some("beta-app"));
+        assert_eq!(v.get("network").and_then(Value::as_str), Some("beta-app_default"));
+        assert_eq!(
+            v.get("release").and_then(|r| r.get("container_prefix")).and_then(Value::as_str),
+            Some("beta-app-app")
+        );
+        assert_eq!(
+            v.get("release").and_then(|r| r.get("healthcheck")).and_then(|h| h.get("exec_in")).and_then(Value::as_str),
+            Some("beta-app-router")
+        );
+        assert_eq!(
+            v.get("compose").and_then(|c| c.get("env")).and_then(|e| e.get("COMPOSE_PROJECT_NAME")).and_then(Value::as_str),
+            Some("beta-app")
+        );
+    }
+
+    #[test]
+    fn default_identity_never_overrides_explicit_values() {
+        let mut v = yaml("project: custom\nnetwork: custom_net\ndeploy_root: /var/www/app\ncompose:\n  env:\n    COMPOSE_PROJECT_NAME: keep");
+        default_identity(&mut v);
+        assert_eq!(v.get("project").and_then(Value::as_str), Some("custom"));
+        assert_eq!(v.get("network").and_then(Value::as_str), Some("custom_net"));
+        assert_eq!(
+            v.get("compose").and_then(|c| c.get("env")).and_then(|e| e.get("COMPOSE_PROJECT_NAME")).and_then(Value::as_str),
+            Some("keep")
+        );
     }
 
     #[test]

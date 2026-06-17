@@ -1,5 +1,6 @@
 //! Typed configuration: load order is parse → interpolate → select+merge stage →
-//! `--set` → deserialize (deny-unknown-fields typo guard) → validate. See spec §5.
+//! `--set` → identity defaults (project/network/{project}) → deserialize
+//! (deny-unknown-fields typo guard) → validate. See spec §5.
 
 mod value_ops;
 
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::error::{DcdError, Result};
-use value_ops::{apply_set, get_sequence, interpolate, merge_value, set_sequence};
+use value_ops::{apply_set, default_identity, get_sequence, interpolate, merge_value, set_sequence};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +130,8 @@ pub struct RunSpec {
     pub network_alias: Option<String>,
     #[serde(default = "unless_stopped")]
     pub restart: String,
+    #[serde(default)]
+    pub env_file: Option<PathBuf>,
     #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
     #[serde(default)]
@@ -424,6 +427,10 @@ pub fn load(
     for assignment in sets {
         apply_set(&mut base, assignment)?;
     }
+
+    // Fill project/network from the deploy_root folder and expand the {project} token (after --set,
+    // so an explicit override still wins).
+    default_identity(&mut base);
 
     let mut config: Config =
         serde_yaml::from_value(base).map_err(|e| DcdError::Config(e.to_string()))?;
