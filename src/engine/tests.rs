@@ -98,7 +98,7 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
     assert!(has("docker inspect demo-postgres --format {{.Config.Image}}"));
     assert!(has("docker compose -p demo --env-file compose.env -f base.yml up -d --no-recreate postgres"));
     assert!(has("docker exec demo-postgres sh -c pg_isready"));
-    assert!(has("docker run --rm --network demo_net --name demo-migrate-1000 reg:app-1 migrate before"));
+    assert!(has("docker run --rm --network demo_net --name demo-migrate-1000 -e TZ=UTC reg:app-1 migrate before"));
     assert!(has("docker run -d --name demo-app-1000 --network demo_net --network-alias app-rr --restart unless-stopped -e TZ=UTC reg:app-1"));
     assert!(has("docker exec demo-nginx sh -c curl -sf http://demo-app-1000:2114/health"));
     assert!(has("docker exec demo-nginx sh -c nginx -s reload"));
