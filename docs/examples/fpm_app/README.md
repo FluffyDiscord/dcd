@@ -1,0 +1,119 @@
+# A PHP-FPM app deployed red-black with `dcd`
+
+A production-shaped example: a **Symfony app whose release image is nginx + php-fpm under
+supervisord** (HTTP on `:8080`), deployed zero-downtime with [`dcd`](../../..) across two stages
+(`prod` + `beta`) on a single host.
+
+Where some apps **are** the HTTP server (RoadRunner, FrankenPHP), here the app is a classic FPM
+stack: nginx terminates HTTP inside the container and speaks FastCGI to php-fpm. The dcd wiring is
+the same either way — that's the point. dcd cuts over an HTTP port; what serves it is up to the image.
+
+## The shape
+
+```
+                          ┌─────────────── one host ───────────────┐
+  TLS (system nginx) ──►  router :8080  ──proxy──►  webapp-app-<rel>   (release, red-black)
+                          (dcd cutover              └ nginx :8080 ──FastCGI──► php-fpm :9000
+                           target)                  webapp-mariadb, webapp-meilisearch,
+                                                    webapp-scheduler        (side containers)
+```
+
+dcd builds `webapp-app-<new-release>` beside the live one, health-checks it **through** the router
+(`curl http://{container}:8080/health`), then rewrites the router's upstream file and reloads nginx —
+the flip is atomic and the old container drains gracefully.
+
+## Files
+
+```
+dcd.yaml                  the deploy config (prod + beta stages)
+docker-compose.prod.yml   side containers: router, mariadb, meilisearch, scheduler
+docker-compose.beta.yml   beta-only overlay: adds mailpit + a loopback DB port
+router/                   the dcd cutover-target nginx (built on the server): Dockerfile, router.conf, maintenance.html
+host-nginx.example.conf   reference vhost for the SYSTEM nginx (TLS terminator → router :8080/:8081)
+.env.deploy.app.example   template for app secrets   → copy to .env.deploy.app   (0600)
+.env.deploy.infra.example template for infra secrets → copy to .env.deploy.infra (0600)
+app-image/                REFERENCE (lives in the app repo, baked into the image — not shipped to the server):
+  supervisord.conf          runs php-fpm + nginx; the drain socket
+  nginx/release.conf        the in-container nginx on :8080 (health probe, static, FastCGI)
+  php/fpm-pool.conf         the php-fpm pool
+  drain.sh                  release.drain: graceful stop of nginx then php-fpm
+  scheduler.sh              the scheduler loop, gated by SCHEDULER_ENABLED
+```
+
+The `dcd.yaml` + compose + router + `.env.*` files live at `$DEPLOY_ROOT` on the server (CI rsyncs
+them there). `app-image/` is shown only so the release side of the picture is complete.
+
+## Why FPM changes almost nothing
+
+| Concern | How this example handles it |
+|---|---|
+| What dcd cuts over to | an HTTP port (`:8080`) — nginx-in-the-image serves it, exactly like RR would |
+| Health probe | `/health` → nginx → php-fpm → `health.php` (no kernel, no DB) — fails fast if fpm is down |
+| Graceful drain | `release.drain` → `drain.sh` → `supervisorctl stop nginx php-fpm` (QUIT, finishes in-flight) |
+| DB migrations | `release.migrate.before` runs `doctrine:migrations:migrate` on the new release before cutover |
+| Periodic jobs | a `scheduler` side container loops `schedule:run`, gated per-stage by `SCHEDULER_ENABLED` |
+
+There are **no messenger workers** in this example. If you add them later, the `workers:` block
+stays global so every stage consumes.
+
+## Two stages, one config
+
+`prod` and `beta` share this one `dcd.yaml`, namespaced by a **pinned** `project` per stage:
+
+| | `prod` | `beta` |
+|---|---|---|
+| `project` | `webapp` | `beta-webapp` |
+| network | `webapp_default` | `beta-webapp_default` |
+| containers | `webapp-*` | `beta-webapp-*` |
+| router port (loopback) | `8080` | `8081` |
+| extras | scheduler runs (`SCHEDULER_ENABLED=1`) | + mailpit sink, + loopback DB port |
+
+`project` is pinned (not derived from the `deploy_root` folder name) so the two stages coexist on one
+host regardless of their paths — and a folder name with a dot in it (which Compose v2 rejects as a
+project name) can never leak in. Every container name, the network, and `COMPOSE_PROJECT_NAME` come
+from `{project}` — see how `dcd.yaml` uses `'{project}-router'`, `'{project}-app'`, etc.
+
+## One-time bootstrap (per stage)
+
+```sh
+cd "$DEPLOY_ROOT"
+
+# 1. Registry auth is EPHEMERAL. The CI deploy job logs the server in with job-scoped creds
+#    (docker login --password-stdin), runs dcd, then docker logout. Do the same for a manual deploy;
+#    do NOT leave a persistent login on the box.
+
+# 2. Secrets (Docker env-file format — never shell-sourced). Fill in real values.
+cp .env.deploy.app.example   .env.deploy.app   && chmod 600 .env.deploy.app
+cp .env.deploy.infra.example .env.deploy.infra && chmod 600 .env.deploy.infra
+#   INVARIANT: MARIADB_USER/PASSWORD/DATABASE (.infra) == user/pass/db in DATABASE_URL (.app)
+
+# 3. Persistent data dirs (owned by the image's www-data uid 1000)
+mkdir -p data/mysql data/meili data/uploads data/private data/log
+chown -R 1000:1000 data/uploads data/private data/log
+
+# 4. Wire the system nginx: adapt host-nginx.example.conf (set X-Forwarded-Proto $scheme!), enable, reload.
+```
+
+dcd creates the `<project>_default` network and generates `compose.env` + `nginx-upstream.conf`
+itself — do not hand-edit those.
+
+## Operating it
+
+```sh
+dcd check prod                 # validate the config (stage merge, interpolation, rules)
+dcd deploy prod --dry-run      # print the whole plan, touch nothing
+dcd deploy prod --image app=<tag>
+dcd status prod                # current release + history
+dcd rollback prod --yes        # re-point to the previous release (runs NO migrations)
+dcd deploy prod --resume       # finish a deploy that died after cutover
+```
+
+CI runs the deploy; manually it is:
+
+```sh
+cd "$DEPLOY_ROOT"
+REGISTRY=<registry-image> DEPLOY_ROOT="$DEPLOY_ROOT" dcd deploy prod --image app=<tag>
+```
+
+`REGISTRY` and `DEPLOY_ROOT` are read from the environment (CI sets them per job), so they aren't
+repeated in `dcd.yaml`. `--image app=<tag>` threads in the tag the build stage produced.

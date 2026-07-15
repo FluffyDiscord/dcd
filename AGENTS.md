@@ -16,12 +16,13 @@ Do both with the commands below; never hand over a config you haven't run `dcd c
 
 ## 1. Orient yourself first
 
-Three reference configs ship with the repo — read them before writing anything:
+Reference configs ship with the repo — read them before writing anything:
 
 | File | What it is | Use it to… |
 |------|------------|-----------|
 | output of `dcd init` | the smallest runnable skeleton | start a brand-new config |
 | `docs/examples/roadrunner_app/dcd.yaml` | a real, lean Symfony config | copy a production-shaped one |
+| `docs/examples/fpm_app/dcd.yaml` | a PHP-FPM app, prod + beta stages | copy a multi-stage FPM setup |
 | `docs/examples/all_in_one/dcd.yaml` | **every** field, described, with defaults | look up any option |
 
 Then skim the project you're configuring and answer: what's the **app image**? what

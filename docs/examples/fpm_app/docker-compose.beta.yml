@@ -1,0 +1,35 @@
+# Beta-only overlay — dcd appends it to docker-compose.prod.yml for stage `beta`
+# (stages.beta.compose.files in dcd.yaml). Prod never loads it.
+#
+# Adds mailpit: a catch-all SMTP sink + web UI for the staging box. It is declared in
+# stages.beta.docker.services (dcd.yaml) so dcd starts it and keeps it across deploys, like the
+# other side services — no manual start. SMTP (1025) is INTENTIONALLY unauthenticated and reachable
+# only inside the beta-webapp_default network (never published, never relays off-box): it is a sink,
+# mail never leaves the machine. Only the web UI is published host-local (127.0.0.1) for the system
+# nginx to serve at /mailpit behind HTTP Basic. The app reaches it via MAILER_DSN =
+# smtp://beta-webapp-mailpit:1025 (.env.deploy.app).
+
+networks:
+  default:
+    name: ${COMPOSE_PROJECT_NAME}_default
+    external: true
+
+services:
+  # Beta-only: expose the DB on the host loopback so it can be reached over an SSH tunnel (admin /
+  # manual import). 127.0.0.1 ONLY — never externally reachable; the tunnel terminates here. This just
+  # adds a port to the base mariadb service (defined in docker-compose.prod.yml); prod's mariadb stays
+  # unpublished. Connect e.g.: ssh -L 13306:127.0.0.1:3306 <host>  ->  mysql -h127.0.0.1 -P13306 -uapp app
+  mariadb:
+    ports:
+      - "127.0.0.1:${MARIADB_HOST_PORT:-3306}:3306"
+
+  mailpit:
+    image: axllent/mailpit:v1.21.8
+    container_name: ${COMPOSE_PROJECT_NAME}-mailpit
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+      MP_WEBROOT: mailpit          # serve UI + API under /mailpit so the path-preserving proxy resolves
+      MP_MAX_MESSAGES: "5000"      # in-memory sink; messages are not persisted across recreation
+    ports:
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"   # UI only — the host nginx proxies /mailpit here

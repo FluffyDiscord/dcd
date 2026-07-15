@@ -1,0 +1,67 @@
+# Long-lived side containers for the dcd deploy. The red-black app container is run by dcd
+# directly (not here). Paths are relative to this file's dir (= $DEPLOY_ROOT).
+# COMPOSE_PROJECT_NAME / REGISTRY / APP_TAG / ROUTER_TAG / ROUTER_PORT come from dcd's compose.env,
+# so every name namespaces per stage and prod + beta coexist on one host.
+#
+# Conventions:
+#   - app + router come from the CI registry (${REGISTRY}:<tag>) — never built on the server.
+#   - mariadb + meilisearch are stock images pinned to exact stable versions.
+#   - Nothing is published publicly: only the router binds a port, on 127.0.0.1 (the host nginx
+#     terminates TLS and proxies to it); all other services talk over the private default network.
+#   - Secrets reach containers only via env_file (Docker env-file format) — never via compose.env.
+
+networks:
+  default:
+    name: ${COMPOSE_PROJECT_NAME}_default
+    external: true
+
+services:
+  router:
+    image: ${REGISTRY}:${ROUTER_TAG:-router-latest}
+    container_name: ${COMPOSE_PROJECT_NAME}-router
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${ROUTER_PORT}:80"
+    volumes:
+      - ./nginx-upstream.conf:/etc/nginx/upstream/nginx-upstream.conf:ro
+
+  mariadb:
+    image: mariadb:10.6.22
+    container_name: ${COMPOSE_PROJECT_NAME}-mariadb
+    restart: unless-stopped
+    env_file:
+      - .env.deploy.infra
+    environment:
+      TZ: UTC
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.35.0
+    container_name: ${COMPOSE_PROJECT_NAME}-meilisearch
+    restart: unless-stopped
+    env_file:
+      - .env.deploy.infra
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - ./data/meili:/meili_data
+
+  scheduler:
+    image: ${REGISTRY}:${APP_TAG}
+    container_name: ${COMPOSE_PROJECT_NAME}-scheduler
+    restart: unless-stopped
+    init: true
+    command:
+      - sh
+      - /app/docker/prod/scheduler.sh
+    env_file:
+      - .env.deploy.app
+    environment:
+      TZ: UTC
+      APP_ENV: prod
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-0}   # prod sets 1 (dcd stages.prod); beta defaults 0 -> idles
+    volumes:
+      - ./data/uploads:/app/public/uploads
+      - ./data/private:/app/private
+      - ./data/log:/app/var/log

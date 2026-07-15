@@ -1,0 +1,129 @@
+# A PHP-FPM Symfony app, deployed red-black with dcd.
+#
+# The release image is nginx + php-fpm under supervisord, serving HTTP on :8080 (see
+# app-image/ for that side of the picture). dcd builds the new release beside the live one,
+# health-checks it through the router, then flips the router's upstream to it.
+#
+# Each stage pins `project` explicitly (stages.<stage>.project): prod -> "webapp",
+# beta -> "beta-webapp". That name drives every container ({project}-*), the network
+# (<project>_default) and COMPOSE_PROJECT_NAME, so prod and beta run side-by-side on one host.
+# It is pinned rather than derived from the deploy_root folder name so the two stages namespace
+# apart even when their paths differ (and a folder name containing a dot, which Compose v2 rejects
+# as a project name, can't leak in).
+#
+# Requires a dcd build with release.run.env_file + {project} support. Only the fields this setup
+# customizes are shown; anything at its default is omitted — see ../all_in_one/dcd.yaml for the
+# full field reference.
+
+version: 1
+
+docker:
+  images:
+    app: ${APP_TAG:-app-latest}
+    # The router is a CI-built image too (built from router/, pushed as ${REGISTRY}:${ROUTER_TAG}),
+    # not built on the server.
+    router: ${ROUTER_TAG:-router-latest}
+  services:
+    # router first: it is ready before the release healthcheck, which curls THROUGH it.
+    router:
+      image: router
+      container: '{project}-router'
+      recreate: on-image-change
+      wait:
+        exec_in: '{project}-router'
+        cmd: 'test -f /var/run/nginx.pid'
+        retries: 30
+    mariadb:
+      container: '{project}-mariadb'
+      wait:
+        exec_in: '{project}-mariadb'
+        cmd: 'mariadb-admin ping -h 127.0.0.1 --protocol=tcp --silent'
+        retries: 60
+    meilisearch:
+      container: '{project}-meilisearch'
+      recreate: never
+    scheduler:
+      image: app
+      container: '{project}-scheduler'
+      wait:
+        exec_in: '{project}-scheduler'
+        cmd: 'pgrep -f scheduler.sh'
+        retries: 10
+
+compose:
+  files:
+    - docker-compose.prod.yml
+  env:
+    REGISTRY: ${REGISTRY}
+    APP_TAG: ${APP_TAG:-app-latest}
+    ROUTER_TAG: ${ROUTER_TAG:-router-latest}
+    DEPLOY_ROOT: ${DEPLOY_ROOT}
+    ROUTER_PORT: '8080'
+    # dcd injects COMPOSE_PROJECT_NAME=<project> here automatically; compose uses it for
+    # container_name and the external default network.
+
+directories:
+  - path: data/mysql
+  - path: data/meili
+  - path: data/uploads
+    owner: '1000:1000'
+  - path: data/private
+    owner: '1000:1000'
+  - path: data/log
+    owner: '1000:1000'
+
+release:
+  image: app
+  container_prefix: '{project}-app'
+  run:
+    network_alias: '{project}-app'
+    env_file: .env.deploy.app
+    env:
+      TZ: UTC
+      APP_ENV: prod
+    volumes:
+      - '${DEPLOY_ROOT}/data/uploads:/app/public/uploads'
+      - '${DEPLOY_ROOT}/data/private:/app/private'
+      - '${DEPLOY_ROOT}/data/log:/app/var/log'
+  healthcheck:
+    exec_in: '{project}-router'
+    cmd: 'curl -sf http://{container}:8080/health'   # {container}, never the alias
+  migrate:
+    before: 'php bin/console doctrine:migrations:migrate --no-interaction --allow-no-migration'
+  drain: 'sh /app/docker/prod/drain.sh'
+
+cutover:
+  backend_port: 8080
+  fallback_backend: '127.0.0.1:9'
+  validate:
+    exec_in: '{project}-router'
+    cmd: 'nginx -t'
+  reload:
+    exec_in: '{project}-router'
+    cmd: 'nginx -s reload'
+
+stages:
+  # deploy_root comes from $DEPLOY_ROOT (CI sets it per job). `project` is pinned per stage
+  # (independent of that path), so prod and beta namespace apart on one host. beta only needs its
+  # own router port behind the system nginx.
+  prod:
+    project: webapp
+    compose:
+      env:
+        SCHEDULER_ENABLED: '1'   # prod runs the scheduler loop; beta leaves it unset -> idles (app-image scheduler.sh)
+  beta:
+    project: beta-webapp
+    compose:
+      files:
+        - docker-compose.beta.yml
+      env:
+        ROUTER_PORT: '8081'
+        MAILPIT_UI_PORT: '8025'
+    docker:
+      services:
+        # mailpit is defined in the appended docker-compose.beta.yml. Declaring it here merges into
+        # the base services map for the beta stage only (deep-merge, like compose.env above), so dcd
+        # starts and re-asserts it across deploys. Not waited on — it never gates cutover.
+        mailpit:
+          container: '{project}-mailpit'
+          recreate: never
