@@ -1,3 +1,21 @@
+UPGRADE FROM 0.2 to 0.3
+=======================
+
+`--env-stdin` on its own is now the WHOLE chain: no `.env` is discovered next to
+`dcd.yaml`. Before, a stdin-only run still absorbed an implicitly discovered
+`.env`/`.env.local` from the config directory — an application's own dotenv sitting
+beside `dcd.yaml` was shipped, dev credentials included, into every container.
+
+ * If you piped secrets on stdin AND relied on those implicit file layers, add
+   `--env-dir .` (or `--env-file <base>`) to keep them — both still stack a stdin
+   layer on top
+
+ * Run `dcd check <stage>` and compare the `env: loaded …` lines before and after
+   upgrading; a shrunken key set means you needed the flag
+
+ * `--env-file` and `--env-dir` runs are unaffected, as are runs without `--env-stdin`
+
+
 UPGRADE FROM 0.1 to 0.2
 =======================
 

@@ -172,7 +172,8 @@ Validation rules (all reported by `check` with the offending path):
   `.env.<stage>` → `.env.<stage>.local` from the config file's directory (`--env-dir`
   overrides; `--env-file <base>` rebases the whole chain onto another base name, e.g.
   `.env.deploy[.local|.<stage>|.<stage>.local]`, so it can coexist with the app's own
-  `.env` files — the explicit base must exist; `--env-stdin` adds a disk-free top layer),
+  `.env` files — the explicit base must exist; `--env-stdin` adds a disk-free top layer,
+  and on its own it is the whole chain: no `.env` is discovered next to the config),
   real process env wins over every file, and every chain-defined key is delivered to
   app/migrate/worker containers as bare `-e KEY` + process env — never written to disk.
   Cross-layer references resolve deferred (forward references work, a later layer

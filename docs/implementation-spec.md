@@ -328,6 +328,8 @@ Loaded before config interpolation. The chain hangs off a **base file**: `--env-
 | 4 | `.env.<stage>.local` | |
 | 5 | `--env-stdin` | one dotenv-format document read from stdin (same parser; error-context filename `<stdin>`); the highest **file** layer. Refused **eagerly at argument parsing** when stdin is a TTY, or when the command can prompt (`rollback`, refuse-confirmations) and `-y/--yes` is absent |
 
+**Layers 1–4 exist only when a file source was named.** `--env-stdin` **on its own suppresses implicit discovery entirely** (`chain_base()` in `src/cli.rs` returns `None`): the stdin document is the whole chain, nothing is probed on disk, and the `env: absent …` report is empty. Combining files with a stdin layer is explicit — `--env-dir` or `--env-file`. Rationale: implicit `.env` discovery is a convenience for the file-based workflow, and silently absorbing an application `.env` that happens to sit beside `dcd.yaml` would ship its keys — dev credentials included — into every container of a deploy whose operator asked for stdin-only secrets. This mirrors the `--env-file /dev/null` pin that already disables compose's own implicit `.env` discovery (§5.2.4).
+
 Later layers override earlier; the **real process environment overrides every layer** (captured once at startup, `src/cli.rs`). An **absent** file is silently skipped (an empty chain is the pre-rework status quo); a file that is present but unreadable, a directory, or not valid UTF-8 is a loud `ConfigError` naming the path — never a silent skip. A `--env-dir` pointing at a missing directory is a `ConfigError`. A stage resolved to the empty string (no `stages:`) loads layers 1–2 only — never `.env.` / `.env..local`.
 
 **Parser:** a Rust port of `symfony/dotenv` **8.1** (`Dotenv::parse` + `parseRaw`), including the exact grammar (quoting, concatenated segments, `export`, comments, CRLF/BOM rules, NUL-byte rejection, `_*`-prefixed variable names, `${VAR}` / `${VAR:-default}` / `${VAR:=default}` with Symfony's brace/default edge cases) and the `FormatException` context format (`<msg> in "<file>" at line N` + snippet + caret). 8.1 lexes values **raw** — literal `$` is protected as a `\x00` marker (`\$`, single-quoted `$`), backslashes stay escaped — and resolves afterwards; an unquoted value containing `$` may contain spaces (only space-without-`$` errors). Ported deviations, each a hard error or documented: `$(command)` is **lexed but never executed** — a completed `$(…)` expression is a `ConfigError` (a deploy tool must not shell-execute env-file content; during deferred chain resolution the error names the key instead of a file position; the refusal also fires for `$(…)` spanning a quoted newline, and — fail-closed divergence — for empty `$()`/`$(())`, which Symfony's command regex leaves literal); no `$_SERVER`/`HTTP_`/`putenv` semantics (dcd is process-env-model only; the process-env snapshot is the single "external" source); no `.env.local.php`. Conformance is proven by porting the `DotenvTest.php` data providers (§10.1 TC-031).
@@ -514,7 +516,7 @@ dcd <command> [stage] [flags]
 | `--image <logical>=<tag>` | override a `docker.images.<logical>` entry (repeatable; CI passes app/db/nginx) |
 | `--set <path>=<value>` | override an existing config scalar (repeatable; §5.1 semantics) |
 | `--env-dir <path>` | directory of the dotenv chain (default: the config file's directory) (§5.2.1) |
-| `--env-stdin` | read one dotenv-format document from stdin as the highest file layer; interactive prompts then error without `-y/--yes` (§5.2) |
+| `--env-stdin` | read one dotenv-format document from stdin; alone it is the whole chain (no implicit `.env` discovery), with `--env-dir`/`--env-file` the highest file layer; interactive prompts then error without `-y/--yes` (§5.2) |
 | `-v/--verbose`, `-q/--quiet`, `--no-color` | output control |
 | `-y/--yes` | assume yes (rollback / refuse prompts) |
 | `--reason <text>` | annotate this deploy/rollback in state |
@@ -632,6 +634,7 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | TC-038 | removed key `compose.env_file` | pre-rework config | targeted `ConfigError` pointing at UPGRADE.md (not "unknown field") | `release.run.env_file` still accepted |
 | TC-039 | `check` env DX | chain + filters + shadowing process env | prints files found/skipped, per-layer counts, per-container key names, shadowed keys; **no values anywhere in output** | reserved key → error |
 | TC-040 | `--env-stdin` | dotenv doc on stdin; a confirming command without `--yes` | stdin layer overrides `.env.<stage>.local`; prompt → error demanding `--yes` | empty stdin = empty layer |
+| TC-041 | `--env-stdin` alone | a `.env`/`.env.local` sitting next to `dcd.yaml` | neither is discovered; `<stdin>` is the only layer and nothing is probed on disk | `--env-dir`/`--env-file` re-enables file layers under the stdin layer |
 
 ### 10.2 Integration tests
 
