@@ -123,6 +123,8 @@ dcd deploy <stage> --dry-run      # the exact docker/compose argv, nothing execu
 - If the config has multiple `stages`, a stage arg is required (e.g. `dcd check prod`).
 - `--dry-run` runs read-only probes for real but stubs every mutation, so the printed plan is
   truthful about the current state without changing anything.
+- Add `-v` to any of these when a step behaves unexpectedly: it traces each command dcd runs
+  with its exit code and the output that is otherwise only shown on failure.
 
 ---
 

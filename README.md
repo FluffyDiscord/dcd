@@ -28,11 +28,12 @@ dcd deploy prod          # do it
 | `dcd deploy --dry-run` | print every command, touch nothing |
 | `dcd check [stage]` | validate the config |
 | `dcd init` | scaffold a `dcd.yaml` (`--with-plugin` adds a Lua stub) |
-| `dcd --version` | the built version (`-v`) |
+| `dcd deploy -v [stage]` | trace every command: argv, exit code, elapsed, output |
+| `dcd --version` | the built version (`-V`) |
 
 Global flags: `--config <path>` · `--env-dir <path>` · `--env-file <path>` · `--env-stdin` ·
 `--json` · `--image app=<tag>` (repeatable) · `--set path=value` (repeatable) · `--yes` ·
-`--reason <text>` · `--version`.
+`--reason <text>` · `-v/--verbose` · `-V/--version`.
 
 Env comes from a Symfony-style dotenv chain next to `dcd.yaml` (`.env` → `.env.local` →
 `.env.<stage>` → `.env.<stage>.local`, real env wins); every chain-defined key reaches the

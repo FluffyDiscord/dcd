@@ -517,7 +517,8 @@ dcd <command> [stage] [flags]
 | `--set <path>=<value>` | override an existing config scalar (repeatable; §5.1 semantics) |
 | `--env-dir <path>` | directory of the dotenv chain (default: the config file's directory) (§5.2.1) |
 | `--env-stdin` | read one dotenv-format document from stdin; alone it is the whole chain (no implicit `.env` discovery), with `--env-dir`/`--env-file` the highest file layer; interactive prompts then error without `-y/--yes` (§5.2) |
-| `-v/--verbose`, `-q/--quiet`, `--no-color` | output control |
+| `-v/--verbose` | trace every spawned command: argv, exit code, elapsed, captured stdout/stderr (§8.2) |
+| `-V/--version` | binary version |
 | `-y/--yes` | assume yes (rollback / refuse prompts) |
 | `--reason <text>` | annotate this deploy/rollback in state |
 
@@ -537,6 +538,8 @@ dcd <command> [stage] [flags]
 ### 8.2 Output modes (ADR-009)
 
 One `Event` stream → reporter renders by environment: **rich** (TTY: per-task status + elapsed + summary), **plain** (no TTY: `[HH:MM:SS] <task>: <status>` — matches today's `log()`), **`--json`** (`{ts,stage,task,status,ms,detail}` per line). All failures print the failing argv + captured stderr.
+
+`-v/--verbose` adds a second layer under those task lines: every command the engine spawns is traced at its single choke point (`Engine::run_argv`, plus the `configure` hook's own runner) as `$ <argv>` / `  exit <code> in <ms>ms` with stdout prefixed `  | ` and stderr `  ! `, or `{"exec":…}` + `{"exec_result":…}`/`{"exec_error":…}` under `--json`. Commands stubbed by `--dry-run` are not traced — they already print as `plan` lines, and nothing ran. The trace can never leak a secret: chain env is delivered as a bare `-e KEY` (§5.2.4), so no value is ever part of an argv.
 
 ### 8.3 CI integration (replaces the existing CI deploy stage)
 

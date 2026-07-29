@@ -1,3 +1,19 @@
+UPGRADE FROM 0.3 to 0.4
+=======================
+
+`-v` is `--verbose`, not `--version`. The version short flag is now `-V`.
+
+ * `-v/--verbose` traces every command dcd spawns — argv, exit code, elapsed, and the
+   stdout/stderr that is otherwise captured and dropped unless the command fails. Under
+   `--json` it is two extra event kinds (`exec`, `exec_result`/`exec_error`)
+
+ * Anything scripted against `dcd -v` for the version string must move to `-V`;
+   `--version` is unchanged
+
+ * Env values still never appear in the trace: chain keys reach containers as a bare
+   `-e KEY`, so no argv ever carries a value
+
+
 UPGRADE FROM 0.2 to 0.3
 =======================
 
@@ -22,7 +38,7 @@ UPGRADE FROM 0.1 to 0.2
 Env is loaded from a dotenv chain where dcd runs and passed through the process
 environment (`-e KEY`). dcd writes no env file. See `docs/implementation-spec.md` §5.2.
 
-Check the installed binary with `dcd --version` (`-v`).
+Check the installed binary with `dcd --version` (`-V`).
 
 Config
 ------
