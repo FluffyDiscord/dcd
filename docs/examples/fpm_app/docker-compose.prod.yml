@@ -1,14 +1,17 @@
 # Long-lived side containers for the dcd deploy. The red-black app container is run by dcd
 # directly (not here). Paths are relative to this file's dir (= $DEPLOY_ROOT).
-# COMPOSE_PROJECT_NAME / REGISTRY / APP_TAG / ROUTER_TAG / ROUTER_PORT come from dcd's compose.env,
-# so every name namespaces per stage and prod + beta coexist on one host.
+# COMPOSE_PROJECT_NAME / REGISTRY / APP_TAG / ROUTER_TAG / ROUTER_PORT come from dcd's compose.env
+# map via the compose process environment (dcd writes no env file), so every name namespaces per
+# stage and prod + beta coexist on one host.
 #
 # Conventions:
 #   - app + router come from the CI registry (${REGISTRY}:<tag>) — never built on the server.
 #   - mariadb + meilisearch are stock images pinned to exact stable versions.
 #   - Nothing is published publicly: only the router binds a port, on 127.0.0.1 (the host nginx
 #     terminates TLS and proxies to it); all other services talk over the private default network.
-#   - Secrets reach containers only via env_file (Docker env-file format) — never via compose.env.
+#   - Secrets reach these side containers only via env_file (Docker env-file format) — never via
+#     the compose.env map. (The red-black app can instead use dcd's dotenv chain, which leaves
+#     nothing at rest — this setup keeps the operator-managed files.)
 
 networks:
   default:

@@ -7,8 +7,19 @@
 #
 # Conventions used below:
 #   • `# default: X`  — the line can be deleted to get X.
-#   • `${VAR}` / `${VAR:-fallback}` interpolate from the environment at load time.
+#   • `${VAR}` / `${VAR:-fallback}` interpolate at load time from the RESOLVED
+#     ENVIRONMENT: the process env layered over the Symfony-style dotenv chain
+#     (.env → .env.local → .env.<stage> → .env.<stage>.local, later wins, real
+#     env wins over all files; cross-layer references resolve Symfony-8.1-style)
+#     read from the config file's directory (override: `--env-dir`; rebase the
+#     chain onto another base name with `--env-file .env.deploy` when the app
+#     owns `.env`; add a disk-free top layer from stdin with `--env-stdin`).
 #     Values containing ${...} must use block style, never flow `{ }`.
+#   • Every key DEFINED in a chain file is also delivered to the app/migrate/
+#     worker containers via process-env passthrough — nothing is written to
+#     disk; filter per container with env_include/env_exclude below. Keys that
+#     exist only in the process env are never delivered (commit a secret-free
+#     `.env` naming the keys; CI supplies values by exporting them).
 #   • Override at the command line with `--set docker.images.app=v2` (any path) or
 #     the shorthand `--image app=v2`.
 #
@@ -77,13 +88,13 @@ docker:
 
 
 # ── compose: how dcd drives `docker compose` ─────────────────────────────────
-# dcd renders `env:` to the env file (mode 0600) and passes it plus every
-# `files:` entry to every compose command it runs.
+# `env:` is injected into every compose command's process environment (compose
+# substitutes ${VAR} in compose files from it) — dcd writes NO env file, and it
+# pins compose's implicit `.env` discovery off with `--env-file /dev/null`.
 
 compose:
   files: [docker-compose.prod.yml]  # -f files, in order (a stage may append more)
-  env_file: compose.env             # where env: is written        (default: compose.env)
-  env:                              # key: value pairs for the env file
+  env:                              # process env for every compose call; may set COMPOSE_*
     COMPOSE_PROJECT_NAME: allinone
     REGISTRY: ${REGISTRY:-registry.example.com}
     APP_TAG: ${APP_TAG:-v1.0.0}
@@ -110,11 +121,15 @@ release:
   run:                            # how the container is `docker run`
     network_alias: app            # alias other containers reach it by      (optional)
     restart: unless-stopped       # docker restart policy                   (default: unless-stopped)
-    env_file: app.env             # --env-file for `docker run`: a host env-file (KEY=VALUE), resolved
-                                  # against deploy_root. Also fed to the migrate:before container, so
-                                  # runtime secrets reach migrations too. An explicit `env:` key below
-                                  # overrides the same key in the file.        (optional, default: none)
-    env: { TZ: UTC }              # extra -e VARS                           (default: none)
+    env_file: app.env             # --env-file for `docker run`: an operator-managed host env-file
+                                  # (KEY=VALUE), resolved against deploy_root. Also fed to the
+                                  # migrate:before container. The dotenv chain usually replaces this;
+                                  # any delivered key overrides the same key in the file.
+                                  #                                          (optional, default: none)
+    env: { TZ: UTC }              # extra vars, delivered as bare `-e KEY` + process env — values
+                                  # never appear in argv or on disk         (default: none)
+    env_include: []               # full-match regexes: chain keys delivered (empty = all)
+    env_exclude: []               # full-match regexes: chain keys withheld; exclude wins
     volumes:                      # -v bind mounts                          (default: none)
       - '${DEPLOY_ROOT:-/srv/allinone}/.docker/logs:/var/log/app'
 
@@ -175,7 +190,10 @@ workers:
     stop_signal: SIGTERM        # signal sent on stop          (default: SIGTERM)
     stop_grace_period: 120s     # grace before SIGKILL         (default: 120s)
     restart: unless-stopped     # docker restart policy        (default: unless-stopped)
-    env: { TZ: UTC }            # extra -e VARS                (default: none)
+    env: { TZ: UTC }            # extra vars; the generated compose file lists key NAMES only,
+                                # values ride the compose process env    (default: none)
+    env_include: []             # chain filters, as in release.run
+    env_exclude: []
     volumes: []                 # -v bind mounts               (default: none)
 
 

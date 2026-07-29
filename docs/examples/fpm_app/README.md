@@ -94,8 +94,12 @@ chown -R 1000:1000 data/uploads data/private data/log
 # 4. Wire the system nginx: adapt host-nginx.example.conf (set X-Forwarded-Proto $scheme!), enable, reload.
 ```
 
-dcd creates the `<project>_default` network and generates `compose.env` + `nginx-upstream.conf`
-itself — do not hand-edit those.
+dcd creates the `<project>_default` network and generates `nginx-upstream.conf` itself — do not
+hand-edit it. (No `compose.env` file exists anymore; compose gets its variables via the process
+environment. Alternative to step 2's at-rest files: keep app secrets in a `.env.prod.local` next
+to `dcd.yaml` — or stream them with `--env-stdin` — and dcd delivers them to the app/migrate
+containers with nothing written to the server; the infra side containers here still use their
+compose `env_file:`.)
 
 ## Operating it
 

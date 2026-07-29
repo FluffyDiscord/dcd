@@ -34,8 +34,8 @@ docker:
       recreate: never
       wait: { exec_in: acme-valkey, cmd: 'valkey-cli ping', retries: 30 }
 
-# Rendered to compose.env and passed to every `docker compose` call (so the tags reach
-# docker-compose.prod.yml too).
+# Injected into every `docker compose` call's process environment (so the tags reach
+# docker-compose.prod.yml too) — nothing is written to disk.
 compose:
   files: [docker-compose.prod.yml]
   env:

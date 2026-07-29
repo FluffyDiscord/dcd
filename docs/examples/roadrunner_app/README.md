@@ -77,8 +77,11 @@ dcd deploy prod --dry-run # print the whole plan, touch nothing
 
 ## Notes
 
-- `docker-compose.prod.yml` is unchanged; `dcd` renders `compose.env` and the workers
-  compose file the same way the original script did.
+- `docker-compose.prod.yml` is unchanged; `compose.env` values ride the compose process
+  environment (no file is written), and the generated workers compose file carries env key
+  names only. Exporting the vars over ssh (as above) works because the process env is the
+  top layer of dcd's dotenv chain; a `.env.prod.local` next to `dcd.yaml` — or
+  `--env-stdin` — replaces the inline exports if preferred.
 - The `nginx` prod image must still `include` the upstream file `dcd` writes
   (`nginx-upstream.conf`) — that wiring already exists in acme's nginx config.
 - Add `host: <prod-hostname>` under `stages.prod` to make `dcd` refuse to run on the
