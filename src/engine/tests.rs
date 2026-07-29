@@ -122,6 +122,50 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
 }
 
 #[test]
+fn verbose_traces_every_command_the_recipe_runs() {
+    let cfg = cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async\nscheduler");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture_verbose(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
+    engine.deploy().unwrap();
+
+    let lines = reporter.lines();
+    let traced: Vec<&String> = lines.iter().filter(|line| line.starts_with("$ ")).collect();
+    assert_eq!(traced.len(), runner.display_calls().len());
+    assert!(traced.iter().any(|line| *line == "$ docker pull reg:app-1"));
+    assert!(lines.iter().any(|line| line.starts_with("  exit 0 in ")));
+
+    // captured stdout is surfaced instead of being dropped
+    assert!(lines.iter().any(|line| line == "  | async"));
+
+    // env values never reach the trace — passthrough is a bare `-e KEY` (§5.2.4)
+    assert!(!lines.iter().any(|line| line.contains("TZ=")));
+}
+
+#[test]
+fn quiet_by_default_leaves_the_recipe_output_untouched() {
+    let cfg = cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async\nscheduler");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
+    engine.deploy().unwrap();
+
+    assert!(!reporter.lines().iter().any(|line| line.starts_with("$ ")));
+}
+
+#[test]
 fn failed_healthcheck_aborts_pre_cutover_and_removes_black() {
     let cfg = cfg();
     let runner = RecordingRunner::new()
