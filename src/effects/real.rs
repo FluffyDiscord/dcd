@@ -1,11 +1,24 @@
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{enforce_check, Access, Argv, Clock, CmdOutput, CommandRunner, FileSystem, RunError, RunOpts};
 
-pub struct SystemRunner;
+/// Spawns every child with the chain runner env and `deploy_root` as its cwd
+/// (spec §5.2.4); per-command `RunOpts::env` overlays win over the runner env.
+#[derive(Default)]
+pub struct SystemRunner {
+    env: BTreeMap<String, String>,
+    cwd: Option<PathBuf>,
+}
+
+impl SystemRunner {
+    pub fn with_context(env: BTreeMap<String, String>, cwd: PathBuf) -> Self {
+        SystemRunner { env, cwd: Some(cwd) }
+    }
+}
 
 impl CommandRunner for SystemRunner {
     fn run(&self, argv: &Argv, _access: Access, opts: &RunOpts) -> Result<CmdOutput, RunError> {
@@ -16,8 +29,15 @@ impl CommandRunner for SystemRunner {
             });
         };
 
-        let output = Command::new(program)
-            .args(args)
+        let mut command = Command::new(program);
+        command.args(args).envs(&self.env);
+        if let Some(overlay) = &opts.env {
+            command.envs(overlay);
+        }
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        let output = command
             .output()
             .map_err(|source| RunError::Spawn {
                 argv: argv.display(),
@@ -37,11 +57,17 @@ pub struct SystemFs;
 
 impl FileSystem for SystemFs {
     fn write(&self, path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-        fs::write(path, bytes)?;
-        if let Some(mode) = mode {
-            set_mode(path, mode)?;
+        match mode {
+            // OpenOptions applies the mode only when CREATING; the chmod covers a
+            // pre-existing file whose mode differs. New files never see the umask default.
+            Some(mode) => {
+                use std::io::Write;
+                let mut file = open_with_mode(path, mode)?;
+                file.write_all(bytes)?;
+                set_mode(path, mode)
+            }
+            None => fs::write(path, bytes),
         }
-        Ok(())
     }
 
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
@@ -59,6 +85,22 @@ impl FileSystem for SystemFs {
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
         fs::create_dir_all(path)
     }
+}
+
+#[cfg(unix)]
+fn open_with_mode(path: &Path, mode: u32) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_with_mode(path: &Path, _mode: u32) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)
 }
 
 #[cfg(unix)]
@@ -80,5 +122,36 @@ impl Clock for SystemClock {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// TC-035's mechanism: the runner env + cwd reach every child, and a
+    /// per-command overlay wins over the runner env.
+    #[test]
+    fn system_runner_delivers_env_cwd_and_overlay() {
+        let cwd = std::env::temp_dir();
+        let env: BTreeMap<String, String> = [
+            ("DCD_TEST_CHAIN".to_string(), "chain-value".to_string()),
+            ("DCD_TEST_SHARED".to_string(), "from-runner".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let runner = SystemRunner::with_context(env, cwd.clone());
+
+        let argv = Argv::of(["sh", "-c", "pwd; printenv DCD_TEST_CHAIN; printenv DCD_TEST_SHARED"]);
+        let overlay: BTreeMap<String, String> =
+            [("DCD_TEST_SHARED".to_string(), "from-overlay".to_string())].into_iter().collect();
+        let out = runner
+            .run(&argv, Access::Read, &RunOpts { check: true, env: Some(overlay) })
+            .unwrap();
+
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        assert_eq!(lines[0], cwd.canonicalize().unwrap().to_str().unwrap());
+        assert_eq!(lines[1], "chain-value");
+        assert_eq!(lines[2], "from-overlay");
     }
 }

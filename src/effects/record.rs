@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 
 use super::{enforce_check, Access, Argv, Clock, CmdOutput, CommandRunner, FileSystem, RunError, RunOpts};
 
+type EnvOverlay = Option<std::collections::BTreeMap<String, String>>;
+
 /// Records every command and returns canned outputs keyed by an argv substring.
 /// Unit tests assert the recorded argv sequence with no Docker.
 #[derive(Default)]
 pub struct RecordingRunner {
-    calls: RefCell<Vec<(Argv, Access)>>,
+    calls: RefCell<Vec<(Argv, Access, EnvOverlay)>>,
     responses: Vec<(String, CmdOutput)>,
 }
 
@@ -35,11 +37,19 @@ impl RecordingRunner {
     }
 
     pub fn calls(&self) -> Vec<Argv> {
-        self.calls.borrow().iter().map(|(a, _)| a.clone()).collect()
+        self.calls.borrow().iter().map(|(a, _, _)| a.clone()).collect()
     }
 
     pub fn display_calls(&self) -> Vec<String> {
-        self.calls.borrow().iter().map(|(a, _)| a.display()).collect()
+        self.calls.borrow().iter().map(|(a, _, _)| a.display()).collect()
+    }
+
+    pub fn env_overlay_of(&self, needle: &str) -> EnvOverlay {
+        self.calls
+            .borrow()
+            .iter()
+            .find(|(argv, _, _)| argv.display().contains(needle))
+            .and_then(|(_, _, env)| env.clone())
     }
 
     fn lookup(&self, argv: &Argv) -> CmdOutput {
@@ -54,7 +64,7 @@ impl RecordingRunner {
 
 impl CommandRunner for RecordingRunner {
     fn run(&self, argv: &Argv, access: Access, opts: &RunOpts) -> Result<CmdOutput, RunError> {
-        self.calls.borrow_mut().push((argv.clone(), access));
+        self.calls.borrow_mut().push((argv.clone(), access, opts.env.clone()));
         enforce_check(argv, self.lookup(argv), opts)
     }
 }
@@ -168,7 +178,7 @@ mod tests {
         );
         let err = runner.run(&Argv::of(["boom"]), Access::Mutate, &RunOpts::default());
         assert!(err.is_err());
-        let ok = runner.run(&Argv::of(["boom"]), Access::Mutate, &RunOpts { check: false });
+        let ok = runner.run(&Argv::of(["boom"]), Access::Mutate, &RunOpts::unchecked());
         assert_eq!(ok.unwrap().code, 1);
     }
 

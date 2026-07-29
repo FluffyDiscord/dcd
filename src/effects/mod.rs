@@ -42,11 +42,20 @@ impl Argv {
 pub struct RunOpts {
     /// Error on a non-zero exit (the common case).
     pub check: bool,
+    /// Per-command env overlay applied on top of the runner's own env — the
+    /// delivery path for the explicit config env maps (spec §5.2.4).
+    pub env: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl Default for RunOpts {
     fn default() -> Self {
-        RunOpts { check: true }
+        RunOpts { check: true, env: None }
+    }
+}
+
+impl RunOpts {
+    pub fn unchecked() -> Self {
+        RunOpts { check: false, env: None }
     }
 }
 
