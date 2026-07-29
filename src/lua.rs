@@ -396,6 +396,7 @@ mod tests {
                 status: ReleaseStatus::Active,
                 ran_migrations: false,
                 reason: None,
+                env_keys: Vec::new(),
             }],
         }
     }
@@ -408,7 +409,7 @@ network: net
 docker:
   images: { app: a }
   services: { x: { container: x, recreate: never } }
-compose: { files: [c.yml], env_file: e }
+compose: { files: [c.yml] }
 release:
   image: app
   container_prefix: demo-app

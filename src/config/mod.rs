@@ -59,8 +59,6 @@ pub struct DockerConfig {
 pub struct Compose {
     #[serde(default)]
     pub files: Vec<PathBuf>,
-    #[serde(default = "compose_env_file")]
-    pub env_file: PathBuf,
     #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
 }
@@ -134,6 +132,10 @@ pub struct RunSpec {
     pub env_file: Option<PathBuf>,
     #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
+    #[serde(default)]
+    pub env_include: Vec<String>,
+    #[serde(default)]
+    pub env_exclude: Vec<String>,
     #[serde(default)]
     pub volumes: Vec<String>,
 }
@@ -221,6 +223,10 @@ pub struct WorkerTemplate {
     #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
     #[serde(default)]
+    pub env_include: Vec<String>,
+    #[serde(default)]
+    pub env_exclude: Vec<String>,
+    #[serde(default)]
     pub volumes: Vec<String>,
 }
 
@@ -297,9 +303,6 @@ fn onehundredtwenty() -> u64 {
 }
 fn dot() -> PathBuf {
     PathBuf::from(".")
-}
-fn compose_env_file() -> PathBuf {
-    PathBuf::from("compose.env")
 }
 fn upstream_default() -> PathBuf {
     PathBuf::from("nginx-upstream.conf")
@@ -403,6 +406,7 @@ pub fn load(
 ) -> Result<Config> {
     let mut doc: Value =
         serde_yaml::from_str(source).map_err(|e| DcdError::Config(format!("parse: {e}")))?;
+    reject_removed_keys(&doc)?;
     interpolate(&mut doc, env)?;
 
     let stages = doc
@@ -437,6 +441,39 @@ pub fn load(
     config.stage = stage_name;
     validate(&config)?;
     Ok(config)
+}
+
+/// Resolve the stage name from a raw (uninterpolated) config — stage names are map
+/// keys, which interpolation never touches, so the dotenv chain can be loaded for
+/// the right stage before `${VAR}` resolution runs (spec §5.2.1).
+pub fn peek_stage(source: &str, requested: Option<&str>) -> Result<String> {
+    let mut doc: Value =
+        serde_yaml::from_str(source).map_err(|e| DcdError::Config(format!("parse: {e}")))?;
+    let stages = doc
+        .as_mapping_mut()
+        .and_then(|map| map.remove(Value::String("stages".into())));
+    select_stage(stages, requested).map(|(name, _)| name)
+}
+
+/// A removed key gets a targeted migration error, not the misleading generic
+/// "unknown field" (spec §5.1 — the AGENTS.md §7 typo row would misdirect).
+fn reject_removed_keys(doc: &Value) -> Result<()> {
+    let has_compose_env_file = |value: &Value| {
+        value
+            .get("compose")
+            .and_then(|compose| compose.get("env_file"))
+            .is_some()
+    };
+    let mut hit = has_compose_env_file(doc);
+    if let Some(stages) = doc.get("stages").and_then(Value::as_mapping) {
+        hit = hit || stages.values().any(has_compose_env_file);
+    }
+    if hit {
+        return Err(DcdError::Config(
+            "compose.env_file was removed — dcd no longer writes an env file; see UPGRADE.md".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Set a top-level key from the first env var present, only if the config did not already
@@ -570,6 +607,39 @@ fn validate(config: &Config) -> Result<()> {
         }
     }
 
+    validate_env_rules(config)?;
+
+    Ok(())
+}
+
+/// The §5.2.3 reserved-key guard and §5.2.4 key-charset rule over the explicit env
+/// maps (also fired on the Lua `ctx.cfg` read-back path, which lands here via
+/// `from_lua_value`), plus early compilation of the filter regexes.
+fn validate_env_rules(config: &Config) -> Result<()> {
+    use crate::dotenv::{filter_container_keys, invalid_env_key, reserved_key_reason, ReservedAllowance};
+
+    let guard = |env: &IndexMap<String, String>, owner: &str, allowance: ReservedAllowance| -> Result<()> {
+        for key in env.keys() {
+            if invalid_env_key(key) {
+                return Err(DcdError::Config(format!(
+                    "invalid env key `{key}` in {owner} (letters, digits, and underscore only, not starting with a digit)"
+                )));
+            }
+            if let Some(reason) = reserved_key_reason(key, allowance) {
+                return Err(DcdError::Config(format!("{key} in {owner} is reserved ({reason})")));
+            }
+        }
+        Ok(())
+    };
+    guard(&config.compose.env, "compose.env", ReservedAllowance::ComposeVars)?;
+    guard(&config.release.run.env, "release.run.env", ReservedAllowance::ProxyVars)?;
+
+    let empty = std::collections::BTreeMap::new();
+    filter_container_keys(&empty, &config.release.run.env_include, &config.release.run.env_exclude)?;
+    if let Some(workers) = &config.workers {
+        guard(&workers.template.env, "workers.template.env", ReservedAllowance::ProxyVars)?;
+        filter_container_keys(&empty, &workers.template.env_include, &workers.template.env_exclude)?;
+    }
     Ok(())
 }
 
