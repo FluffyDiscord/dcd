@@ -34,6 +34,8 @@ pub struct Release {
     pub ran_migrations: bool,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub env_keys: Vec<String>,
 }
 
 impl Release {
@@ -250,6 +252,7 @@ mod tests {
             status,
             ran_migrations: false,
             reason: None,
+            env_keys: Vec::new(),
         }
     }
 

@@ -2,7 +2,7 @@
 //! slots (spec §3, §7). Every side effect goes through the effects seam, so a full
 //! deploy is asserted against the recorded argv with no Docker.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -63,6 +63,11 @@ pub struct Options {
     pub dry_run: bool,
     pub sleep_enabled: bool,
     pub reason: Option<String>,
+    /// Chain-derived keys+values delivered to containers (spec §5.2.2); values ride
+    /// the runner env, the engine only emits their key names.
+    pub container_env: BTreeMap<String, String>,
+    /// Process env over the chain — what `ctx.env()` reads (spec §5.2.2).
+    pub interpolation_env: HashMap<String, String>,
 }
 
 impl Default for Options {
@@ -71,6 +76,8 @@ impl Default for Options {
             dry_run: false,
             sleep_enabled: true,
             reason: None,
+            container_env: BTreeMap::new(),
+            interpolation_env: HashMap::new(),
         }
     }
 }
@@ -222,6 +229,7 @@ impl<'a> Engine<'a> {
             }
         }
         self.ran_migrations = false;
+        self.warn_env_drift(&target.env_keys, target.id);
         self.reporter.log(&format!(
             "rolling back {} -> release {} ({})",
             self.cfg.stage,
@@ -245,6 +253,7 @@ impl<'a> Engine<'a> {
         self.begin(Mode::Resume);
         self.container = pending.container.clone();
         self.images = pending.images.clone();
+        self.warn_env_drift(&pending.env_keys, pending.id);
         self.post_cutover = true;
         self.drive(RESUME_STEPS)
     }
@@ -316,7 +325,6 @@ impl<'a> Engine<'a> {
             }
         }
         self.reap_orphans()?;
-        self.write_compose_env()?;
         Ok(Outcome::Done(None))
     }
 
@@ -389,7 +397,7 @@ impl<'a> Engine<'a> {
             } else {
                 self.docker().compose(&["up", "-d", "--no-recreate", name], false)
             };
-            self.exec(&argv, Access::Mutate)?;
+            self.exec_env(&argv, Access::Mutate, self.compose_overlay())?;
         }
 
         for name in &services {
@@ -414,8 +422,9 @@ impl<'a> Engine<'a> {
         let name = format!("{}-migrate-{}", self.cfg.project, self.release_id);
         let app = self.images.get("app").cloned().unwrap_or_default();
         let args: Vec<String> = command.split_whitespace().map(String::from).collect();
-        let argv = self.docker().run_throwaway(&name, &app, &args);
-        self.exec(&argv, Access::Mutate)?;
+        let env_keys = self.release_env_keys()?;
+        let argv = self.docker().run_throwaway(&name, &app, &args, &env_keys);
+        self.exec_env(&argv, Access::Mutate, self.run_overlay())?;
         Ok(Outcome::Done(None))
     }
 
@@ -425,8 +434,9 @@ impl<'a> Engine<'a> {
             return Err(DcdError::PreCutover(format!("container {} already exists", self.container)));
         }
         let app = self.images.get("app").cloned().unwrap_or_default();
-        let argv = self.docker().run_black(&self.container, &app);
-        self.exec(&argv, Access::Mutate)?;
+        let env_keys = self.release_env_keys()?;
+        let argv = self.docker().run_black(&self.container, &app, &env_keys);
+        self.exec_env(&argv, Access::Mutate, self.run_overlay())?;
         self.black_started = true;
         Ok(Outcome::Done(Some(self.container.clone())))
     }
@@ -496,6 +506,7 @@ impl<'a> Engine<'a> {
             status: ReleaseStatus::CutoverPending,
             ran_migrations: self.ran_migrations,
             reason: self.opts.reason.clone(),
+            env_keys: self.release_env_keys()?,
         };
         let stage = self.cfg.stage.clone();
         self.state.stage_mut(&stage).record_cutover(release);
@@ -547,7 +558,10 @@ impl<'a> Engine<'a> {
         if names.is_empty() {
             return Ok(Outcome::Skipped);
         }
-        let compose_yaml = self.render_workers(workers, &names);
+        let template = &workers.template;
+        let env_keys =
+            self.delivered_env_keys(&template.env_include, &template.env_exclude, &template.env)?;
+        let compose_yaml = self.render_workers(workers, &names, &env_keys);
         let path = self.resolve(&workers.compose_file);
         self.fs_write(&path, compose_yaml.as_bytes(), None, "workers compose")?;
         let mut args: Vec<String> = vec!["up".into(), "-d".into()];
@@ -556,7 +570,7 @@ impl<'a> Engine<'a> {
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let argv = self.docker().compose(&arg_refs, true);
-        self.exec(&argv, Access::Mutate)?;
+        self.exec_env(&argv, Access::Mutate, self.workers_up_overlay(template))?;
         Ok(Outcome::Done(Some(format!("{} worker(s)", names.len()))))
     }
 
@@ -656,7 +670,7 @@ impl<'a> Engine<'a> {
             }
             HookAction::Compose { compose } => {
                 let refs: Vec<&str> = compose.iter().map(String::as_str).collect();
-                self.exec(&self.docker().compose(&refs, false), Access::Mutate)
+                self.exec_env(&self.docker().compose(&refs, false), Access::Mutate, self.compose_overlay())
             }
             HookAction::CpFromRelease { cp_from_release } => {
                 let src = format!("{}:{}", self.container, cp_from_release.from);
@@ -675,6 +689,76 @@ impl<'a> Engine<'a> {
 
     fn stage(&self) -> Option<&crate::state::StageState> {
         self.state.stage(&self.cfg.stage)
+    }
+
+    fn delivered_env_keys(
+        &self,
+        include: &[String],
+        exclude: &[String],
+        explicit: &IndexMap<String, String>,
+    ) -> Result<Vec<String>> {
+        crate::dotenv::delivered_keys(&self.opts.container_env, include, exclude, explicit.keys())
+            .map_err(|e| self.classify(e.to_string()))
+    }
+
+    fn release_env_keys(&self) -> Result<Vec<String>> {
+        let run = &self.cfg.release.run;
+        self.delivered_env_keys(&run.env_include, &run.env_exclude, &run.env)
+    }
+
+    fn overlay(env: &IndexMap<String, String>) -> Option<BTreeMap<String, String>> {
+        if env.is_empty() {
+            return None;
+        }
+        Some(env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
+    fn compose_overlay(&self) -> Option<BTreeMap<String, String>> {
+        Self::overlay(&self.cfg.compose.env)
+    }
+
+    fn run_overlay(&self) -> Option<BTreeMap<String, String>> {
+        Self::overlay(&self.cfg.release.run.env)
+    }
+
+    /// The workers `compose up` carries compose.env (for `${VAR}` substitution in
+    /// compose files) with `template.env` layered over it — spec §5.2.4 precedence.
+    fn workers_up_overlay(
+        &self,
+        template: &crate::config::WorkerTemplate,
+    ) -> Option<BTreeMap<String, String>> {
+        let mut overlay = self.compose_overlay().unwrap_or_default();
+        overlay.extend(template.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        if overlay.is_empty() {
+            return None;
+        }
+        Some(overlay)
+    }
+
+    /// Warn loudly when a recorded release's delivered key set differs from what the
+    /// current chain would deliver — env is not versioned (spec §5.2.5).
+    fn warn_env_drift(&self, recorded: &[String], release_id: u64) {
+        if recorded.is_empty() {
+            return; // pre-rework release: nothing was recorded
+        }
+        let Ok(current) = self.release_env_keys() else { return };
+        let added: Vec<&String> = current.iter().filter(|k| !recorded.contains(k)).collect();
+        let removed: Vec<&String> = recorded.iter().filter(|k| !current.contains(k)).collect();
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
+        let describe = |keys: &[&String], sign: char| -> String {
+            keys.iter().map(|k| format!("{sign}{k}")).collect::<Vec<_>>().join(", ")
+        };
+        self.reporter.warn(&format!(
+            "release {release_id} ran with different env keys than the current chain delivers ({})",
+            [describe(&added, '+'), describe(&removed, '-')]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     fn worker_names(&self, workers: &crate::config::Workers) -> Result<Vec<String>> {
@@ -700,7 +784,9 @@ impl<'a> Engine<'a> {
             .collect())
     }
 
-    fn render_workers(&self, workers: &crate::config::Workers, names: &[String]) -> String {
+    /// The generated file carries env key NAMES only (compose bare-key passthrough);
+    /// values ride the workers-`up` command env — no secret bytes on disk (spec §5.2.4).
+    fn render_workers(&self, workers: &crate::config::Workers, names: &[String], env_keys: &[String]) -> String {
         let template = &workers.template;
         let image = self.images.get(&template.image).cloned().unwrap_or_else(|| template.image.clone());
         let mut yaml = String::from("services:\n");
@@ -714,10 +800,10 @@ impl<'a> Engine<'a> {
             yaml.push_str(&format!("        stop_signal: {}\n", template.stop_signal));
             yaml.push_str(&format!("        stop_grace_period: {}s\n", template.stop_grace_period));
             yaml.push_str(&format!("        restart: {}\n", template.restart));
-            if !template.env.is_empty() {
+            if !env_keys.is_empty() {
                 yaml.push_str("        environment:\n");
-                for (key, value) in &template.env {
-                    yaml.push_str(&format!("            {key}: {value}\n"));
+                for key in env_keys {
+                    yaml.push_str(&format!("            - {key}\n"));
                 }
             }
             if !template.volumes.is_empty() {
@@ -783,15 +869,6 @@ impl<'a> Engine<'a> {
             let _ = self.try_run(&rm, Access::Mutate);
         }
         Ok(())
-    }
-
-    fn write_compose_env(&self) -> Result<()> {
-        let mut content = String::new();
-        for (key, value) in &self.cfg.compose.env {
-            content.push_str(&format!("{key}={value}\n"));
-        }
-        let path = self.resolve(&self.cfg.compose.env_file);
-        self.fs_write(&path, content.as_bytes(), Some(0o600), "compose env")
     }
 
     fn persist_state(&self) -> Result<()> {
@@ -861,25 +938,40 @@ impl<'a> Engine<'a> {
         self.fs.write(path, bytes, mode).map_err(|e| self.classify(format!("write {}: {e}", path.display())))
     }
 
-    fn run_argv(&self, argv: &Argv, access: Access, check: bool) -> Result<crate::effects::CmdOutput> {
+    fn run_argv(
+        &self,
+        argv: &Argv,
+        access: Access,
+        check: bool,
+        env: Option<BTreeMap<String, String>>,
+    ) -> Result<crate::effects::CmdOutput> {
         if self.opts.dry_run && access == Access::Mutate {
             self.reporter.plan(&argv.display());
         }
         self.runner
-            .run(argv, access, &RunOpts { check })
+            .run(argv, access, &RunOpts { check, env })
             .map_err(|e| self.classify(e.to_string()))
     }
 
     fn exec(&self, argv: &Argv, access: Access) -> Result<crate::effects::CmdOutput> {
-        self.run_argv(argv, access, true)
+        self.run_argv(argv, access, true, None)
+    }
+
+    fn exec_env(
+        &self,
+        argv: &Argv,
+        access: Access,
+        env: Option<BTreeMap<String, String>>,
+    ) -> Result<crate::effects::CmdOutput> {
+        self.run_argv(argv, access, true, env)
     }
 
     fn try_run(&self, argv: &Argv, access: Access) -> Result<crate::effects::CmdOutput> {
-        self.run_argv(argv, access, false)
+        self.run_argv(argv, access, false, None)
     }
 
     fn read(&self, argv: &Argv) -> Result<crate::effects::CmdOutput> {
-        self.run_argv(argv, Access::Read, false)
+        self.run_argv(argv, Access::Read, false, None)
     }
 
     fn classify(&self, message: String) -> DcdError {
@@ -913,7 +1005,9 @@ impl HookHost for Engine<'_> {
 
     fn compose(&self, args: Vec<String>) -> std::result::Result<String, String> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.exec(&self.docker().compose(&refs, false), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
+        self.exec_env(&self.docker().compose(&refs, false), Access::Mutate, self.compose_overlay())
+            .map(|o| o.stdout)
+            .map_err(|e| e.to_string())
     }
 
     fn cp_from_release(&self, from: &str, to: &str) -> std::result::Result<(), String> {
@@ -943,7 +1037,7 @@ impl HookHost for Engine<'_> {
     }
 
     fn env(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok()
+        self.opts.interpolation_env.get(name).cloned()
     }
 
     fn log(&self, message: &str) {
