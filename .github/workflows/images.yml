@@ -10,7 +10,6 @@ jobs:
   binary:
     name: binary (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    container: rust:1-alpine
     strategy:
       fail-fast: false
       matrix:
@@ -20,19 +19,18 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - name: Install toolchain dependencies
-        run: apk add --no-cache musl-dev build-base git
-
       - uses: actions/checkout@v4
 
-      - name: Build static binary
-        run: cargo build --release --locked
-
-      - name: Test
-        run: cargo test --locked
-
-      - name: Smoke-test the binary
-        run: ./target/release/dcd --version
+      # Built inside Alpine so the musl target is native for this architecture. The
+      # container is driven from the host because Alpine cannot host JS actions on arm64.
+      - name: Build and test the static binary
+        run: |
+          docker run --rm -v "$PWD":/build -w /build rust:1-alpine sh -eu -c '
+            apk add --no-cache musl-dev build-base
+            cargo build --release --locked
+            cargo test --locked
+            ./target/release/dcd --version
+          '
 
       - uses: actions/upload-artifact@v4
         with:
