@@ -21,7 +21,7 @@ Reference configs ship with the repo — read them before writing anything:
 | File | What it is | Use it to… |
 |------|------------|-----------|
 | output of `dcd init` | the smallest runnable skeleton | start a brand-new config |
-| `docs/examples/roadrunner_app/dcd.yaml` | a real, lean Symfony config | copy a production-shaped one |
+| `docs/examples/roadrunner_app/dcd.yaml` | a real, lean PHP-app config | copy a production-shaped one |
 | `docs/examples/fpm_app/dcd.yaml` | a PHP-FPM app, prod + beta stages | copy a multi-stage FPM setup |
 | `docs/examples/all_in_one/dcd.yaml` | **every** field, described, with defaults | look up any option |
 
@@ -47,7 +47,7 @@ docker:                    # required
 
 compose:                   # required
   files: [docker-compose.yml]    # -f files
-  env: { … }                     # written to compose.env (0600), passed to every compose call
+  env: { … }                     # injected into every compose call's process env (no file is written)
 
 directories: [ … ]         # optional — host paths to mkdir/chown before deploy
 release: { … }             # required — the app: image, container_prefix, healthcheck, run, migrate?, drain?
@@ -166,11 +166,27 @@ Validation rules (all reported by `check` with the offending path):
   <path>=<value>` overrides any existing scalar path (a *new* path is an error).
 - **Migrations are expand-contract:** `release.migrate.before` runs pre-cutover in a
   throwaway container (additive only); `after` runs in the live container. The throwaway
-  inherits `release.run.env` + `release.run.env_file`, so runtime `DATABASE_URL`/secrets reach it.
-- **`release.run.env_file`** points `docker run --env-file` at a host env-file (`KEY=VALUE`,
-  resolved vs `deploy_root`) — one 0600 file instead of enumerating each secret as `${VAR}`; an
-  explicit `release.run.env` key overrides the same key in the file. Also feeds `migrate:before`.
-- **Rollback runs no migrations** and re-deploys the previous release's images.
+  inherits the delivered env (dotenv chain + `release.run.env` + `release.run.env_file`),
+  so runtime `DATABASE_URL`/secrets reach it.
+- **Secrets come from the dotenv chain** (spec §5.2): dcd loads `.env` → `.env.local` →
+  `.env.<stage>` → `.env.<stage>.local` from the config file's directory (`--env-dir`
+  overrides; `--env-file <base>` rebases the whole chain onto another base name, e.g.
+  `.env.deploy[.local|.<stage>|.<stage>.local]`, so it can coexist with the app's own
+  `.env` files — the explicit base must exist; `--env-stdin` adds a disk-free top layer),
+  real process env wins over every file, and every chain-defined key is delivered to
+  app/migrate/worker containers as bare `-e KEY` + process env — never written to disk.
+  Cross-layer references resolve deferred (forward references work, a later layer
+  overriding a key rewrites earlier references to it, circular references error).
+  Filter per container with
+  `release.run.env_include`/`env_exclude` and `workers.template.env_include`/`env_exclude`
+  (full-match regexes, exclude wins). Commit a secret-free `.env` naming the keys; values
+  come from `.env.<stage>.local`, CI-exported env, or stdin.
+- **`release.run.env_file`** (optional, operator-managed) still points `docker run
+  --env-file` at a host env-file resolved vs `deploy_root`; any chain/`env:` key overrides
+  the same key in the file. Prefer the chain — the file is at-rest on the server.
+- **Rollback runs no migrations** and re-deploys the previous release's images. Env is
+  re-read from **today's** chain — dcd warns when the key set differs from what the
+  rolled-back release recorded.
 
 ---
 
@@ -182,7 +198,13 @@ Validation rules (all reported by `check` with the offending path):
 | `execs in 'X' … not a declared service container` | `exec_in` names a container with no service | add a `docker.services` entry whose `container:` is `X` |
 | `healthcheck.cmd must reference {container}` | hardcoded host/alias in the probe | use `http://{container}:<port>/…` |
 | `unknown field 'X'` | typo, or pre-`docker:` schema | nest under `docker:` / fix the key |
-| `unresolved … ${VAR}` | env var not set at load | export it, or write `${VAR:-default}` |
+| `compose.env_file was removed …` | pre-rework config | delete the key; see UPGRADE.md |
+| `unresolved … ${VAR}` | var in no chain file and not exported | add it to a chain layer, export it, or write `${VAR:-default}` |
+| `X in <file> is reserved (configures dcd's own tooling)` | `DOCKER_*`/`COMPOSE_*`/`PATH`/proxy var in a chain file | remove it; use `release.run.env` if a container truly needs it |
+| `env dir <path> does not exist` | bad `--env-dir` | fix the path |
+| `env file <path> does not exist (checked <path>.dist too)` | bad `--env-file` base | fix the path or create the base file |
+| `Too many levels of variable indirection in env vars: …` | circular `${VAR}` references across chain layers | break the cycle |
+| a dotenv parse error with a `^` caret | syntax error in a chain file | fix the named file:line |
 | `multiple stages; pass one of: …` | `check`/`deploy` with no stage | add the stage arg |
 | a `parse:` error pointing at a line with `${VAR}` | `${}` inside a flow `{ }` map | switch that line to block style |
 

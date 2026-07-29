@@ -1,7 +1,7 @@
 # dcd
 
-Zero-downtime **red-black** Docker deploys from a YAML file. One static binary, runs on
-the server, talks to the local Docker socket. Replaces hand-rolled the original script scripts.
+Zero-downtime **red-black** Docker deploys from a YAML file targeting Nginx as proxy. One static binary, runs on
+the server, talks to the local Docker socket.
 
 It builds the new ("black") container next to the live ("red") one, health-checks it,
 flips nginx to it, and drains the old one — without dropping a request.
@@ -28,9 +28,18 @@ dcd deploy prod          # do it
 | `dcd deploy --dry-run` | print every command, touch nothing |
 | `dcd check [stage]` | validate the config |
 | `dcd init` | scaffold a `dcd.yaml` (`--with-plugin` adds a Lua stub) |
+| `dcd --version` | the built version (`-v`) |
 
-Global flags: `--config <path>` · `--stage <name>` · `--json` · `--image app=<tag>` (repeatable) ·
-`--set path=value` (repeatable) · `--yes` · `--reason <text>`.
+Global flags: `--config <path>` · `--env-dir <path>` · `--env-file <path>` · `--env-stdin` ·
+`--json` · `--image app=<tag>` (repeatable) · `--set path=value` (repeatable) · `--yes` ·
+`--reason <text>` · `--version`.
+
+Env comes from a Symfony-style dotenv chain next to `dcd.yaml` (`.env` → `.env.local` →
+`.env.<stage>` → `.env.<stage>.local`, real env wins); every chain-defined key reaches the
+containers via process-env passthrough — dcd writes no env file on the server.
+`--env-file .env.deploy` rebases the whole chain onto another base name
+(`.env.deploy` → `.env.deploy.local` → `.env.deploy.<stage>` → `.env.deploy.<stage>.local`),
+so dcd's chain can live beside the app's own `.env` files without colliding.
 
 ## dcd.yaml
 
@@ -75,7 +84,7 @@ Routed through the engine, so they're **dry-run-safe** (and observable in `--dry
 | `ctx.read_file(path)` | string | read a file (relative to `deploy_root`) |
 | `ctx.write_file(path, s)` | — | write a file (skipped in `--dry-run`) |
 | `ctx.file_exists(path)` | bool | |
-| `ctx.env(name)` | string \| nil | read an environment variable |
+| `ctx.env(name)` | string \| nil | read the resolved environment (process env over the dotenv chain) |
 
 ### `ctx` — utilities & debug
 

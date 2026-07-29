@@ -57,7 +57,7 @@ keeping it (without an over-built task graph) gives extensibility at low weight.
 | Extensibility | **Embedded Lua (mlua)**, sandboxed; PHP-Deployer-style globals + `ctx` | ADR-003 |
 | Docker interface | **Shell out to `docker` / `docker compose` CLI** | ADR-004 |
 | Rollback semantics | **Code-only; migrations forward-only (expand-contract)** | ADR-005 |
-| Secrets | **Env-var `${VAR}` interpolation**; rendered env file `0600` on disk | ADR-006 |
+| Secrets | **Symfony-style dotenv chain at the launch source; process-env passthrough to containers; nothing dcd-written at rest on the server** (spec §5.2) | ADR-011/012 (supersede ADR-006) |
 | Multi-stage | **One config file, stages merged over a shared base** + host guard | ADR-007 |
 | Common-case Lua | **Zero Lua required** — YAML drives the recipe | ADR-008 |
 | Output | **Adaptive**: rich TTY / plain non-TTY / `--json` opt-in | ADR-009 |
@@ -99,7 +99,7 @@ concurrency lock with crash recovery; adaptive output.
 | **Non-Docker deploy** (symlink, k8s, swarm) | Out of scope; the recipe is Docker-CLI + compose specific |
 | **A user-definable task DAG** | One fixed recipe + hook slots covers the need; a general graph is unjustified weight (ADR-002) |
 | **A daemon / web UI / scheduler** | A CLI invoked by CI or by hand is the whole surface |
-| External secrets managers (Vault/SSM) | Heavy dependency for one-man ops; env-var path covers the need (ADR-006) |
+| External secrets managers (Vault/SSM) | Heavy dependency for one-man ops; the dotenv-chain path covers the need (ADR-011) |
 
 ## 8. References
 

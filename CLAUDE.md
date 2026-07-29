@@ -45,5 +45,7 @@ all_in_one validates with no env set; acme needs `REGISTRY`/`DEPLOY_ROOT`/`MAXMI
 ## Conventions
 
 - Side effects go through the effects seam only — never raw `std::process` / `std::fs` in the engine or recipe.
-- No secret redaction (intentionally removed): secrets come from `${VAR}` env interpolation; the rendered env file is `0600`.
+- No secret redaction (intentionally removed) — instead, env **values are never printed or written**: secrets come
+  from the Symfony-style dotenv chain (`src/dotenv/`, spec §5.2) and reach containers via process-env passthrough
+  (bare `-e KEY`); dcd writes no env file. Schema changes here also touch UPGRADE.md.
 - One app container per release — there is no replica/scale knob yet.

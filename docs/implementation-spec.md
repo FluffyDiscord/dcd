@@ -1,7 +1,7 @@
 # dcd — Implementation Spec (Implementation)
 
 **Document type:** Implementation
-**Status:** Specified (2026-06-11), revised post-gate-review (v2), pre-implementation
+**Status:** Specified (2026-06-11), revised post-gate-review (v2), implemented; §5.2 environment rework specified 2026-07-28 (v3, gate-reviewed), pre-implementation
 **Source:** reverse-engineered from an existing production red-black deploy script, its CI deploy stage, and the compose file for the managed side services.
 **Strategy & rationale:** [Strategic Blueprint](strategic-blueprint.md)
 
@@ -21,6 +21,8 @@
 | **Managed service** | a compose-owned, long-lived container (postgres, nginx, valkey, …) recreated only on policy |
 | **Worker** | a compose service consuming a queue, regenerated each deploy |
 | **Stage** | a named deploy profile (`beta`, `prod`) merged over the shared base config |
+| **Chain** | the Symfony-style dotenv layer stack (`.env` → `.env.local` → `.env.<stage>` → `.env.<stage>.local` → `--env-stdin`) resolved at launch (§5.2.1) |
+| **Interpolation env / container env** | the two maps derived from the chain + process env (§5.2.2): what `${VAR}` in `dcd.yaml` sees / what containers receive |
 | **Recipe** | the one built-in fixed task sequence: `docker-redblack` |
 
 **Load-bearing invariants** (each maps to a test, §10.3):
@@ -57,6 +59,7 @@ parse args ─▶ load+merge config ─▶ resolve stage ─▶ host guard ─�
 |--------|----------------|-----------|
 | `cli` | clap commands/flags → `Action` | `Cli`, `Command`, `Action` |
 | `config` | parse `dcd.yaml`, stage-merge, `${VAR}` interpolation, `--set` overrides, identity defaults (project from deploy_root folder, network `<project>_default`, `{project}` token expansion), validation | `Config`, `Stage`, `RawConfig`, `ConfigError` |
+| `dotenv` | Symfony-port parser + chain loader (§5.2): 4-file chain + stdin layer, the two resolved maps, per-container filters, reserved-key guard | `DotenvParser`, `EnvChain`, `ResolvedEnv` |
 | `effects` | the testability seam: all side effects behind traits | `CommandRunner`, `FileSystem`, `Clock` |
 | `effects::real` | production impls | `SystemRunner`, `SystemFs`, `SystemClock` |
 | `effects::record` | recording / read-pass-through impls for tests + `--dry-run` | `RecordingRunner`, `MemoryFs`, `FixedClock` |
@@ -89,7 +92,7 @@ trait FileSystem {
 trait Clock { fn now_epoch(&self) -> u64; fn now_iso(&self) -> String; }
 ```
 
-- **Production:** `SystemRunner` spawns real processes.
+- **Production:** `SystemRunner` spawns real processes — since the §5.2 rework, with `current_dir = deploy_root` and the chain runner env (plus per-command overlays), so the effective command contract is **argv + recorded env**, not argv alone; bare `-e KEY` flags in dry-run output are the manifest of what rides the env.
 - **Tests:** `RecordingRunner` (canned outputs keyed by argv prefix; records calls) + `MemoryFs` + `FixedClock` → engine/recipe/Lua exercised with **zero Docker**, asserted against exact recorded argv.
 - **`--dry-run`** is *not* a fully-synthetic runner. It is **read-pass-through** (§2.4): `Access::Read` commands execute for real (so current image state, running workers, transport lists are truthful); `Access::Mutate` commands are stubbed (printed as planned actions, return synthetic ok). Points that cannot be resolved without a mutation having happened (e.g. the dynamic worker provider, which execs in the not-yet-started black) are emitted as `⚠ data-dependent` lines, never silently defaulted.
 
@@ -98,7 +101,7 @@ trait Clock { fn now_epoch(&self) -> u64; fn now_iso(&self) -> String; }
 | `Access::Read` (run for real in dry-run) | `Access::Mutate` (stubbed in dry-run) |
 |---|---|
 | `docker inspect`, `docker ps [-a]`, `docker images`, `docker network inspect`, `docker version` | `docker run`, `docker rm`, `docker stop`, `docker pull`, `docker cp`, `docker image rm`, `docker network create` |
-| reads of state/upstream files | `docker exec` that runs a project command (migrate, drain, healthcheck against black), `docker compose up/stop`, the `nginx -s reload`, writes of compose.env/upstream/workers/state files |
+| reads of state/upstream files | `docker exec` that runs a project command (migrate, drain, healthcheck against black), `docker compose up/stop`, the `nginx -s reload`, writes of upstream/workers/state files |
 
 The dynamic worker provider (`exec` in black) is `Mutate`-adjacent: in dry-run there is no black, so it emits `⚠ worker set is dynamic (provider command); not resolvable in dry-run` rather than "0 workers".
 
@@ -119,7 +122,7 @@ The dynamic worker provider (`exec` in black) is `Mutate`-adjacent: in dry-run t
 
 | # | Task | Action (exact commands in §7) | Phase |
 |---|------|-------------------------------|-------|
-| 1 | `preflight` | ensure network; mkdir+chown dirs; **reap orphan `{prefix}-*` containers**; write `compose.env` (`0600`) | pre-cutover (red live) |
+| 1 | `preflight` | ensure network; mkdir+chown dirs; **reap orphan `{prefix}-*` containers** | pre-cutover (red live) |
 | 2 | `ensure_upstream` | if `state.current` not running → write `fallback_backend` to upstream file (INV-9) | pre-cutover |
 | 3 | `pull` | `docker pull` app + every managed-service image | pre-cutover |
 | 4 | `infra` | reconcile managed services **in declared order** (conditional recreate; if a recreated service has `on_recreate_drain_workers`, drain workers first via discovery, set `drained`); then run all `wait` gates | pre-cutover |
@@ -175,7 +178,7 @@ Because finalize always demotes the **run-start `current`** (not merely "the pre
 
 ## 5. Configuration schema (`dcd.yaml`)
 
-`${VAR}`/`${VAR:-default}` interpolate from process env at load; missing var, no default → `ConfigError` (exit `2`). Below is the **complete acme translation**, exercising every feature.
+`${VAR}`/`${VAR:-default}` interpolate from the **resolved environment** (process env layered over the dotenv chain, §5.2) at load; missing var, no default → `ConfigError` (exit `2`). Below is the **complete acme translation**, exercising every feature.
 
 ```yaml
 version: 1
@@ -211,8 +214,7 @@ docker:
 
 compose:
   files: [docker-compose.prod.yml]     # -f files; stage compose.files APPENDS (additive, see §5.1)
-  env_file: compose.env                # rendered by dcd, 0600
-  env:                                 # written to env_file; map MERGES on stage merge
+  env:                                 # injected into every compose command's process env (§5.2); map MERGES on stage merge; NEVER written to disk
     COMPOSE_PROJECT_NAME: acme
     COMPOSE_IGNORE_ORPHANS: 'true'     # app/workers managed outside this file -> suppress orphan noise
     REGISTRY: ${REGISTRY}
@@ -233,8 +235,10 @@ release:                               # the red-black app
   run:
     network_alias: app-rr              # SHARED by red & black; never used for healthcheck (§7.7 / §9)
     restart: unless-stopped
-    env_file: .env.deploy              # optional --env-file (resolved vs deploy_root); also fed to migrate:before
-    env: { TZ: UTC }                   # -e pairs; an explicit key here overrides the same key in env_file
+    env_file: .env.deploy              # optional --env-file (resolved vs deploy_root); operator-managed file, the sanctioned dcd-consumed env-at-rest (§5.2.5 names the full residual list); also fed to migrate:before
+    env: { TZ: UTC }                   # extra vars; delivered via process-env passthrough (§5.2), override env_file and chain keys
+    env_include: []                    # optional full-match regex list: chain keys passed to this container (empty = all) (§5.2)
+    env_exclude: []                    # optional full-match regex list: chain keys withheld; exclude wins over include
     volumes: ['${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log']
   healthcheck:
     exec_in: acme-nginx             # check runs from nginx; {container} = black NAME (not the alias)
@@ -268,7 +272,9 @@ workers:
     stop_signal: SIGTERM
     stop_grace_period: 120s
     restart: unless-stopped
-    env: { TZ: UTC }
+    env: { TZ: UTC }                   # values ride the compose process env; the generated file carries key NAMES only (§5.2/§7.12)
+    env_include: []                    # optional full-match regex filters over chain keys, as in release.run (§5.2)
+    env_exclude: []
     volumes: ['${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log']
 
 retention: { keep_releases: 3, keep_managed_images: 2 }   # app releases + managed-image versions retained
@@ -301,9 +307,59 @@ stages:                                # merged over the base above
 | Stage merge — maps | deep-merged; stage keys override base |
 | Stage merge — scalars | stage replaces base |
 | Stage merge — lists | stage list **replaces** base list — **except `compose.files`, which APPENDS** (compose `-f` is additive; the one ergonomic exception, demonstrated by the `beta` stage) |
-| Interpolation | `${VAR}` / `${VAR:-default}` from process env at load; unresolved + no default → `ConfigError` |
+| Interpolation | `${VAR}` / `${VAR:-default}` from the resolved environment (§5.2: process env over dotenv chain) at load; unresolved + no default → `ConfigError` |
+| Removed keys | `compose.env_file` in any config → targeted `ConfigError` naming UPGRADE.md (pre-deserialize scan; a plain `deny_unknown_fields` "unknown field" would misdirect to the typo row of the AGENTS.md §7 table) |
 | `--set path=value` | applied **after** interpolation, **before** validation; may override **existing scalar paths only** (a new path → error, preserving no-laundered-defaults); dotted grammar with `[i]` list indices |
 | Validation | unknown keys → error (typo guard); referenced `image:` must exist in `docker.images`; `exec_in`/`wait.exec_in` must name a declared `docker.services` container; `healthcheck.cmd` must reference `{container}` (guard against accidental alias use) |
+
+### 5.2 Environment system (dotenv chain → ephemeral delivery)
+
+**Goal (2026-07-28 rework, ADR-011/012):** no dcd-written secret bytes at rest on the deploy server. The canonical secret source is Symfony-style dotenv files held wherever `dcd` is launched from; values reach containers only through process-env passthrough and are persisted solely by Docker itself in the container config (root-only `/var/lib/docker`, which is what makes `--restart` survive reboot — verified against Docker 29.4.0: env is baked at create and survives stop/start with no env present).
+
+#### 5.2.1 The dotenv chain
+
+Loaded before config interpolation. The chain hangs off a **base file**: `--env-file <path>` when given (Symfony `loadEnv` semantics — every layer name below is `<path>` + suffix, so dcd's chain can live beside an application's own `.env` files, e.g. `.env.deploy[.local|.<stage>|.<stage>.local]`; the base — or its `.dist` — **must exist**, a missing explicit base is a `ConfigError`), else `<--env-dir>/.env` (default `--env-dir`: **the directory of the config file**; `--env-file` and `--env-dir` conflict). The stage is resolved by `config::peek_stage` (the stage positional — the CLI's only stage selector — else the sole `stages:` key, else the empty string for a stages-less config; safe pre-interpolation because interpolation is values-only and stage names are keys):
+
+| Order | Layer | Notes |
+|-------|-------|-------|
+| 1 | `.env` — or `.env.dist` when `.env` is absent | Symfony parity |
+| 2 | `.env.local` | always loaded (deviation: Symfony skips it for `test` envs; dcd has no test-env concept) |
+| 3 | `.env.<stage>` | skipped entirely (with 4) when the stage is literally `local` (Symfony parity) |
+| 4 | `.env.<stage>.local` | |
+| 5 | `--env-stdin` | one dotenv-format document read from stdin (same parser; error-context filename `<stdin>`); the highest **file** layer. Refused **eagerly at argument parsing** when stdin is a TTY, or when the command can prompt (`rollback`, refuse-confirmations) and `-y/--yes` is absent |
+
+Later layers override earlier; the **real process environment overrides every layer** (captured once at startup, `src/cli.rs`). An **absent** file is silently skipped (an empty chain is the pre-rework status quo); a file that is present but unreadable, a directory, or not valid UTF-8 is a loud `ConfigError` naming the path — never a silent skip. A `--env-dir` pointing at a missing directory is a `ConfigError`. A stage resolved to the empty string (no `stages:`) loads layers 1–2 only — never `.env.` / `.env..local`.
+
+**Parser:** a Rust port of `symfony/dotenv` **8.1** (`Dotenv::parse` + `parseRaw`), including the exact grammar (quoting, concatenated segments, `export`, comments, CRLF/BOM rules, NUL-byte rejection, `_*`-prefixed variable names, `${VAR}` / `${VAR:-default}` / `${VAR:=default}` with Symfony's brace/default edge cases) and the `FormatException` context format (`<msg> in "<file>" at line N` + snippet + caret). 8.1 lexes values **raw** — literal `$` is protected as a `\x00` marker (`\$`, single-quoted `$`), backslashes stay escaped — and resolves afterwards; an unquoted value containing `$` may contain spaces (only space-without-`$` errors). Ported deviations, each a hard error or documented: `$(command)` is **lexed but never executed** — a completed `$(…)` expression is a `ConfigError` (a deploy tool must not shell-execute env-file content; during deferred chain resolution the error names the key instead of a file position; the refusal also fires for `$(…)` spanning a quoted newline, and — fail-closed divergence — for empty `$()`/`$(())`, which Symfony's command regex leaves literal); no `$_SERVER`/`HTTP_`/`putenv` semantics (dcd is process-env-model only; the process-env snapshot is the single "external" source); no `.env.local.php`. Conformance is proven by porting the `DotenvTest.php` data providers (§10.1 TC-031).
+
+**Variable resolution** (Symfony 8.1 deferred model, map-based — no process-env mutation): chain layers are parsed **raw**, layered (process env wins for keys it already defines — those keep their external value verbatim, backslashes and `$` included, never executed), then resolved together in **up to 5 passes to a fixpoint** (`resolveLoadedVars`). Consequences, each pinned by a ported case: a later layer overriding `REDIS_HOST` rewrites an earlier layer's `redis://${REDIS_HOST}`; **forward references** across layers resolve; a **self-referencing** value (`MY_VAR=${MY_VAR}_suffix`, `${MY_VAR:-default}`) hides its own raw value and sees the pre-chain external value / the previous layer's value / the default; values still changing after 5 passes are a `ConfigError`: `Too many levels of variable indirection in env vars: <NAMES>.`. A `$NAME` lookup resolves against the working map (process env ∪ loaded layers) with Symfony's external-value protection. `:=` additionally assigns the default. **The ported test suite (TC-031) is the authoritative oracle**: where this prose and a ported Symfony case could be read to disagree, the case wins and the prose is corrected.
+
+#### 5.2.2 The two resolved maps
+
+| Map | Contents | Consumers |
+|-----|----------|-----------|
+| **interpolation env** | process env layered over the chain (process wins) | `${VAR}` in `dcd.yaml`; `registry`/`deploy_root` defaults; `ctx.env()` in Lua (both hosts) |
+| **container env** | keys **defined in any chain layer** (incl. stdin), values after process-env override | passthrough to release/migrate/worker containers, after per-container filters |
+
+A key present only in the process env (e.g. `PATH`, CI noise) never reaches a container. The Symfony convention makes CI-only delivery work with no extra mechanism: a committed secret-free `.env` names the key (`DATABASE_URL=`), CI exports the value over ssh, process-env-wins supplies it — the file is the manifest, the env is the value.
+
+#### 5.2.3 Reserved keys (tooling-hijack guard)
+
+A chain layer that defines any of `PATH`, `HOME`, `LD_*`, `DOCKER_*`, `COMPOSE_*`, `BUILDX_*`, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` (case-insensitive for the proxy set) → `ConfigError` naming the key **and the defining file**, plus the escape hatch (`release.run.env`). The same guard applies to the `compose.env` and `workers.template.env` maps and to `release.run.env`, with one carve-out: `compose.env` may set `COMPOSE_*` (deliberate config, e.g. `COMPOSE_PROJECT_NAME`, `COMPOSE_IGNORE_ORPHANS`), and `release.run.env`/`workers.template.env` may set the proxy family (a container legitimately needs proxies; the acknowledged cost is that the value then rides that one command's docker-CLI child env — the overlay — during create). Rationale: the chain and overlays ride the child process env of `docker`/`docker compose`, which read their own configuration from it — a `.env` with `DOCKER_HOST` would silently retarget the deploy.
+
+#### 5.2.4 Delivery
+
+- **Runner-level env:** `SystemRunner` carries the **container-env map** (chain-derived, §5.2.2) and applies it via `Command::envs()` to **every** spawned child, and sets `current_dir(deploy_root)` on every child — fixing, for an **absolute** `deploy_root`, the pre-rework bug where compose resolved relative `-f` paths against dcd's cwd (a relative `deploy_root`, default `.`, still resolves against dcd's cwd exactly as before — cwd-launch workflows are unchanged). The `CommandRunner` trait signature is unchanged (`RunOpts` gains an optional per-command env overlay); hooks (`run:`), `ctx.run`, and compose substitution therefore all see one consistent environment. The three explicit config env maps are all delivered as **per-command overlays** on top of the runner env, overlay wins: `compose.env` on every compose invocation, `release.run.env` on the release/migrate `docker run`, `workers.template.env` on the workers `compose up` (which also carries `compose.env`; `template.env` wins on collision — the more specific map). Precedence for any consumer is therefore: explicit map (overlay) > chain (runner env) > nothing — and a key in both an overlay and the chain is delivered once with the overlay's value.
+- **`docker run` (release + migrate throwaway):** for every delivered key, a bare `-e KEY` flag — the docker CLI reads the value from its own (child) environment; values never appear in argv, `ps`, or on disk (verified live). Explicit `release.run.env` pairs are delivered the same way (bare `-e KEY`, value in a per-command env overlay via `RunOpts`), replacing the pre-rework `-e K=V`-in-argv leak; they override chain keys and `env_file` keys. `run.env_file` (operator-managed, the one sanctioned at-rest file) keeps its `--env-file` flag, emitted before all `-e` flags.
+- **Compose:** no `--env-file` flag and no rendered file. `compose.env` + container env ride the child process env (compose substitutes `${VAR}` in compose files from its environment — verified). To keep compose's *implicit* `.env`-discovery from re-introducing filtered-out keys, every compose invocation passes `--env-file /dev/null` (verified live: suppresses discovery, no error); `dcd check` warns when `deploy_root/.env` exists and is not the chain's own `.env`.
+- **Workers compose file:** `environment:` is a YAML list of bare key **names** (template `env` keys + filtered chain keys; template values ride the workers-`up` command overlay and win over chain on collision). The generated file contains no values — also closing the pre-rework YAML-injection hazard of unquoted `{key}: {value}` embedding. A bare name whose variable is unset at `compose up` resolves to *unset in the container* (compose `null`, verified), which keeps `env_exclude` honest. Consequence, stated deliberately: the generated workers file is **not operator-usable outside dcd** — a hand-run `docker compose up` without dcd's env resolves every bare name to unset.
+- **Delivered set per container** = container env filtered by that container's `env_include` (empty = all) then `env_exclude` (exclude wins), plus its explicit `env` map. Filters are **full-match** regexes (`regex-lite`; an unanchored pattern like `MAILER` does *not* match `MAILER_DSN`). `-e` flags and generated key lists are emitted as a **sorted, deduplicated union** — a key in both the chain set and the explicit map appears once (deterministic argv for tests). Empty-valued keys are delivered as empty (verified: docker passes them; only *unset* keys are omitted).
+
+#### 5.2.5 Observability & lifecycle
+
+- **`dcd check [stage]`** prints: chain files found/skipped (paths), per-layer key counts, the sorted key **names** delivered to each container after filters, keys shadowed by the process env, and reserved-key errors. **Resolved values are never printed** (redaction stays removed — the right response is to never print values at all). One deliberate exception: a dotenv **parse error** reproduces Symfony's byte-exact snippet+caret (§5.2.1), which quotes up to 20 raw bytes around the error — a value adjacent to a syntax error can appear in stderr. Accepted: the conformance oracle (TC-031) pins the format, and the exposure requires a malformed file the operator is actively editing. `--dry-run` prints bare `-e KEY` argv — strictly better than the pre-rework `-e K=V`.
+- **State fingerprint:** each `Release` records `env_keys` (sorted container-env key names — names are not secrets; `dcd-state.json` stays `0600`). `rollback` and `--resume` diff the recorded set against the currently-resolved set and print a loud warning naming added/removed keys (env is *not* versioned — a rollback runs old images under **today's** chain; the warning is the guard). Value hashes are deliberately not stored (low-entropy secrets are offline-crackable from a hash).
+- **Recovery model:** the chain files live at the launch source (operator machine, CI secrets, or `ssh host 'dcd deploy prod --env-stdin --yes' < .env.prod.local` for a genuinely disk-free path — `--env-stdin` consumes stdin, so interactive prompts error and `-y/--yes` is required for any confirming command). Server loss no longer loses secrets. Residual at-rest copies on the server, named deliberately: Docker's own container config under `/var/lib/docker` (inherent — it is what makes reboot-restart work; root-only), the optional operator-managed `release.run.env_file`, any `env_file:` entries inside user-owned compose files (UPGRADE.md shows the bare-key migration), and — in the default layout, where `--env-dir` is the config directory on the server — the operator's own chain files themselves; `--env-stdin` (or values-over-ssh with a secret-free `.env` manifest) is the path that removes that last class. The claim dcd itself makes is precise: **dcd writes no secret bytes to disk** (IT-007's grep proves it over dcd-written files).
 
 ---
 
@@ -336,7 +392,7 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 | `ctx.docker(args)` / `ctx.compose(args)` | `docker <args>` / fully-qualified `docker compose … <args>`; returns stdout |
 | `ctx.cp_from_release(src,dst)` / `ctx.cp_to_release(src,dst)` | `docker cp` to/from black |
 | `ctx.read_file(path)` / `ctx.write_file(path, s)` / `ctx.file_exists(path)` | via the fs seam (`write` dry-run-safe; `read`/`exists` execute) |
-| `ctx.env(name)` | process env var → string or nil |
+| `ctx.env(name)` | resolved-environment var (§5.2.2 interpolation env — process env over the dotenv chain) → string or nil |
 
 **Utilities** (pure): `ctx.json_decode(s)` / `ctx.json_encode(v)` / `ctx.yaml_decode(s)` / `ctx.yaml_encode(v)`, `ctx.log(msg)` / `ctx.warn(msg)`.
 
@@ -348,7 +404,7 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 
 ### 6.5 The `configure` hook
 
-Registered with `configure(fn)`; fires **once before the recipe**, with a host offering `run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` (no `in_release`/`docker`/`compose`/`cp_*` — there is no release container yet). It adjusts the initial config by **mutating `ctx.cfg` directly** (`ctx.cfg.retention.keep_releases = 5`); the mutated table is read back, re-parsed and re-validated into the typed config the engine then runs against. The **same live read-back applies to every hook mid-deploy** (§6.2), not just `configure`: a `before_`/`after_` hook may mutate `ctx.cfg` (honored for any step not yet run) or `ctx.state` (read back into deploy state, persisted once past cutover). Implementation: before firing a slot's hooks the engine `refresh`es the `cfg`/`state` tables from the typed values; after, it re-reads them and, if changed, re-parses (`cfg` re-validated; a failure aborts the deploy). The round-trip goes through Lua, so an empty map serializes as an empty table and is parsed back as an empty map (`de_lenient_map`); map ordering (`docker.images`/`env`/`docker.services`) is not guaranteed across a mutated round-trip but does not affect correctness. `ctx.vars` remains for scratch state that is not part of cfg/state.
+Registered with `configure(fn)`; fires **once before the recipe**, with a host offering `run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` (no `in_release`/`docker`/`compose`/`cp_*` — there is no release container yet). Its `run` commands execute under the same §5.2.4 runner env and `deploy_root` cwd as recipe commands, and its `ctx.env` reads the §5.2.2 interpolation env — the configure host and the deploy host see one environment. It adjusts the initial config by **mutating `ctx.cfg` directly** (`ctx.cfg.retention.keep_releases = 5`); the mutated table is read back, re-parsed and re-validated into the typed config the engine then runs against. The **same live read-back applies to every hook mid-deploy** (§6.2), not just `configure`: a `before_`/`after_` hook may mutate `ctx.cfg` (honored for any step not yet run) or `ctx.state` (read back into deploy state, persisted once past cutover). Implementation: before firing a slot's hooks the engine `refresh`es the `cfg`/`state` tables from the typed values; after, it re-reads them and, if changed, re-parses (`cfg` re-validated; a failure aborts the deploy). The round-trip goes through Lua, so an empty map serializes as an empty table and is parsed back as an empty map (`de_lenient_map`); map ordering (`docker.images`/`env`/`docker.services`) is not guaranteed across a mutated round-trip but does not affect correctness. `ctx.vars` remains for scratch state that is not part of cfg/state.
 
 ### 6.3 YAML hook actions (zero-Lua path)
 
@@ -362,13 +418,13 @@ mlua with stdlib minus process/file escapes: `os.execute`, `os.exit`, `os.getenv
 
 ## 7. Built-in recipe `docker-redblack` (exact commands)
 
-Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values; `compose(...)` = `docker compose -p {project} --env-file {env_file} -f {compose.files…} [+ -f {workers.compose_file} for worker ops]`. Argv is built as `Vec<String>` — no shell unless an action explicitly wraps in `sh -c`.
+Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values; `compose(...)` = `docker compose -p {project} --env-file {empty-file pin, §5.2.4} -f {compose.files…} [+ -f {workers.compose_file} for worker ops]`, spawned with `current_dir = deploy_root` and the §5.2.4 runner env. Argv is built as `Vec<String>` — no shell unless an action explicitly wraps in `sh -c`.
 
 ### 7.1 `preflight`
 - `docker network inspect {network}` *(Read)* → on failure `docker network create {network}` *(Mutate)*.
 - For each `directories[]`: `fs.create_dir_all(path)`; if `owner` → `docker run --rm -v {deploy_root}:/wd busybox chown {owner} /wd/{path}` (unprivileged-safe chown; resolves OQ-1).
 - **Orphan reaping:** `docker ps -a --filter name={release.container_prefix}- --format '{{.Names}}'` *(Read)*; for each not present in `state.releases` → `docker rm -f {name}` *(Mutate)* (clears crashed-deploy leftovers; §2.6).
-- Render `compose.env` from `compose.env` map (interpolated) → `fs.write(env_file, …, 0600)`.
+- No env file is written (§5.2 — env rides the process environment of every spawned command).
 - Failure → abort, red untouched.
 
 ### 7.2 `ensure_upstream` (INV-9)
@@ -388,12 +444,12 @@ Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values
 - **Ordering contract (tested):** worker drain (if any) precedes the first recreate; wait-gates run after all recreates.
 
 ### 7.5 `migrate:before`
-- Skip if unset. `docker run --rm --network {network} --name {project}-migrate-{release_id} {--env-file run.env_file} {-e K=V…} {docker.images.app} php bin/console app:db:migrate before --no-interaction` — argv passed **directly** (no `sh -c`), matching the original script. The throwaway carries the **release `run.env_file` + `run.env`** (so runtime-injected DB/secret env reaches migrations) plus image-baked env + `--network`; no volumes.
+- Skip if unset. `docker run --rm --network {network} --name {project}-migrate-{release_id} {--env-file run.env_file} {-e KEY…} {docker.images.app} php bin/console app:db:migrate before --no-interaction` — argv passed **directly** (no `sh -c`), matching the original script. `-e` flags are bare key names in sorted order (filtered chain keys + `run.env` keys; values in the child env, §5.2.4), so the migrate throwaway carries the same runtime env as the release; image-baked env + `--network`; no volumes.
 - Failure → abort (red untouched). Note: migrations are not guaranteed atomic — expand-contract discipline must keep even a partially-applied `before` migration backward-compatible with red (§11, §9).
 
 ### 7.6 `start:black`
 - `container = {container_prefix}-{release_id}` (stored id, §2.6); fail if it already exists (defence behind the lock; orphan-reaping in 7.1 clears stale ones).
-- `docker run -d --name {container} --network {network} --network-alias {run.network_alias} --restart {run.restart} {--env-file run.env_file} {-e K=V…} {-v vol…} {docker.images.app}`. `--env-file` (resolved vs deploy_root) precedes `-e`, so an explicit `env:` key overrides the file. Mirrors the original script.
+- `docker run -d --name {container} --network {network} --network-alias {run.network_alias} --restart {run.restart} {--env-file run.env_file} {-e KEY…} {-v vol…} {docker.images.app}`. `-e` flags are bare sorted key names (values via child env, §5.2.4); `--env-file` (resolved vs deploy_root) precedes `-e`, so a delivered key overrides the file. Mirrors the original script.
 
 ### 7.7 `healthcheck`
 - Repeat up to `retries`, sleeping `interval`: substitute the black **container name** into `healthcheck.cmd` (`{container}`), run `docker exec {healthcheck.exec_in} sh -c '<cmd>'` *(Mutate — execs into the black, which exists only after `start:black`; stubbed-OK in `--dry-run` like any post-`start:black` step)*; success on exit 0.
@@ -423,7 +479,7 @@ Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values
 
 ### 7.12 `workers` (mirrors the original script)
 - Names: `provider.static`, or run `provider.command_in_release` in black *(Mutate — execs in black; in `--dry-run` there is no black, so it emits `⚠ worker set is dynamic; not resolvable in dry-run`)* and split stdout into non-empty lines, filtering names containing `.` and any in an `exclude` list (matches the worker-listing command's behaviour).
-- Render `workers.compose_file`: one `{name_filter}{name}` service per name from `template` (substitute `{name}` in `command` + service name), plus the external-network footer.
+- Render `workers.compose_file`: one `{name_filter}{name}` service per name from `template` (substitute `{name}` in `command` + service name), plus the external-network footer. `environment:` is a bare-key-name list (§5.2.4) — the file contains no env values.
 - `compose up -d {name_filter}{name}…` — **explicit worker service list only; never a bare `up -d`; `--remove-orphans` is forbidden** (the app is `docker run`-managed and would be deleted) (§9).
 
 ### 7.13 `finalize` (mirrors the original script, corrected)
@@ -441,23 +497,24 @@ dcd <command> [stage] [flags]
 
 | Command | Behaviour |
 |---------|-----------|
-| `deploy [stage]` | run the recipe; `stage` optional if exactly one exists. `--resume` recovers a `cutover_pending` state (§4.2); a non-resume deploy that finds one refuses (exit 4) |
+| `deploy [stage]` | run the recipe; `stage` optional if exactly one exists (or the config has no `stages:` block — the stages-less case §5.2.1 covers). `--resume` recovers a `cutover_pending` state (§4.2); a non-resume deploy that finds one refuses (exit 4). Stage selection is the **positional only** (there is no `--stage` flag) |
 | `rollback [stage]` | §4.1; requires `--yes` when non-interactive |
 | `status [stage]` | current + history from state: each release's status, images, age, `ran_migrations`, and any `cutover_pending` recovery hint |
 | `tasks [stage]` | print the resolved, ordered task plan (graph + hooks); no side effects |
-| `config check` | validate config + stage merge + interpolation + `--set` + plugin load; no side effects |
+| `check [stage]` | validate config + stage merge + dotenv chain + interpolation + `--set` + plugin load; prints the §5.2.5 env observability report; no side effects |
 | `init` | scaffold config — see §8.4 |
 | `version` | binary version |
 
 | Global flag | Meaning |
 |-------------|---------|
 | `-c, --config <path>` | config file (default `./dcd.yaml`) |
-| `-s, --stage <name>` | stage (alternative to positional) |
 | `--resume` | (deploy) recover a post-cutover-incomplete release |
 | `--dry-run` | read-pass-through plan; mutations stubbed (§2.3/§2.4) |
 | `--json` | newline-delimited JSON events |
 | `--image <logical>=<tag>` | override a `docker.images.<logical>` entry (repeatable; CI passes app/db/nginx) |
 | `--set <path>=<value>` | override an existing config scalar (repeatable; §5.1 semantics) |
+| `--env-dir <path>` | directory of the dotenv chain (default: the config file's directory) (§5.2.1) |
+| `--env-stdin` | read one dotenv-format document from stdin as the highest file layer; interactive prompts then error without `-y/--yes` (§5.2) |
 | `-v/--verbose`, `-q/--quiet`, `--no-color` | output control |
 | `-y/--yes` | assume yes (rollback / refuse prompts) |
 | `--reason <text>` | annotate this deploy/rollback in state |
@@ -482,12 +539,16 @@ One `Event` stream → reporter renders by environment: **rich** (TTY: per-task 
 ### 8.3 CI integration (replaces the existing CI deploy stage)
 
 ```
-scp dcd dcd.yaml plugins/ → $DEPLOY_ROOT
-ssh server "cd $DEPLOY_ROOT && ./dcd deploy prod \
+scp dcd dcd.yaml .env plugins/ → $DEPLOY_ROOT
+ssh server "cd $DEPLOY_ROOT && ./dcd deploy prod --env-stdin --yes \
   --image app=$DOCKER_IMAGE_TAG_APP \
   --image database=$DOCKER_IMAGE_TAG_DATABASE \
-  --image nginx=$DOCKER_IMAGE_TAG_NGINX"
-# MAXMIND_* / REGISTRY exported as CI env → ${VAR} interpolation
+  --image nginx=$DOCKER_IMAGE_TAG_NGINX" < .env.prod.local
+# secrets stream over ssh stdin — no dcd-written secret FILES at rest
+# (Docker still bakes values into root-only /var/lib/docker container
+#  config; that is what makes reboot-restart work — §5.2.5);
+# the scp'd secret-free .env names the keys (§5.2.2);
+# MAXMIND_* / REGISTRY may instead be exported as CI env → process-env-wins
 ```
 
 ### 8.4 `dcd init`
@@ -516,6 +577,11 @@ Generated Rust MUST be dumb-simple and readable: intention-revealing names, smal
 | Rely on Rust `Drop` to release the lock on a signal | catch SIGINT/SIGTERM; use `flock(2)` (OS-released on SIGKILL) (§2.5) | `Drop` doesn't run on default-terminating signals |
 | Silently default an unknown/missing config key | unknown → error; missing required → error | a laundered default produces a confident wrong deploy |
 | Parse container names to find the rollback target | read typed `state.releases` (§4.1) | names are display, state is truth |
+| Write env values to any file dcd owns (compose env, workers compose, temp files) | process-env passthrough + bare `-e KEY` / bare compose keys (§5.2.4) | a file at rest is the leak class this rework removes; crash-safety of "write then delete" is a lie |
+| `-e KEY=VALUE` in `docker run` argv | bare `-e KEY`, value in the child process env | argv is world-readable in `ps` for the container's whole create window |
+| Execute `$(command)` found in a dotenv value | `ConfigError` naming file+line (§5.2.1) | env files are data; shell execution of them is an injection primitive |
+| Silently drop or empty an unresolvable env construct | loud `ConfigError` with the Symfony-format context | a silently-empty `DATABASE_URL` deploys a broken container with exit 0 |
+| Pass the whole process env (or chain) into containers | container env = chain-defined keys only, then per-container filters (§5.2.2/5.2.4) | `PATH`/CI noise in a container, and secrets reaching containers that don't need them |
 
 ---
 
@@ -556,6 +622,16 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | TC-028 | second (synthetic) config | the §15 appendix config (no Postgres, static workers, non-nginx healthcheck host, different ports, no migrations) | recipe builds a valid ordered plan + correct argv with **zero core changes** | proves generality |
 | TC-029 | rollback finalize | state {B1 superseded, B2 current}; rollback | fresh black R3 from B1 images → `active`/`current`; B2 → `rolled_back`; B1 stays `superseded` (§4.1 step 7) | rollback-of-rollback steps to next target, skips no-op |
 | TC-030 | single-pending (INV-10) | state has a crashed `cutover_pending` P; run cutover for R_new | after append exactly **one** `cutover_pending` (R_new); P → `rolled_back`; drain:red reaps P's container; finalize demotes run-start `current` | resume aborts if >1 `cutover_pending` found |
+| TC-031 | dotenv parser (Symfony 8.1 port) | the ported `DotenvTest.php` data providers (`getEnvData`, `getEnvDataWithFormatErrors`, load/loadEnv chain cases) | byte-identical values / Symfony-format errors; `$(cmd)` cases → `ConfigError` instead of execution; `$_SERVER`/`putenv`/`.env.local.php` cases N/A (documented) | `${FOO:-a$a}` unsupported-char error; `${FOO:-a"a}` → missing-quote (8.1); `__FOO_BAR`; NUL rejection; brace-less `$FOO:-TEST}`; `:=` assignment; BOM; CRLF |
+| TC-032 | chain layering + deferred resolution | dir with all 4 layers + stdin + process env | later layer wins; process env wins over all (external values verbatim — backslash matrix, `secret$word`, `value$(id)` never executed); `.env.dist` only when `.env` absent; stage `local` skips 3–4; empty stage loads 1–2 only; missing files skipped; missing `--env-dir` → error; `--env-file` rebases the chain, missing explicit base → error | cross-layer + forward `${VAR}` references resolve; later override rewrites earlier reference; self-referencing defaults; circular chain → `ConfigError` |
+| TC-033 | container-env derivation | chain + process-env-only vars + filters | container env = chain keys only; `env_include`/`env_exclude` full-match regex, exclude wins; sorted `-e KEY` argv; empty-valued key delivered | unanchored pattern does not substring-match |
+| TC-034 | reserved keys | chain defines `DOCKER_HOST` / `COMPOSE_FILE` / `PATH` | `ConfigError` naming key + escape hatch | `compose.env` map may set `COMPOSE_*` |
+| TC-035 | runner env + cwd | full deploy over the recorder | every recorded call carries the chain runner env and `current_dir = deploy_root`; compose calls additionally carry the `compose.env` overlay (overlay wins); `docker run` bare `-e` keys present in its child env; no env-value bytes in any `fs.write` | recorder must capture env to make this assertable |
+| TC-036 | workers env passthrough | template.env + chain + filters | generated YAML `environment:` = bare sorted deduplicated names only, no values; template.env value wins over chain in the workers-`up` command env (overlay) | excluded key absent from the list |
+| TC-037 | env fingerprint | deploy records `env_keys`; rollback/resume under a changed chain | sorted names in state; loud warning listing added/removed keys | unchanged chain → no warning |
+| TC-038 | removed key `compose.env_file` | pre-rework config | targeted `ConfigError` pointing at UPGRADE.md (not "unknown field") | `release.run.env_file` still accepted |
+| TC-039 | `check` env DX | chain + filters + shadowing process env | prints files found/skipped, per-layer counts, per-container key names, shadowed keys; **no values anywhere in output** | reserved key → error |
+| TC-040 | `--env-stdin` | dotenv doc on stdin; a confirming command without `--yes` | stdin layer overrides `.env.<stage>.local`; prompt → error demanding `--yes` | empty stdin = empty layer |
 
 ### 10.2 Integration tests
 
@@ -567,6 +643,7 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | IT-004 | resume | kill dcd between cutover and finalize (inject failure in `migrate:after`) | exit 4; `dcd deploy --resume` finishes; state `active` | as above |
 | IT-005 | concurrent lock | two `dcd deploy` in parallel | one runs, other exit 3; killed holder's flock reclaimed | as above |
 | IT-006 | conditional recreate | redeploy with unchanged managed image | postgres/nginx `--no-recreate` (same container id) | as above |
+| IT-007 | env at rest + reboot survival | deploy with a 4-layer chain incl. a secret value; **chain dir outside `deploy_root`, passed via `--env-dir`** | `docker inspect` shows the value in container config; `docker stop`+`start` (env-less shell) preserves it; **no file under `deploy_root` contains the value** (recursive grep over dcd-written files) | rm containers/network; shred chain files |
 
 ### 10.3 Invariant → test map
 
@@ -606,7 +683,18 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 
 | Error | Message | Exit | Recovery |
 |-------|---------|------|----------|
-| missing `${VAR}` no default | `config: ${REGISTRY} is not set` + file/line | 2 | export the var |
+| missing `${VAR}` no default | `config: ${REGISTRY} is not set` + file/line | 2 | export the var, add it to a chain layer, or write `${VAR:-default}` |
+| dotenv syntax error | Symfony-format context: `<msg> in "<file>" at line N` + snippet + caret (§5.2.1) | 2 | fix the named line |
+| `$(command)` in a dotenv value | `command expansion is not supported; remove $(...)` + file/line | 2 | compute outside, pass the result |
+| reserved key in a chain layer or env map | `<KEY> in <file-or-config-path> is reserved (configures dcd's own tooling)` — the chain variant appends `; set it via release.run.env if a container needs it` (config-map variants omit it: no legitimate delivery exists for those keys) | 2 | move/remove the key |
+| env-map key with whitespace/`=`/other bad chars | `invalid env key <key> in <owner> (letters, digits, and underscore only, not starting with a digit)` — guards argv/YAML injection, incl. via Lua `ctx.cfg` | 2 | fix the key |
+| `--env-dir` missing directory | `env dir <path> does not exist` | 2 | fix the path |
+| `--env-file` base missing | `env file <path> does not exist (checked <path>.dist too)` | 2 | fix the path or create the base |
+| circular chain references | `Too many levels of variable indirection in env vars: <NAMES>.` (after 5 deferred passes) | 2 | break the reference cycle |
+| NUL byte in a dotenv document | `Loading files containing NUL bytes is not supported.` + context | 2 | fix the file encoding |
+| `compose.env_file` present | `compose.env_file was removed — dcd no longer writes an env file; see UPGRADE.md` | 2 | delete the key |
+| `--env-stdin` on a prompting command without `--yes`, or stdin is a TTY | `--env-stdin consumes stdin; pass -y/--yes` / `--env-stdin requires piped input` — both refused at arg-parse, before the lock | 2 | add `--yes` / pipe the document |
+| rollback/resume env drift | warning: `release <id> ran with env keys [+ADDED/-REMOVED] vs current chain` (not an error) | — | verify the chain before proceeding |
 | unknown config key | `config: unknown key 'servces' (did you mean 'services'?)` | 2 | fix key |
 | stage not found / ambiguous | `stage 'staging' not found; known: beta, prod` / `multiple stages; pass one of: …` | 2 | pass stage |
 | lock held | `another deploy holds prod (pid 4123 since 16:40)`; dead pid → reclaimed | 3 | wait/retry |
@@ -626,11 +714,13 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | 003 | **Embedded Lua (mlua), sandboxed** | proven, liked, no system Lua; effects only via `ctx` | native Rust plugins (recompile), WASM (heavy) |
 | 004 | **Shell out to `docker` CLI** | parity; `--dry-run` prints real cmds; `compose` has no API | Bollard, hybrid |
 | 005 | **Code-only rollback; forward-only migrations** | expand-contract; down-migrations lossy | down-migrations; block-on-migrate |
-| 006 | **Env-var `${VAR}` secrets, `compose.env` 0600 on disk** | CI-native, no new dependency | sops/age, Vault/SSM |
+| 006 | ~~Env-var `${VAR}` secrets, `compose.env` 0600 on disk~~ **superseded by ADR-011** (2026-07-28) | (historical) CI-native, no new dependency | sops/age, Vault/SSM |
 | 007 | **One config, stages over base** + host guard | DRY, single source; server = CI SSH target | file-per-stage; independent stages |
 | 008 | **Zero Lua for the common case** | best DX; YAML drives the recipe | Lua-first; scaffolded recipe |
 | 009 | **Adaptive output** (TTY/plain/json) | right output everywhere from one stream | plain-only; json-only |
 | 010 | binary **`dcd`**, config **`dcd.yaml`** | user choice (round 2) | `deployer`, `redblack` |
+| 011 | **Dotenv-chain secrets, process-env passthrough, nothing dcd-written at rest** (§5.2; supersedes ADR-006) | secrets live at the launch source (recovery); Docker's create-time env baking makes reboot-restart work with no on-disk file; bare `-e KEY` removes the `ps` leak. Honest cost: the command contract becomes argv **plus** a recorded env (§2.3) — a copy-pasted dry-run line needs the named keys exported first | keep 0600 files (residue + no recovery); temp-file-then-delete (crash leaves secrets); `--env-file /proc/self/fd/N` via memfd (needs `libc`+`unsafe` and fd-lifetime plumbing across the spawn for no observable gain over passthrough); sops/age & Vault/SSM (still out, blueprint §7) |
+| 012 | **Parser = Rust port of `symfony/dotenv` 8.1 (raw lexing + deferred ≤5-pass chain resolution), proven by its ported test suite; `$(cmd)` errors instead of executing** | the chain must parse the user's real Symfony files byte-identically; every surveyed crate fails (dotenvy/dotenv: per-file substitution scope + `${VAR:-default}` silently empty — read from source; darkweb-dotenv: abandoned beta, env-mutating, `regex` dep; ruby-lineage precedence is first-wins, the opposite of Symfony) | dotenvy + layering wrapper (cannot fix parse-time substitution); any listed crate; hand grammar without the ported suite (unproven parity) |
 
 ---
 
@@ -646,6 +736,8 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | Workers carry `com.docker.compose.project={project}` + name prefix `{workers.name_filter}` | `name_filter` is config-driven (§5); adjust per project |
 | `release_id = epoch seconds` is unique enough | orphan-reaping + name-collision guard turn a clash into a clear error, not corruption |
 | `migrate:after` (and any post-cutover command) is idempotent under re-run | `--resume` re-runs it after a later-stage failure; if a project's command is not idempotent, record a per-release `migrated_after` marker in state and skip on resume |
+| `docker`/`docker compose` on the target read env for `${VAR}` substitution and bare `-e KEY`/bare-list passthrough as verified on Docker 29.4.0 / Compose v2 (2026-07-28 live tests) | these are documented, long-stable CLI contracts; IT-007 re-verifies on the CI daemon — a regression there fails the e2e, not production |
+| The chain-as-interpolation-source also feeds `registry`/`deploy_root` defaults (one rule, no exceptions — deviation from the design-review recommendation to keep those process-env-only) | if a stray `.env` redefining `deploy_root` proves a real hazard, narrow `inject_env_default` to process-env-only; `dcd check` printing the chain files makes the stray visible first |
 
 ### Open Questions
 
@@ -654,6 +746,7 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | OQ-1 | chown preflight dirs via a `busybox` container vs assume a privileged uid | the original script chowns directly (implies privilege) | `preflight` impl | busybox-container chown (unprivileged); adopted in §7.1 |
 | OQ-2 | Should `config check` optionally **lint** the expand-contract contract (flag destructive `before` migrations)? | enforces ADR-005 | a v1.1 feature | defer; document the contract, opt-in linter later |
 | OQ-3 | `serde_yaml` is in maintenance mode — pin it or use `serde_yml`/`saphyr` | dependency longevity | crate choice | pin a maintained YAML crate at impl start; isolate behind `config` |
+| OQ-4 | ~~mechanism to pin compose's implicit `.env` discovery off~~ **resolved 2026-07-28:** `--env-file /dev/null` verified on Compose v2 (suppresses discovery, no error); adopted in §5.2.4 | — | — | — |
 
 ---
 
@@ -684,7 +777,6 @@ docker:
       wait: { exec_in: blogapp-web, cmd: 'wget -qO- localhost/up', retries: 20, interval: 1s }
 compose:
   files: [compose.prod.yml]
-  env_file: compose.env
   env:
     COMPOSE_PROJECT_NAME: blogapp
     COMPOSE_IGNORE_ORPHANS: 'true'
