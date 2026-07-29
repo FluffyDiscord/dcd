@@ -19,11 +19,16 @@ fn release(id: u64, container: &str, app: &str, status: ReleaseStatus) -> Releas
         status,
         ran_migrations: false,
         reason: None,
+        env_keys: Vec::new(),
     }
 }
 
 fn cfg() -> config::Config {
-    let src = r#"
+    config::load(cfg_src(), Some("prod"), &[], &HashMap::new()).unwrap()
+}
+
+fn cfg_src() -> &'static str {
+    r#"
 version: 1
 project: demo
 network: demo_net
@@ -43,7 +48,6 @@ docker:
       recreate: never
 compose:
   files: [base.yml]
-  env_file: compose.env
   env:
     REGISTRY: reg
 directories:
@@ -64,15 +68,13 @@ workers:
   template: { image: app, entrypoint: ['php', 'consume'], command: ['{name}'] }
 stages:
   prod: {}
-"#;
-    config::load(src, Some("prod"), &[], &HashMap::new()).unwrap()
+"#
 }
 
 fn opts() -> Options {
     Options {
-        dry_run: false,
         sleep_enabled: false,
-        reason: None,
+        ..Options::default()
     }
 }
 
@@ -96,14 +98,14 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
     assert!(has("docker pull reg:app-1"));
     assert!(has("docker pull reg:db-1"));
     assert!(has("docker inspect demo-postgres --format {{.Config.Image}}"));
-    assert!(has("docker compose -p demo --env-file compose.env -f base.yml up -d --no-recreate postgres"));
+    assert!(has("docker compose -p demo --env-file /dev/null -f base.yml up -d --no-recreate postgres"));
     assert!(has("docker exec demo-postgres sh -c pg_isready"));
-    assert!(has("docker run --rm --network demo_net --name demo-migrate-1000 -e TZ=UTC reg:app-1 migrate before"));
-    assert!(has("docker run -d --name demo-app-1000 --network demo_net --network-alias app-rr --restart unless-stopped -e TZ=UTC reg:app-1"));
+    assert!(has("docker run --rm --network demo_net --name demo-migrate-1000 -e TZ reg:app-1 migrate before"));
+    assert!(has("docker run -d --name demo-app-1000 --network demo_net --network-alias app-rr --restart unless-stopped -e TZ reg:app-1"));
     assert!(has("docker exec demo-nginx sh -c curl -sf http://demo-app-1000:2114/health"));
     assert!(has("docker exec demo-nginx sh -c nginx -s reload"));
     assert!(has("docker exec demo-app-1000 migrate after"));
-    assert!(has("docker compose -p demo --env-file compose.env -f base.yml -f workers.yml up -d worker-async worker-scheduler"));
+    assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f workers.yml up -d worker-async worker-scheduler"));
 
     // healthcheck targets the container NAME, never the shared alias (spec §7.7)
     assert!(!calls.iter().any(|c| c.contains("http://app-rr:")));
@@ -113,8 +115,9 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
     assert_eq!(prod.current.as_deref(), Some("demo-app-1000"));
     assert_eq!(prod.find("demo-app-1000").unwrap().status, crate::state::ReleaseStatus::Active);
 
-    // compose.env + workers compose + state were written
-    assert!(fs.exists(std::path::Path::new("./compose.env")));
+    // no env file is ever rendered (spec §5.2.4); workers compose + state were written
+    assert!(!fs.exists(std::path::Path::new("./compose.env")));
+    assert!(fs.exists(std::path::Path::new("./workers.yml")));
     assert!(fs.exists(std::path::Path::new("./dcd-state.json")));
 }
 
@@ -172,7 +175,7 @@ fn dry_run_executes_no_mutations() {
         Options {
             dry_run: true,
             sleep_enabled: false,
-            reason: None,
+            ..Options::default()
         },
     );
     engine.deploy().unwrap();
@@ -210,7 +213,7 @@ fn rollback_deploys_previous_image_without_migrations() {
     let calls = runner.display_calls();
     assert!(calls.iter().any(|c| c == "docker pull reg:app-old"));
     assert!(calls.iter().any(|c| c
-        == "docker run -d --name demo-app-5000 --network demo_net --network-alias app-rr --restart unless-stopped -e TZ=UTC reg:app-old"));
+        == "docker run -d --name demo-app-5000 --network demo_net --network-alias app-rr --restart unless-stopped -e TZ reg:app-old"));
     assert!(!calls.iter().any(|c| c.contains("migrate"))); // INV-5: no migrations on rollback
 
     let state = engine.into_state();
@@ -393,7 +396,6 @@ docker:
       wait: { exec_in: blogapp-web, cmd: 'wget -qO- localhost/up', retries: 2, interval: 1s }
 compose:
   files: [compose.prod.yml]
-  env_file: compose.env
   env: { COMPOSE_PROJECT_NAME: blogapp }
 release:
   image: app
@@ -424,6 +426,190 @@ stages:
     assert!(calls.iter().any(|c| c == "docker run -d --name blogapp-app-1234 --network blogapp_net --network-alias app --restart unless-stopped app1"));
     assert!(calls.iter().any(|c| c.contains("up -d worker-default worker-mail"))); // static workers
     assert!(calls.iter().any(|c| c == "docker exec blogapp-web sh -c wget -qO- http://blogapp-app-1234:9000/up"));
+}
+
+#[test]
+fn chain_env_reaches_containers_as_bare_keys_with_overlays() {
+    // TC-035/TC-036: chain keys ride as bare -e / bare compose names; explicit maps
+    // arrive as per-command overlays; no env value lands in any written file.
+    let cfg = cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(4000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut options = opts();
+    options.container_env = [
+        ("DATABASE_URL".to_string(), "postgres://secret@db".to_string()),
+        ("APP_SECRET".to_string(), "hunter2".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), options);
+    engine.deploy().unwrap();
+
+    let calls = runner.display_calls();
+    assert!(calls.iter().any(|c| c
+        == "docker run -d --name demo-app-4000 --network demo_net --network-alias app-rr --restart unless-stopped -e APP_SECRET -e DATABASE_URL -e TZ reg:app-1"));
+
+    // run.env values arrive as the overlay of the docker run command, never argv
+    let overlay = runner.env_overlay_of("docker run -d --name demo-app-4000").unwrap();
+    assert_eq!(overlay.get("TZ").map(String::as_str), Some("UTC"));
+
+    // compose calls carry the compose.env overlay
+    let overlay = runner.env_overlay_of("up -d --no-recreate postgres").unwrap();
+    assert_eq!(overlay.get("REGISTRY").map(String::as_str), Some("reg"));
+
+    // the workers file lists key NAMES only; no secret value in any written file
+    let workers_yaml = String::from_utf8(fs.read(std::path::Path::new("./workers.yml")).unwrap()).unwrap();
+    assert!(workers_yaml.contains("            - APP_SECRET\n"));
+    assert!(workers_yaml.contains("            - DATABASE_URL\n"));
+    assert!(!workers_yaml.contains("hunter2"));
+    let state_json = String::from_utf8(fs.read(std::path::Path::new("./dcd-state.json")).unwrap()).unwrap();
+    assert!(!state_json.contains("hunter2"));
+    assert!(!calls.iter().any(|c| c.contains("hunter2")), "no value in any argv");
+
+    // TC-037: the release records its delivered key names
+    let state = engine.into_state();
+    let release = state.stage("prod").unwrap().find("demo-app-4000").unwrap().clone();
+    assert_eq!(release.env_keys, vec!["APP_SECRET", "DATABASE_URL", "TZ"]);
+}
+
+#[test]
+fn template_env_wins_over_compose_env_in_the_workers_up_overlay() {
+    // TC-036 second clause: the workers `up` carries compose.env with template.env over it.
+    let src = cfg_src().replace(
+        "  template: { image: app, entrypoint: ['php', 'consume'], command: ['{name}'] }",
+        "  template: { image: app, entrypoint: ['php', 'consume'], command: ['{name}'], env: { REGISTRY: tmpl-wins, TZ: UTC } }",
+    );
+    let cfg = config::load(&src, Some("prod"), &[], &HashMap::new()).unwrap();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(4200);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
+    engine.deploy().unwrap();
+
+    let overlay = runner.env_overlay_of("up -d worker-async").unwrap();
+    assert_eq!(overlay.get("REGISTRY").map(String::as_str), Some("tmpl-wins"));
+    assert_eq!(overlay.get("TZ").map(String::as_str), Some("UTC"));
+}
+
+#[test]
+fn rollback_warns_when_recorded_env_keys_drift_from_the_chain() {
+    // TC-037: recorded [DB_URL, TZ] vs current chain delivering [NEW_KEY, TZ].
+    let cfg = cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(5100);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut state = State::default();
+    {
+        let st = state.stage_mut("prod");
+        let mut old = release(1, "demo-app-1", "reg:app-old", ReleaseStatus::Superseded);
+        old.env_keys = vec!["DB_URL".to_string(), "TZ".to_string()];
+        st.releases.push(old);
+        st.releases.push(release(2, "demo-app-2", "reg:app-new", ReleaseStatus::Active));
+        st.current = Some("demo-app-2".into());
+    }
+    let mut options = opts();
+    options.container_env = [("NEW_KEY".to_string(), "v".to_string())].into_iter().collect();
+
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, options);
+    engine.rollback().unwrap();
+
+    let warned = reporter.lines().into_iter().find(|l| l.contains("different env keys"));
+    let warned = warned.expect("expected a drift warning");
+    assert!(warned.contains("+NEW_KEY"), "got: {warned}");
+    assert!(warned.contains("-DB_URL"), "got: {warned}");
+    assert!(!warned.contains('v') || warned.contains("env"), "values never printed");
+}
+
+#[test]
+fn unchanged_env_keys_produce_no_drift_warning() {
+    let cfg = cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(5200);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut state = State::default();
+    {
+        let st = state.stage_mut("prod");
+        let mut old = release(1, "demo-app-1", "reg:app-old", ReleaseStatus::Superseded);
+        old.env_keys = vec!["TZ".to_string()]; // exactly what run.env delivers today
+        st.releases.push(old);
+        st.releases.push(release(2, "demo-app-2", "reg:app-new", ReleaseStatus::Active));
+        st.current = Some("demo-app-2".into());
+    }
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    engine.rollback().unwrap();
+    assert!(
+        !reporter.lines().iter().any(|l| l.contains("different env keys")),
+        "no drift, no warning"
+    );
+}
+
+#[test]
+fn env_exclude_withholds_a_chain_key_from_the_release() {
+    let src = r#"
+version: 1
+project: demo
+network: demo_net
+registry: reg
+docker:
+  images: { app: app-1 }
+  services:
+    nginx: { container: demo-nginx, recreate: never }
+compose:
+  files: [base.yml]
+release:
+  image: app
+  container_prefix: demo-app
+  run:
+    env_exclude: ['DEPLOY_.*']
+  healthcheck: { exec_in: demo-nginx, cmd: 'curl {container}', retries: 1, interval: 1s }
+cutover:
+  backend_port: 8080
+  reload: { exec_in: demo-nginx, cmd: 'nginx -s reload' }
+stages:
+  prod: {}
+"#;
+    let cfg = config::load(src, Some("prod"), &[], &HashMap::new()).unwrap();
+    let runner = RecordingRunner::new();
+    let fs = MemoryFs::new();
+    let clock = FixedClock(4100);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut options = opts();
+    options.container_env = [
+        ("DEPLOY_ROOT_TOKEN".to_string(), "x".to_string()),
+        ("APP_SECRET".to_string(), "y".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), options);
+    engine.deploy().unwrap();
+    let run_line = runner
+        .display_calls()
+        .into_iter()
+        .find(|c| c.starts_with("docker run -d"))
+        .unwrap();
+    assert!(run_line.contains("-e APP_SECRET"));
+    assert!(!run_line.contains("DEPLOY_ROOT_TOKEN"), "excluded key must not be delivered");
 }
 
 #[test]
