@@ -175,3 +175,34 @@ fn durations_parse_suffixes() {
     assert_eq!(pg.wait.as_ref().unwrap().interval, 1);
     assert_eq!(c.workers.as_ref().unwrap().stop_timeout, 120); // default 120s
 }
+
+#[test]
+fn removed_compose_env_file_gets_targeted_error() {
+    let top_level = sample().replace("compose:\n", "compose:\n  env_file: compose.env\n");
+    let err = load(&top_level, Some("prod"), &[], &env()).unwrap_err();
+    assert!(err.to_string().contains("compose.env_file was removed"), "got: {err}");
+    assert!(err.to_string().contains("UPGRADE.md"));
+
+    let in_stage = sample().replace(
+        "stages:\n",
+        "stages:\n  legacy:\n    compose: { env_file: old.env }\n",
+    );
+    let err = load(&in_stage, Some("prod"), &[], &env()).unwrap_err();
+    assert!(err.to_string().contains("compose.env_file was removed"), "got: {err}");
+}
+
+#[test]
+fn env_map_keys_are_charset_validated_and_reserved_guarded() {
+    let bad_key = sample().replace("env:\n", "env:\n    'BAD KEY': x\n");
+    let err = load(&bad_key, Some("prod"), &[], &env()).unwrap_err();
+    assert!(err.to_string().contains("invalid env key `BAD KEY`"), "got: {err}");
+
+    let hijack = sample().replace("env:\n", "env:\n    DOCKER_HOST: tcp://evil:2375\n");
+    let err = load(&hijack, Some("prod"), &[], &env()).unwrap_err();
+    assert!(err.to_string().contains("DOCKER_HOST"), "got: {err}");
+    assert!(err.to_string().contains("reserved"), "got: {err}");
+
+    // COMPOSE_* stays legitimate in compose.env
+    let compose_ok = sample().replace("env:\n", "env:\n    COMPOSE_IGNORE_ORPHANS: 'true'\n");
+    assert!(load(&compose_ok, Some("prod"), &[], &env()).is_ok());
+}
