@@ -139,6 +139,28 @@ after('healthcheck', 'centrifugo')
 after('cutover', function(ctx) ctx.dump() end)
 ```
 
+## Container images
+
+Every release publishes the binary as `linux/amd64` + `linux/arm64` images on GHCR, in a
+Debian-slim and an Alpine flavour. The binary is statically linked, so either flavour can be
+copied into any base image:
+
+```dockerfile
+COPY --from=ghcr.io/fluffydiscord/dcd:0.2.0 /usr/local/bin/dcd /usr/local/bin/dcd
+```
+
+| Tag | What it points at |
+|-----|-------------------|
+| `0.2.0`, `0.2`, `latest` | Debian-slim, the release `v0.2.0` |
+| `0.2.0-alpine`, `0.2-alpine`, `latest-alpine` | Alpine, the same release |
+| `edge`, `edge-alpine` | the current `master` |
+
+Tag a release to publish one:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
 ## Build & test
 
 ```bash
