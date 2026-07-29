@@ -770,14 +770,23 @@ pub struct ResolvedEnv {
 /// Loads the chain hanging off `base` (Symfony `loadEnv` semantics): `<base>`
 /// (or `<base>.dist`) → `<base>.local` → `<base>.<stage>` → `<base>.<stage>.local`.
 /// `base_required` makes a missing base file an error — used when the operator
-/// pointed dcd at an explicit `--env-file`.
+/// pointed dcd at an explicit `--env-file`. A `None` base means the operator
+/// named no file source at all (`--env-stdin` alone, spec §5.2.1): dcd discovers
+/// nothing on disk and the stdin document is the whole chain.
 pub fn resolve(
-    base: &Path,
+    base: Option<&Path>,
     stage: &str,
     base_required: bool,
     stdin_document: Option<&str>,
     process_env: &HashMap<String, String>,
 ) -> Result<ResolvedEnv> {
+    let Some(base) = base else {
+        let documents: Vec<(String, String)> = stdin_document
+            .map(|doc| vec![("<stdin>".to_string(), doc.to_string())])
+            .unwrap_or_default();
+        return resolve_documents(&documents, process_env, Vec::new());
+    };
+
     let parent = match base.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         _ => PathBuf::from("."),

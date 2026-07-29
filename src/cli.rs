@@ -70,8 +70,9 @@ pub struct Cli {
     /// <path>.local, <path>.<stage>, <path>.<stage>.local; the base must exist
     #[arg(long, global = true, value_name = "PATH", conflicts_with = "env_dir")]
     env_file: Option<PathBuf>,
-    /// Read one extra dotenv document from stdin as the highest file layer
-    /// (nothing lands on disk); requires piped input and -y for prompting commands
+    /// Read a dotenv document from stdin (nothing lands on disk). On its own it is
+    /// the WHOLE chain — no .env is discovered next to the config; with --env-dir or
+    /// --env-file it is the highest layer. Needs piped input, and -y when prompting
     #[arg(long, global = true)]
     env_stdin: bool,
     /// Skip confirmation prompts (e.g. for rollback)
@@ -155,14 +156,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         .map_err(|e| DcdError::Config(format!("cannot read {}: {e}", cli.config.display())))?;
     let stage_name = config::peek_stage(&source, stage_of(&cli.command))?;
     let stdin_document = read_env_stdin(&cli)?;
-    let chain_base = match (&cli.env_file, &cli.env_dir) {
-        (Some(file), _) => file.clone(),
-        (None, Some(dir)) => dir.join(".env"),
-        (None, None) => config_dir(&cli.config).join(".env"),
-    };
+    let chain_base = chain_base(&cli);
     let base_required = cli.env_file.is_some();
     let resolved = crate::dotenv::resolve(
-        &chain_base,
+        chain_base.as_deref(),
         &stage_name,
         base_required,
         stdin_document.as_deref(),
@@ -208,7 +205,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Status { .. } => status(&cfg, &reporter),
         Command::Tasks { .. } => tasks(&cfg, &reporter),
-        Command::Check { .. } => check_report(&cfg, &reporter, &resolved, &chain_base),
+        Command::Check { .. } => check_report(&cfg, &reporter, &resolved, chain_base.as_deref()),
         Command::Init { .. } => unreachable!("handled above"),
     }
 }
@@ -219,7 +216,7 @@ fn check_report(
     cfg: &Config,
     reporter: &Reporter,
     resolved: &crate::dotenv::ResolvedEnv,
-    chain_base: &Path,
+    chain_base: Option<&Path>,
 ) -> Result<()> {
     for layer in &resolved.layers {
         reporter.log(&format!("env: loaded {} ({} keys)", layer.label, layer.values.len()));
@@ -250,7 +247,8 @@ fn check_report(
     }
 
     let stray = cfg.deploy_root.join(".env");
-    let is_same_file = stray.canonicalize().ok() == chain_base.canonicalize().ok();
+    let base_real = chain_base.and_then(|base| base.canonicalize().ok());
+    let is_same_file = base_real.is_some() && stray.canonicalize().ok() == base_real;
     if stray.exists() && !is_same_file {
         reporter.warn(&format!(
             "{} exists but is not part of dcd's chain — compose never reads it (dcd pins compose's --env-file to /dev/null)",
@@ -260,6 +258,18 @@ fn check_report(
 
     reporter.log(&format!("config ok ({} stage '{}')", cfg.project, cfg.stage));
     Ok(())
+}
+
+/// Where the dotenv chain hangs from, or `None` when no file source was named
+/// (spec §5.2.1): `--env-stdin` alone must not absorb an application `.env` that
+/// happens to sit beside `dcd.yaml`. `--env-dir`/`--env-file` combine both.
+fn chain_base(cli: &Cli) -> Option<PathBuf> {
+    match (&cli.env_file, &cli.env_dir) {
+        (Some(file), _) => Some(file.clone()),
+        (None, Some(dir)) => Some(dir.join(".env")),
+        (None, None) if cli.env_stdin => None,
+        (None, None) => Some(config_dir(&cli.config).join(".env")),
+    }
 }
 
 fn config_dir(config_path: &Path) -> PathBuf {
@@ -662,6 +672,39 @@ mod tests {
     }
 
     #[test]
+    fn env_stdin_alone_discovers_no_dotenv_next_to_the_config() {
+        // The regression: an application .env beside dcd.yaml used to be absorbed
+        // into the chain — and into every container — behind a stdin-only deploy.
+        let cli = Cli::parse_from(["dcd", "check", "prod", "--config", "/srv/app/dcd.yaml", "--env-stdin"]);
+        assert_eq!(chain_base(&cli), None);
+
+        let empty = std::collections::HashMap::new();
+        let resolved = crate::dotenv::resolve(None, "prod", false, Some("APP_SECRET=s\n"), &empty).unwrap();
+        let labels: Vec<&str> = resolved.layers.iter().map(|layer| layer.label.as_str()).collect();
+        assert_eq!(labels, ["<stdin>"]);
+        assert!(resolved.skipped.is_empty(), "nothing is probed on disk: {:?}", resolved.skipped);
+    }
+
+    #[test]
+    fn an_explicit_file_source_still_pairs_with_a_stdin_layer() {
+        let with_dir = Cli::parse_from([
+            "dcd", "check", "prod", "--config", "/srv/app/dcd.yaml", "--env-dir", "/srv/env", "--env-stdin",
+        ]);
+        assert_eq!(chain_base(&with_dir), Some(PathBuf::from("/srv/env/.env")));
+
+        let with_file = Cli::parse_from([
+            "dcd", "check", "prod", "--config", "/srv/app/dcd.yaml", "--env-file", "/srv/env/.env.deploy", "--env-stdin",
+        ]);
+        assert_eq!(chain_base(&with_file), Some(PathBuf::from("/srv/env/.env.deploy")));
+    }
+
+    #[test]
+    fn without_env_stdin_the_config_directory_dotenv_is_the_base() {
+        let cli = Cli::parse_from(["dcd", "check", "prod", "--config", "/srv/app/dcd.yaml"]);
+        assert_eq!(chain_base(&cli), Some(PathBuf::from("/srv/app/.env")));
+    }
+
+    #[test]
     fn check_report_prints_key_names_and_never_values() {
         // TC-039: the env observability report leaks no value bytes.
         let config_env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -673,7 +716,7 @@ mod tests {
         let resolved =
             crate::dotenv::resolve_documents(&documents, &config_env, Vec::new()).unwrap();
         let reporter = Reporter::capture(crate::ui::Mode::Plain);
-        check_report(&cfg, &reporter, &resolved, Path::new(".")).unwrap();
+        check_report(&cfg, &reporter, &resolved, Some(Path::new("."))).unwrap();
 
         let output = reporter.lines().join("\n");
         assert!(output.contains("APP_SECRET"), "key names are printed: {output}");
