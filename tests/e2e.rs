@@ -44,7 +44,6 @@ docker:
       wait: {{ exec_in: {project}-nginx, cmd: 'wget -qO- -T 2 http://localhost/ >/dev/null 2>&1 || true', retries: 10, interval: 1s }}
 compose:
   files: [compose.prod.yml]
-  env_file: compose.env
 release:
   image: app
   container_prefix: {project}-app
@@ -157,6 +156,52 @@ fn it_002_failed_healthcheck_keeps_red_and_removes_black() {
     // black was removed; no app container left; state never advanced
     assert!(fx.running("app").is_empty());
     assert!(!fx.dir.join("dcd-state.json").exists() || !std::fs::read_to_string(fx.dir.join("dcd-state.json")).unwrap().contains("active"));
+}
+
+#[test]
+fn it_007_env_baked_at_create_survives_restart_and_never_rests_in_deploy_root() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new("envchain");
+
+    // Chain lives OUTSIDE deploy_root (spec IT-007) and carries a secret value.
+    let env_dir = std::env::temp_dir().join(format!("{}-env", fx.project));
+    std::fs::create_dir_all(&env_dir).unwrap();
+    std::fs::write(env_dir.join(".env"), "APP_SECRET=\nCHAIN_MARKER=base\n").unwrap();
+    std::fs::write(env_dir.join(".env.it"), "APP_SECRET=e2e-hunter2\nCHAIN_MARKER=stage\n").unwrap();
+
+    let out = fx.dcd(&["deploy", "it", "--env-dir", env_dir.to_str().unwrap()]);
+    assert!(out.status.success(), "deploy failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let app = fx.running("app");
+    assert_eq!(app.len(), 1);
+
+    // env baked into the container config at create
+    let inspect = docker(&["inspect", &app[0], "--format", "{{.Config.Env}}"]);
+    let env_line = String::from_utf8_lossy(&inspect.stdout).to_string();
+    assert!(env_line.contains("APP_SECRET=e2e-hunter2"), "env not baked: {env_line}");
+    assert!(env_line.contains("CHAIN_MARKER=stage"), "later layer must win: {env_line}");
+
+    // survives a restart with no env present anywhere
+    docker(&["restart", &app[0]]);
+    let inspect = docker(&["exec", &app[0], "printenv", "APP_SECRET"]);
+    assert_eq!(String::from_utf8_lossy(&inspect.stdout).trim(), "e2e-hunter2");
+
+    // no file under deploy_root contains the secret value
+    for entry in std::fs::read_dir(&fx.dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("e2e-hunter2"),
+                "secret at rest in {}",
+                path.display()
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&env_dir);
 }
 
 #[test]
