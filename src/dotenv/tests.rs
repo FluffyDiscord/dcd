@@ -505,19 +505,19 @@ fn chain_file_discovery_layers_and_local_stage_skip() {
     std::fs::write(dir.join(".env.prod.local"), "FOO=prodlocal").unwrap();
 
     let base = dir.join(".env");
-    let resolved = resolve(&base, "prod", false, None, &HashMap::new()).unwrap();
+    let resolved = resolve(Some(&base), "prod", false, None, &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "prodlocal");
     assert_eq!(resolved.container_env["ONLY_BASE"], "1");
     assert_eq!(resolved.layers.len(), 4);
 
-    let resolved = resolve(&base, "local", false, None, &HashMap::new()).unwrap();
+    let resolved = resolve(Some(&base), "local", false, None, &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "local");
 
-    let resolved = resolve(&base, "", false, None, &HashMap::new()).unwrap();
+    let resolved = resolve(Some(&base), "", false, None, &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "local");
 
     let stdin_doc = "FOO=stdin";
-    let resolved = resolve(&base, "prod", false, Some(stdin_doc), &HashMap::new()).unwrap();
+    let resolved = resolve(Some(&base), "prod", false, Some(stdin_doc), &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "stdin");
     assert_eq!(resolved.layers.last().unwrap().label, "<stdin>");
 
@@ -530,16 +530,16 @@ fn chain_dist_fallback_and_missing_dir() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(".env.dist"), "FOO=dist").unwrap();
     let base = dir.join(".env");
-    let resolved = resolve(&base, "", false, None, &HashMap::new()).unwrap();
+    let resolved = resolve(Some(&base), "", false, None, &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "dist");
 
     std::fs::write(dir.join(".env"), "FOO=real").unwrap();
-    let resolved = resolve(&base, "", false, None, &HashMap::new()).unwrap();
+    let resolved = resolve(Some(&base), "", false, None, &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "real");
     std::fs::remove_dir_all(&dir).unwrap();
 
     let missing = dir.join("nope").join(".env");
-    let err = resolve(&missing, "", false, None, &HashMap::new()).unwrap_err();
+    let err = resolve(Some(&missing), "", false, None, &HashMap::new()).unwrap_err();
     assert!(err.to_string().contains("does not exist"), "got: {err}");
 }
 
@@ -549,12 +549,12 @@ fn chain_unreadable_file_is_a_loud_error() {
     std::fs::create_dir_all(dir.join(".env.prod")).unwrap();
     std::fs::write(dir.join(".env"), "FOO=1").unwrap();
     let base = dir.join(".env");
-    let err = resolve(&base, "prod", false, None, &HashMap::new()).unwrap_err();
+    let err = resolve(Some(&base), "prod", false, None, &HashMap::new()).unwrap_err();
     assert!(err.to_string().contains("is a directory"), "got: {err}");
 
     std::fs::remove_dir_all(dir.join(".env.prod")).unwrap();
     std::fs::write(dir.join(".env.prod"), [0xFF, 0xFE, 0x00]).unwrap();
-    let err = resolve(&base, "prod", false, None, &HashMap::new()).unwrap_err();
+    let err = resolve(Some(&base), "prod", false, None, &HashMap::new()).unwrap_err();
     assert!(err.to_string().contains("not valid UTF-8"), "got: {err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -731,7 +731,7 @@ fn chain_base_override_rebases_the_whole_chain() {
     std::fs::write(dir.join(".env.deploy.prod"), "FOO=prod").unwrap();
 
     let base = dir.join(".env.deploy");
-    let resolved = resolve(&base, "prod", true, None, &HashMap::new()).unwrap();
+    let resolved = resolve(Some(&base), "prod", true, None, &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "prod");
     assert_eq!(resolved.container_env["ONLY_BASE"], "1");
     assert!(
@@ -740,7 +740,7 @@ fn chain_base_override_rebases_the_whole_chain() {
     );
 
     let missing = dir.join(".env.missing");
-    let err = resolve(&missing, "prod", true, None, &HashMap::new()).unwrap_err();
+    let err = resolve(Some(&missing), "prod", true, None, &HashMap::new()).unwrap_err();
     assert!(err.to_string().contains("does not exist"), "got: {err}");
 
     std::fs::remove_dir_all(&dir).unwrap();
