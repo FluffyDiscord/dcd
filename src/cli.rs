@@ -3,6 +3,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
@@ -42,8 +43,11 @@ AGENTS.md                          a guide for authoring one from scratch"
 )]
 pub struct Cli {
     /// Print the dcd version and exit
-    #[arg(short = 'v', long = "version", global = true, action = clap::ArgAction::Version)]
+    #[arg(short = 'V', long = "version", global = true, action = clap::ArgAction::Version)]
     version: Option<bool>,
+    /// Trace every command dcd runs: its argv, exit code, elapsed, and output
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
     /// Path to the config file
     #[arg(short, long, global = true, default_value = "dcd.yaml")]
     config: std::path::PathBuf,
@@ -166,7 +170,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         &process_env,
     )?;
     let mut cfg = config::load(&source, stage_of(&cli.command), &sets, &resolved.interpolation_env)?;
-    let reporter = Reporter::auto(cli.json);
+    let reporter = Reporter::auto(cli.json, cli.verbose);
 
     match &cli.command {
         Command::Deploy { .. } | Command::Rollback { .. } => {
@@ -513,34 +517,38 @@ impl ConfigureHost<'_> {
     fn no_container(&self, what: &str) -> String {
         format!("ctx.{what} is unavailable in the configure hook (no release container yet)")
     }
+
+    /// The configure hook runs before the engine exists, so it traces its own
+    /// commands (`-v`) the way `Engine::run_argv` traces the recipe's.
+    fn run_traced(&self, argv: Argv) -> std::result::Result<String, String> {
+        self.reporter.command(&argv.display());
+        let started = Instant::now();
+        let outcome = self.runner.run(&argv, Access::Mutate, &RunOpts::default());
+        let ms = started.elapsed().as_millis() as u64;
+        match &outcome {
+            Ok(out) => self.reporter.command_output(out.code, ms, &out.stdout, &out.stderr),
+            Err(err) => self.reporter.command_error(ms, &err.to_string()),
+        }
+        outcome.map(|out| out.stdout).map_err(|e| e.to_string())
+    }
 }
 
 impl HookHost for ConfigureHost<'_> {
     fn run_host(&self, cmd: &str) -> std::result::Result<String, String> {
         let full = format!("cd {} && {}", self.deploy_root.display(), cmd);
-        self.runner
-            .run(&Argv::of(["sh", "-c", &full]), Access::Mutate, &RunOpts::default())
-            .map(|o| o.stdout)
-            .map_err(|e| e.to_string())
+        self.run_traced(Argv::of(["sh", "-c", &full]))
     }
 
     fn in_release(&self, _cmd: &str) -> std::result::Result<String, String> {
         Err(self.no_container("in_release"))
     }
     fn exec_in(&self, service: &str, cmd: &str) -> std::result::Result<String, String> {
-        let argv = Argv::of(["docker", "exec", service, "sh", "-c", cmd]);
-        self.runner
-            .run(&argv, Access::Mutate, &RunOpts::default())
-            .map(|o| o.stdout)
-            .map_err(|e| e.to_string())
+        self.run_traced(Argv::of(["docker", "exec", service, "sh", "-c", cmd]))
     }
     fn docker(&self, args: Vec<String>) -> std::result::Result<String, String> {
         let mut argv = vec!["docker".to_string()];
         argv.extend(args);
-        self.runner
-            .run(&Argv(argv), Access::Mutate, &RunOpts::default())
-            .map(|o| o.stdout)
-            .map_err(|e| e.to_string())
+        self.run_traced(Argv(argv))
     }
     fn compose(&self, _args: Vec<String>) -> std::result::Result<String, String> {
         Err(self.no_container("compose"))

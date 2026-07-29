@@ -945,12 +945,24 @@ impl<'a> Engine<'a> {
         check: bool,
         env: Option<BTreeMap<String, String>>,
     ) -> Result<crate::effects::CmdOutput> {
-        if self.opts.dry_run && access == Access::Mutate {
+        let stubbed = self.opts.dry_run && access == Access::Mutate;
+        if stubbed {
             self.reporter.plan(&argv.display());
+            return self
+                .runner
+                .run(argv, access, &RunOpts { check, env })
+                .map_err(|e| self.classify(e.to_string()));
         }
-        self.runner
-            .run(argv, access, &RunOpts { check, env })
-            .map_err(|e| self.classify(e.to_string()))
+
+        self.reporter.command(&argv.display());
+        let started = Instant::now();
+        let outcome = self.runner.run(argv, access, &RunOpts { check, env });
+        let ms = started.elapsed().as_millis() as u64;
+        match &outcome {
+            Ok(out) => self.reporter.command_output(out.code, ms, &out.stdout, &out.stderr),
+            Err(err) => self.reporter.command_error(ms, &err.to_string()),
+        }
+        outcome.map_err(|e| self.classify(e.to_string()))
     }
 
     fn exec(&self, argv: &Argv, access: Access) -> Result<crate::effects::CmdOutput> {

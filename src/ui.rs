@@ -35,11 +35,12 @@ enum Sink {
 
 pub struct Reporter {
     mode: Mode,
+    verbose: bool,
     sink: Sink,
 }
 
 impl Reporter {
-    pub fn auto(json: bool) -> Reporter {
+    pub fn auto(json: bool, verbose: bool) -> Reporter {
         let mode = if json {
             Mode::Json
         } else if std::io::stdout().is_terminal() {
@@ -49,6 +50,7 @@ impl Reporter {
         };
         Reporter {
             mode,
+            verbose,
             sink: Sink::Stdout,
         }
     }
@@ -56,6 +58,15 @@ impl Reporter {
     pub fn capture(mode: Mode) -> Reporter {
         Reporter {
             mode,
+            verbose: false,
+            sink: Sink::Capture(RefCell::new(Vec::new())),
+        }
+    }
+
+    pub fn capture_verbose(mode: Mode) -> Reporter {
+        Reporter {
+            mode,
+            verbose: true,
             sink: Sink::Capture(RefCell::new(Vec::new())),
         }
     }
@@ -126,6 +137,62 @@ impl Reporter {
         }
     }
 
+    /// `-v/--verbose` command tracing: the exact argv dcd spawns. Safe to print —
+    /// chain env reaches containers as a bare `-e KEY`, so no value is ever in an argv.
+    pub fn command(&self, argv: &str) {
+        if !self.verbose {
+            return;
+        }
+        match self.mode {
+            Mode::Json => self.write(serde_json::json!({ "exec": argv }).to_string()),
+            _ => self.write(format!("$ {argv}")),
+        }
+    }
+
+    /// The other half of a traced command: exit code, elapsed, and the output that
+    /// is otherwise captured and dropped unless the command fails.
+    pub fn command_output(&self, code: i32, ms: u64, stdout: &str, stderr: &str) {
+        if !self.verbose {
+            return;
+        }
+        match self.mode {
+            Mode::Json => {
+                let value = serde_json::json!({
+                    "exec_result": { "code": code, "ms": ms, "stdout": stdout, "stderr": stderr },
+                });
+                self.write(value.to_string());
+            }
+            _ => {
+                self.write(format!("  exit {code} in {ms}ms"));
+                self.write_output(stdout, "  | ");
+                self.write_output(stderr, "  ! ");
+            }
+        }
+    }
+
+    /// A command that never produced an exit code (spawn failure).
+    pub fn command_error(&self, ms: u64, message: &str) {
+        if !self.verbose {
+            return;
+        }
+        match self.mode {
+            Mode::Json => {
+                let value = serde_json::json!({ "exec_error": { "ms": ms, "message": message } });
+                self.write(value.to_string());
+            }
+            _ => {
+                self.write(format!("  failed in {ms}ms"));
+                self.write_output(message, "  ! ");
+            }
+        }
+    }
+
+    fn write_output(&self, output: &str, prefix: &str) {
+        for line in output.lines() {
+            self.write(format!("{prefix}{line}"));
+        }
+    }
+
     fn write(&self, line: String) {
         match &self.sink {
             Sink::Stdout => println!("{line}"),
@@ -148,6 +215,46 @@ mod tests {
         assert_eq!(value["status"], "ok");
         assert_eq!(value["ms"], 300);
         assert_eq!(value["detail"], "nginx reloaded");
+    }
+
+    #[test]
+    fn command_tracing_is_silent_without_verbose() {
+        let r = Reporter::capture(Mode::Plain);
+        r.command("docker pull reg:app-1");
+        r.command_output(0, 42, "pulled", "");
+        r.command_error(7, "no such binary");
+        assert!(r.lines().is_empty());
+    }
+
+    #[test]
+    fn verbose_traces_argv_exit_and_both_output_streams() {
+        let r = Reporter::capture_verbose(Mode::Plain);
+        r.command("docker inspect demo-app-1");
+        r.command_output(1, 42, "running\nhealthy", "not found");
+        assert_eq!(
+            r.lines(),
+            vec![
+                "$ docker inspect demo-app-1",
+                "  exit 1 in 42ms",
+                "  | running",
+                "  | healthy",
+                "  ! not found",
+            ]
+        );
+    }
+
+    #[test]
+    fn verbose_trace_is_parseable_in_json_mode() {
+        let r = Reporter::capture_verbose(Mode::Json);
+        r.command("docker pull reg:app-1");
+        r.command_output(0, 900, "done", "");
+        let lines = r.lines();
+        let started: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let finished: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(started["exec"], "docker pull reg:app-1");
+        assert_eq!(finished["exec_result"]["code"], 0);
+        assert_eq!(finished["exec_result"]["ms"], 900);
+        assert_eq!(finished["exec_result"]["stdout"], "done");
     }
 
     #[test]
