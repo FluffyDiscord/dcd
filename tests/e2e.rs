@@ -205,6 +205,67 @@ fn it_007_env_baked_at_create_survives_restart_and_never_rests_in_deploy_root() 
 }
 
 #[test]
+fn it_008_unlock_accepts_a_stuck_release_clears_the_lock_and_leaves_the_stage_deployable() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new("unlock");
+    let config = fx.dir.join("dcd.yaml");
+    let healthy_yaml = std::fs::read_to_string(&config).unwrap();
+
+    assert!(fx.deploy().status.success(), "first deploy failed");
+    let red = fx.running("app")[0].clone();
+
+    // A second deploy that fails AFTER the cutover: the black is live and recorded
+    // cutover_pending, `migrate:after` errors -> exit 4. That is the stuck state.
+    let stuck_yaml = healthy_yaml.replace("  drain: 'true'", "  drain: 'true'\n  migrate: { after: 'false' }");
+    std::fs::write(&config, &stuck_yaml).unwrap();
+    let failed = fx.deploy();
+    assert_eq!(failed.status.code(), Some(4), "expected post-cutover exit 4");
+    let stuck_state = std::fs::read_to_string(fx.dir.join("dcd-state.json")).unwrap();
+    assert!(stuck_state.contains("cutover_pending"));
+    assert!(fx.dcd(&["deploy", "it"]).status.code() == Some(4), "a plain deploy must refuse while stuck");
+    let live_before_unlock = fx.running("app");
+
+    // Hold the stage lock by hand: unlock overrides a live flock by design.
+    let lock_path = fx.dir.join(".dcd.it.lock");
+    std::fs::write(&lock_path, b"").unwrap();
+    use fs2::FileExt;
+    let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
+    held.try_lock_exclusive().unwrap();
+
+    let unlocked = fx.dcd(&["unlock", "it", "-y"]);
+    assert!(
+        unlocked.status.success(),
+        "unlock failed: {}",
+        String::from_utf8_lossy(&unlocked.stderr)
+    );
+    fs2::FileExt::unlock(&held).unwrap();
+
+    // State-only: the black is the release of record and the lock is gone. The container
+    // set is exactly what the failed deploy left — unlock started, stopped, and removed
+    // nothing (that deploy had already drained the red before `migrate:after` failed).
+    let app = fx.running("app");
+    assert_eq!(app, live_before_unlock, "unlock must not touch containers");
+    let black = app[0].clone();
+    assert_ne!(black, red, "the promoted release is the black, not the old red");
+    let state = std::fs::read_to_string(fx.dir.join("dcd-state.json")).unwrap();
+    assert!(!state.contains("cutover_pending"), "state still incomplete: {state}");
+    assert!(state.contains(&format!("\"current\": \"{black}\"")), "current not advanced: {state}");
+    assert!(!lock_path.exists());
+    assert!(!fx.dir.join(".dcd.it.lock.meta").exists());
+
+    // The payoff: a plain deploy runs fresh — no --resume, no hand-editing — and it is
+    // that deploy which reaps every stale container.
+    std::fs::write(&config, &healthy_yaml).unwrap();
+    let after = fx.deploy();
+    assert!(after.status.success(), "stage not deployable after unlock: {}", String::from_utf8_lossy(&after.stderr));
+    let survivors = fx.running("app");
+    assert_eq!(survivors.len(), 1, "next deploy must drain the leftovers, got {survivors:?}");
+    assert!(!survivors.contains(&black), "the unlocked release is drained by the next deploy");
+}
+
+#[test]
 fn it_005_concurrent_lock_refuses_second() {
     if !enabled() {
         return;

@@ -353,6 +353,119 @@ fn deploy_refuses_when_a_cutover_pending_exists() {
 }
 
 #[test]
+fn unlock_promotes_the_stuck_release_and_runs_no_docker_at_all() {
+    let cfg = cfg();
+    let runner = RecordingRunner::new();
+    let fs = MemoryFs::new();
+    let clock = FixedClock(8200);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut state = State::default();
+    {
+        let st = state.stage_mut("prod");
+        st.releases.push(release(1, "demo-app-prev", "reg:app-1", ReleaseStatus::Active));
+        st.releases.push(release(2, "demo-app-9", "reg:app-2", ReleaseStatus::CutoverPending));
+        st.current = Some("demo-app-prev".into());
+    }
+
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    let promoted = engine.unlock().unwrap();
+    assert_eq!(promoted.as_deref(), Some("demo-app-9"));
+
+    // Nothing is drained, recreated, or garbage-collected — the next deploy does that.
+    assert!(runner.display_calls().is_empty(), "unlock spawned: {:?}", runner.display_calls());
+
+    let persisted = State::from_json(&fs.read(std::path::Path::new("./dcd-state.json")).unwrap()).unwrap();
+    let prod = persisted.stage("prod").unwrap();
+    assert_eq!(prod.current.as_deref(), Some("demo-app-9"));
+    assert_eq!(prod.find("demo-app-9").unwrap().status, ReleaseStatus::Active);
+    assert_eq!(prod.find("demo-app-prev").unwrap().status, ReleaseStatus::Superseded);
+    assert_eq!(prod.pending_count(), 0);
+
+    let warnings = reporter.lines().join("\n");
+    assert!(warnings.contains("migrate:after"), "operator is told what was skipped: {warnings}");
+    assert!(warnings.contains("workers"), "operator is told what was skipped: {warnings}");
+    assert!(
+        warnings.contains("demo-app-prev was left running"),
+        "operator is told the old container survives: {warnings}"
+    );
+}
+
+#[test]
+fn unlock_without_a_pending_release_changes_nothing() {
+    let cfg = cfg();
+    let runner = RecordingRunner::new();
+    let fs = MemoryFs::new();
+    let clock = FixedClock(8300);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut state = State::default();
+    {
+        let st = state.stage_mut("prod");
+        st.releases.push(release(1, "demo-app-prev", "reg:app-1", ReleaseStatus::Active));
+        st.current = Some("demo-app-prev".into());
+    }
+
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    assert_eq!(engine.unlock().unwrap(), None);
+    assert!(runner.display_calls().is_empty());
+    assert!(!fs.exists(std::path::Path::new("./dcd-state.json")));
+    assert_eq!(engine.into_state().stage("prod").unwrap().current.as_deref(), Some("demo-app-prev"));
+}
+
+#[test]
+fn unlock_promotes_a_stuck_first_ever_release() {
+    // No previous `current` to supersede — the escape hatch must not need one.
+    let cfg = cfg();
+    let runner = RecordingRunner::new();
+    let fs = MemoryFs::new();
+    let clock = FixedClock(8400);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut state = State::default();
+    state.stage_mut("prod").releases.push(release(9, "demo-app-9", "reg:app-2", ReleaseStatus::CutoverPending));
+
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    assert_eq!(engine.unlock().unwrap().as_deref(), Some("demo-app-9"));
+    let prod = engine.into_state();
+    assert_eq!(prod.stage("prod").unwrap().current.as_deref(), Some("demo-app-9"));
+    assert!(!reporter.lines().join("\n").contains("was left running"));
+}
+
+#[test]
+fn unlock_records_the_reason_and_demotes_a_second_pending() {
+    let cfg = cfg();
+    let runner = RecordingRunner::new();
+    let fs = MemoryFs::new();
+    let clock = FixedClock(8500);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut state = State::default();
+    {
+        let st = state.stage_mut("prod");
+        st.releases.push(release(1, "demo-app-old", "reg:app-1", ReleaseStatus::CutoverPending));
+        st.releases.push(release(2, "demo-app-9", "reg:app-2", ReleaseStatus::CutoverPending));
+    }
+
+    let unlock_opts = Options {
+        reason: Some("migrations hand-applied".to_string()),
+        ..opts()
+    };
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, unlock_opts);
+    assert_eq!(engine.unlock().unwrap().as_deref(), Some("demo-app-9"));
+
+    let prod = engine.into_state();
+    let stage = prod.stage("prod").unwrap();
+    assert_eq!(stage.find("demo-app-old").unwrap().status, ReleaseStatus::RolledBack);
+    assert_eq!(stage.find("demo-app-9").unwrap().reason.as_deref(), Some("migrations hand-applied"));
+    assert_eq!(stage.pending_count(), 0);
+}
+
+#[test]
 fn resume_refuses_more_than_one_pending() {
     let cfg = cfg();
     let runner = RecordingRunner::new();
