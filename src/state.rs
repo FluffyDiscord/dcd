@@ -100,6 +100,16 @@ impl StageState {
             .find(|r| r.status == ReleaseStatus::CutoverPending)
     }
 
+    /// The `cutover_pending` release `unlock` promotes. Identical to `cutover_pending()`
+    /// under INV-10; the two differ only on corrupt state, where the most recently
+    /// appended pending is the one that reached cutover last.
+    pub fn newest_cutover_pending(&self) -> Option<&Release> {
+        self.releases
+            .iter()
+            .rev()
+            .find(|r| r.status == ReleaseStatus::CutoverPending)
+    }
+
     pub fn pending_count(&self) -> usize {
         self.releases
             .iter()
@@ -149,6 +159,27 @@ impl StageState {
             }
         }
         self.current = Some(new_container.to_string());
+    }
+
+    /// Restore INV-10 around the release `unlock` promotes: every other pending is
+    /// demoted to `rolled_back`. Returns the demoted containers so the caller can
+    /// report the corruption it just cleaned up.
+    pub fn demote_other_pending_releases(&mut self, promoted: &str) -> Vec<String> {
+        let mut demoted = Vec::new();
+        for release in &mut self.releases {
+            let is_stale_pending = release.status == ReleaseStatus::CutoverPending && release.container != promoted;
+            if is_stale_pending {
+                release.status = ReleaseStatus::RolledBack;
+                demoted.push(release.container.clone());
+            }
+        }
+        demoted
+    }
+
+    pub fn set_reason(&mut self, container: &str, reason: String) {
+        if let Some(release) = self.releases.iter_mut().find(|r| r.container == container) {
+            release.reason = Some(reason);
+        }
     }
 
     fn set_status(&mut self, container: &str, status: ReleaseStatus) {
@@ -323,6 +354,42 @@ mod tests {
         // no phantom active, exactly one active == current
         let actives: Vec<_> = statuses(&s).into_iter().filter(|(_, st)| *st == ReleaseStatus::Active).collect();
         assert_eq!(actives, vec![("R3".to_string(), ReleaseStatus::Active)]);
+    }
+
+    #[test]
+    fn unlock_promotes_the_newest_pending_and_supersedes_the_stale_current() {
+        // a deploy that cut over and then died: current still points at the old red
+        let mut s = StageState::default();
+        s.releases.push(release(1, "C_prev", "img1", ReleaseStatus::Active));
+        s.releases.push(release(2, "P_stuck", "img2", ReleaseStatus::CutoverPending));
+        s.current = Some("C_prev".into());
+
+        let promoted = s.newest_cutover_pending().unwrap().container.clone();
+        assert_eq!(promoted, "P_stuck");
+        let serving_before = s.current.clone();
+        assert!(s.demote_other_pending_releases(&promoted).is_empty());
+        s.finalize(&promoted, FinalizeKind::Deploy, serving_before.as_deref());
+
+        assert_eq!(s.current.as_deref(), Some("P_stuck"));
+        assert_eq!(s.find("P_stuck").unwrap().status, ReleaseStatus::Active);
+        assert_eq!(s.find("C_prev").unwrap().status, ReleaseStatus::Superseded);
+        assert_eq!(s.pending_count(), 0);
+    }
+
+    #[test]
+    fn unlock_demotes_every_other_pending_on_corrupt_state() {
+        let mut s = StageState::default();
+        s.releases.push(release(1, "P_old", "img1", ReleaseStatus::CutoverPending));
+        s.releases.push(release(2, "P_new", "img2", ReleaseStatus::CutoverPending));
+
+        let promoted = s.newest_cutover_pending().unwrap().container.clone();
+        assert_eq!(promoted, "P_new");
+        assert_eq!(s.demote_other_pending_releases(&promoted), vec!["P_old".to_string()]);
+        s.finalize(&promoted, FinalizeKind::Deploy, None);
+
+        assert_eq!(s.pending_count(), 0);
+        assert_eq!(s.find("P_old").unwrap().status, ReleaseStatus::RolledBack);
+        assert_eq!(s.find("P_new").unwrap().status, ReleaseStatus::Active);
     }
 
     #[test]

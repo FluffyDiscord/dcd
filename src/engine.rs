@@ -197,8 +197,8 @@ impl<'a> Engine<'a> {
             if stage.cutover_pending().is_some() {
                 let pending = stage.cutover_pending().unwrap().container.clone();
                 return Err(DcdError::PostCutover(format!(
-                    "{} has an incomplete release {pending}; run `dcd deploy --resume {}` or `dcd rollback {}`",
-                    self.cfg.stage, self.cfg.stage, self.cfg.stage
+                    "{} has an incomplete release {pending}; run `dcd deploy --resume {}`, `dcd rollback {}`, or `dcd unlock {}` to accept it as-is",
+                    self.cfg.stage, self.cfg.stage, self.cfg.stage, self.cfg.stage
                 )));
             }
         }
@@ -256,6 +256,58 @@ impl<'a> Engine<'a> {
         self.warn_env_drift(&pending.env_keys, pending.id);
         self.post_cutover = true;
         self.drive(RESUME_STEPS)
+    }
+
+    /// The `unlock` escape hatch (spec §4.4): accept the recorded `cutover_pending`
+    /// release as the outcome of the deploy, so the stage is deployable again. It is a
+    /// pure state repair — no container, image, or hook is touched, so nothing that
+    /// already failed can block it. The leftovers are the next deploy's job: it reaps
+    /// every stale app container in `drain:red` and applies retention in `finalize`.
+    /// Returns the promoted container, or `None` when the stage has no incomplete release.
+    pub fn unlock(&mut self) -> Result<Option<String>> {
+        let pending = self.stage().and_then(|s| s.newest_cutover_pending()).cloned();
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+
+        let stage = self.cfg.stage.clone();
+        let serving_before = self.stage().and_then(|s| s.current.clone());
+        let demoted = self.state.stage_mut(&stage).demote_other_pending_releases(&pending.container);
+        if !demoted.is_empty() {
+            self.reporter
+                .warn(&format!("unlock: demoted stale incomplete release(s) {}", demoted.join(", ")));
+        }
+        if let Some(reason) = self.opts.reason.clone() {
+            self.state.stage_mut(&stage).set_reason(&pending.container, reason);
+        }
+
+        self.reporter
+            .log(&format!("unlock: accepting {} as the release of record", pending.container));
+        self.state
+            .stage_mut(&stage)
+            .finalize(&pending.container, FinalizeKind::Deploy, serving_before.as_deref());
+        self.persist_state()?;
+        self.warn_unlock_left_behind(serving_before.as_deref());
+
+        Ok(Some(pending.container))
+    }
+
+    /// What `unlock` deliberately left alone — the promoted release is live without the
+    /// post-cutover work the recipe would have done, and the next deploy is what cleans up.
+    fn warn_unlock_left_behind(&self, serving_before: Option<&str>) {
+        let runs_after_migration = self.cfg.release.migrate.as_ref().is_some_and(|m| m.after.is_some());
+        if runs_after_migration {
+            self.reporter
+                .warn("unlock: `migrate:after` was NOT run — run it yourself if the release needs it");
+        }
+        if self.cfg.workers.is_some() {
+            self.reporter
+                .warn("unlock: workers were NOT recreated — they still run the previous release");
+        }
+        if let Some(previous) = serving_before {
+            self.reporter
+                .warn(&format!("unlock: {previous} was left running — the next deploy drains it"));
+        }
     }
 
     fn drive(&mut self, steps: &[&str]) -> Result<()> {

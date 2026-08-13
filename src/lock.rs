@@ -17,8 +17,8 @@ pub struct StageLock {
 
 impl StageLock {
     pub fn acquire(deploy_root: &Path, stage: &str, holder: &str) -> Result<StageLock> {
-        let lock_path = deploy_root.join(format!(".dcd.{stage}.lock"));
-        let meta_path = deploy_root.join(format!(".dcd.{stage}.lock.meta"));
+        let lock_path = lock_path(deploy_root, stage);
+        let meta_path = meta_path(deploy_root, stage);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -48,10 +48,62 @@ impl StageLock {
     }
 }
 
+impl StageLock {
+    /// The lock file and its sidecar, whether or not they exist.
+    pub fn paths(deploy_root: &Path, stage: &str) -> [PathBuf; 2] {
+        [lock_path(deploy_root, stage), meta_path(deploy_root, stage)]
+    }
+
+    /// What the sidecar says about the holder. The sidecar alone proves nothing —
+    /// the OS drops the flock on any exit, so it can outlive the process that wrote it.
+    pub fn holder(deploy_root: &Path, stage: &str) -> Option<String> {
+        let meta = std::fs::read_to_string(meta_path(deploy_root, stage)).ok()?;
+        let holder = meta.trim().to_string();
+        if holder.is_empty() {
+            return None;
+        }
+        Some(holder)
+    }
+
+    /// Whether a live process holds the flock right now — the only trustworthy
+    /// "a deploy is running" signal (`unlock` warns before overriding it).
+    pub fn is_held(deploy_root: &Path, stage: &str) -> bool {
+        let Ok(file) = File::open(lock_path(deploy_root, stage)) else {
+            return false;
+        };
+        let probe = file.try_lock_exclusive();
+        probe.is_err()
+    }
+
+    /// Delete the stage lock and its sidecar even while another process holds the
+    /// flock — `dcd unlock` is the escape hatch for a deploy that can no longer
+    /// finish. Returns the paths that existed and were removed.
+    pub fn force_release(deploy_root: &Path, stage: &str) -> Result<Vec<PathBuf>> {
+        let mut removed = Vec::new();
+        for path in StageLock::paths(deploy_root, stage) {
+            if !path.exists() {
+                continue;
+            }
+            std::fs::remove_file(&path)
+                .map_err(|e| DcdError::Config(format!("cannot remove lock {}: {e}", path.display())))?;
+            removed.push(path);
+        }
+        Ok(removed)
+    }
+}
+
 impl Drop for StageLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.meta_path);
     }
+}
+
+fn lock_path(deploy_root: &Path, stage: &str) -> PathBuf {
+    deploy_root.join(format!(".dcd.{stage}.lock"))
+}
+
+fn meta_path(deploy_root: &Path, stage: &str) -> PathBuf {
+    deploy_root.join(format!(".dcd.{stage}.lock.meta"))
 }
 
 #[cfg(test)]
@@ -82,6 +134,36 @@ mod tests {
         let third = StageLock::acquire(&dir, "prod", "pid 3 since 16:42");
         assert!(third.is_ok());
         drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn force_release_drops_a_lock_a_live_process_still_holds() {
+        let dir = temp_dir("c");
+        let held = StageLock::acquire(&dir, "prod", "pid 1 since 16:40").unwrap();
+        assert!(StageLock::is_held(&dir, "prod"));
+        assert_eq!(StageLock::holder(&dir, "prod").as_deref(), Some("pid 1 since 16:40"));
+
+        let removed = StageLock::force_release(&dir, "prod").unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(!StageLock::is_held(&dir, "prod"));
+        assert_eq!(StageLock::holder(&dir, "prod"), None);
+
+        // idempotent: nothing left to remove, and no error
+        assert!(StageLock::force_release(&dir, "prod").unwrap().is_empty());
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_released_lock_reads_as_unheld_even_with_a_stale_sidecar() {
+        let dir = temp_dir("d");
+        drop(StageLock::acquire(&dir, "prod", "pid 1 since 16:40").unwrap());
+        std::fs::write(dir.join(".dcd.prod.lock.meta"), "pid 1 since 16:40\n").unwrap();
+
+        assert!(!StageLock::is_held(&dir, "prod"));
+        assert_eq!(StageLock::holder(&dir, "prod").as_deref(), Some("pid 1 since 16:40"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

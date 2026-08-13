@@ -13,6 +13,7 @@ use crate::effects::{
 };
 use crate::engine::{Engine, Options, DEPLOY_STEPS};
 use crate::error::{DcdError, Result};
+use crate::lock::StageLock;
 use crate::lua::{HookHost, LuaHost};
 use crate::signal::Interrupt;
 use crate::state::State;
@@ -101,6 +102,17 @@ enum Command {
         /// Stage to roll back (omit if the config defines exactly one)
         stage: Option<String>,
     },
+    /// Force a stuck deploy to done: accept the incomplete release and clear the lock.
+    ///
+    /// The last resort for when `deploy --resume` cannot finish. It marks the recorded
+    /// cutover-pending release active and current, and removes the stage lock even while
+    /// another dcd still holds it. It is a state repair only: no container is started,
+    /// stopped, or removed, no migrations run, no workers are recreated, and no hooks
+    /// fire — the next deploy runs fresh and cleans up what is left behind.
+    Unlock {
+        /// Stage to unlock (omit if the config defines exactly one)
+        stage: Option<String>,
+    },
     /// Show the current release and history.
     Status {
         /// Stage to inspect (omit if the config defines exactly one)
@@ -135,6 +147,7 @@ fn stage_of(command: &Command) -> Option<&str> {
     match command {
         Command::Deploy { stage }
         | Command::Rollback { stage }
+        | Command::Unlock { stage }
         | Command::Status { stage }
         | Command::Tasks { stage }
         | Command::Check { stage } => stage.as_deref(),
@@ -207,6 +220,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             execute(&cfg, &cli, &reporter, run, lua_host.as_ref(), &resolved)
         }
+        Command::Unlock { .. } => unlock(&cfg, &cli, &reporter, &resolved),
         Command::Status { .. } => status(&cfg, &reporter),
         Command::Tasks { .. } => tasks(&cfg, &reporter),
         Command::Check { .. } => check_report(&cfg, &reporter, &resolved, chain_base.as_deref()),
@@ -292,7 +306,7 @@ fn read_env_stdin(cli: &Cli) -> Result<Option<String>> {
     if std::io::stdin().is_terminal() {
         return Err(DcdError::Config("--env-stdin requires piped input".to_string()));
     }
-    let can_prompt = matches!(cli.command, Command::Rollback { .. });
+    let can_prompt = matches!(cli.command, Command::Rollback { .. } | Command::Unlock { .. });
     if can_prompt && !cli.yes {
         return Err(DcdError::Config("--env-stdin consumes stdin; pass -y/--yes".to_string()));
     }
@@ -318,25 +332,12 @@ fn execute(
 
     let clock = SystemClock;
     let holder = format!("pid {} since {}", std::process::id(), hhmmss(now_epoch()));
-    let _lock = crate::lock::StageLock::acquire(&cfg.deploy_root, &cfg.stage, &holder)?;
+    let _lock = StageLock::acquire(&cfg.deploy_root, &cfg.stage, &holder)?;
 
     let state = load_state(&cfg.deploy_root)?;
     let interrupt = Interrupt::install();
-    let opts = Options {
-        dry_run: cli.dry_run,
-        sleep_enabled: true,
-        reason: cli.reason.clone(),
-        container_env: resolved.container_env.clone(),
-        interpolation_env: resolved.interpolation_env.clone(),
-    };
-
-    let system_runner =
-        SystemRunner::with_context(resolved.container_env.clone(), cfg.deploy_root.clone());
-    let runner: Box<dyn CommandRunner> = if cli.dry_run {
-        Box::new(DryRunRunner::new(system_runner))
-    } else {
-        Box::new(system_runner)
-    };
+    let opts = engine_options(cli, resolved);
+    let runner = engine_runner(cfg, cli, resolved);
     let fs = SystemFs;
 
     let mut engine = Engine::new(cfg.clone(), runner.as_ref(), &fs, &clock, reporter, &interrupt, state, opts);
@@ -356,6 +357,91 @@ fn execute(
     }
 }
 
+fn engine_options(cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Options {
+    Options {
+        dry_run: cli.dry_run,
+        sleep_enabled: true,
+        reason: cli.reason.clone(),
+        container_env: resolved.container_env.clone(),
+        interpolation_env: resolved.interpolation_env.clone(),
+    }
+}
+
+fn engine_runner(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Box<dyn CommandRunner> {
+    let system_runner = SystemRunner::with_context(resolved.container_env.clone(), cfg.deploy_root.clone());
+    if cli.dry_run {
+        Box::new(DryRunRunner::new(system_runner))
+    } else {
+        Box::new(system_runner)
+    }
+}
+
+/// The escape hatch (spec §4.4): promote the stuck release and drop the stage lock —
+/// deliberately overriding a live flock, since the whole point is to unstick a deploy that
+/// will never release it. State and lock files only; loads no plugins, runs no Docker.
+fn unlock(cfg: &Config, cli: &Cli, reporter: &Reporter, resolved: &crate::dotenv::ResolvedEnv) -> Result<()> {
+    host_guard(cfg)?;
+
+    let stage = cfg.stage.clone();
+    let state = load_state(&cfg.deploy_root)?;
+    let pending = state
+        .stage(&stage)
+        .and_then(|s| s.newest_cutover_pending())
+        .map(|release| release.container.clone());
+
+    if StageLock::is_held(&cfg.deploy_root, &stage) {
+        let holder = StageLock::holder(&cfg.deploy_root, &stage).unwrap_or_else(|| "unknown holder".to_string());
+        reporter.warn(&format!(
+            "{stage} is locked by a RUNNING dcd ({holder}) — clearing it lets a second deploy start alongside that one, and its next state write would overwrite this unlock"
+        ));
+    }
+
+    let prompt = match &pending {
+        Some(container) => format!("Mark {container} as the successful release on {stage} and clear the lock?"),
+        None => format!("No incomplete release on {stage} — clear the stage lock anyway?"),
+    };
+    if !confirm(&prompt, cli.yes)? {
+        return Err(DcdError::PreCutover("unlock declined (pass --yes to confirm)".to_string()));
+    }
+
+    let clock = SystemClock;
+    let fs = SystemFs;
+    let interrupt = Interrupt::install();
+    let runner = engine_runner(cfg, cli, resolved);
+    let mut engine = Engine::new(
+        cfg.clone(),
+        runner.as_ref(),
+        &fs,
+        &clock,
+        reporter,
+        &interrupt,
+        state,
+        engine_options(cli, resolved),
+    );
+    match engine.unlock()? {
+        Some(container) => reporter.log(&format!("{stage}: {container} is now active and current")),
+        None => reporter.log(&format!("{stage}: no incomplete release to promote — state untouched")),
+    }
+
+    clear_lock(cfg, cli, reporter, &stage)
+}
+
+fn clear_lock(cfg: &Config, cli: &Cli, reporter: &Reporter, stage: &str) -> Result<()> {
+    if cli.dry_run {
+        for path in StageLock::paths(&cfg.deploy_root, stage) {
+            reporter.plan(&format!("remove lock {}", path.display()));
+        }
+        return Ok(());
+    }
+    let removed = StageLock::force_release(&cfg.deploy_root, stage)?;
+    if removed.is_empty() {
+        reporter.log(&format!("{stage}: no lock file was present"));
+    } else {
+        reporter.log(&format!("{stage}: lock cleared"));
+    }
+    Ok(())
+}
+
 fn status(cfg: &Config, reporter: &Reporter) -> Result<()> {
     let state = load_state(&cfg.deploy_root)?;
     let stage = &cfg.stage;
@@ -365,7 +451,7 @@ fn status(cfg: &Config, reporter: &Reporter) -> Result<()> {
             reporter.log(&format!("{stage}: current = {}", s.current.as_deref().unwrap_or("none")));
             if let Some(pending) = s.cutover_pending() {
                 reporter.warn(&format!(
-                    "incomplete release {} — run `dcd deploy --resume {stage}` or `dcd rollback {stage}`",
+                    "incomplete release {} — run `dcd deploy --resume {stage}`, `dcd rollback {stage}`, or `dcd unlock {stage}` to accept it as-is",
                     pending.container
                 ));
             }
@@ -677,6 +763,25 @@ mod tests {
         let err = read_env_stdin(&cli).unwrap_err();
         assert!(err.to_string().contains("pass -y/--yes"), "got: {err}");
         assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn unlock_prompts_so_env_stdin_needs_yes_there_too() {
+        let cli = Cli::parse_from(["dcd", "unlock", "prod", "--env-stdin"]);
+        let err = read_env_stdin(&cli).unwrap_err();
+        assert!(err.to_string().contains("pass -y/--yes"), "got: {err}");
+
+        let confirmed = Cli::parse_from(["dcd", "unlock", "prod", "--env-stdin", "-y"]);
+        assert!(read_env_stdin(&confirmed).is_ok());
+    }
+
+    #[test]
+    fn unlock_takes_the_positional_stage_like_every_other_command() {
+        let cli = Cli::parse_from(["dcd", "unlock", "beta"]);
+        assert_eq!(stage_of(&cli.command), Some("beta"));
+
+        let stageless = Cli::parse_from(["dcd", "unlock"]);
+        assert_eq!(stage_of(&stageless.command), None);
     }
 
     #[test]
