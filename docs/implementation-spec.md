@@ -107,7 +107,7 @@ The dynamic worker provider (`exec` in black) is `Mutate`-adjacent: in dry-run t
 
 ### 2.5 Signals, lock, and crash recovery
 
-- **Lock:** `flock(2)` (LOCK_EX|LOCK_NB) on `${deploy_root}/.dcd.{stage}.lock`. The OS releases it on any process exit, including SIGKILL — so it never goes stale from a crash. A sidecar `.dcd.{stage}.lock.meta` (pid, ISO start, stage) is written for the human "who holds it" message; because the flock itself is the source of truth, if `dcd` can acquire the flock any meta present is treated as stale and overwritten. Failure to acquire → exit `3` with the meta details.
+- **Lock:** `flock(2)` (LOCK_EX|LOCK_NB) on `${deploy_root}/.dcd.{stage}.lock`. The OS releases it on any process exit, including SIGKILL — so it never goes stale from a crash. A sidecar `.dcd.{stage}.lock.meta` (pid, ISO start, stage) is written for the human "who holds it" message; because the flock itself is the source of truth, if `dcd` can acquire the flock any meta present is treated as stale and overwritten. Failure to acquire → exit `3` with the meta details. `dcd unlock` (§4.4) deletes both files whether or not the flock is currently held — the one deliberate override, for a hung deploy that will never release it.
 - **Signals:** a `signal` handler sets an atomic `Interrupt`. The executor checks it between tasks and inside retry loops. Interrupt **before** cutover → pre-cutover cleanup (remove black) + lock release via normal unwind, exit `130`. Interrupt **during** cutover → finish the in-flight reload-or-restore deterministically (never leave the upstream half-written), then exit. SIGKILL cannot run cleanup; the flock auto-releases and `--resume`/orphan-reaping (§7.1) recover the rest.
 
 ### 2.6 Container & release naming
@@ -158,7 +158,7 @@ Tasks 5, 11, 12 are **skipped** (logged) when their config is absent.
 
 ### 4.2 `dcd deploy --resume [stage]` (recovers an exit-4 state, INV-3)
 
-If state holds a `cutover_pending` release (a prior deploy died/​failed after cutover), `--resume` re-runs **only** the post-cutover tasks (`drain:red` → `migrate:after` → `workers` → `finalize`) against that recorded live black — it does **not** start a new black or re-cutover. Resume reads `current` and the `cutover_pending` release from the on-disk state; `drain:red` on resume re-checks whether the old `current` container is still running (the failed run likely already removed it) and skips it if gone (§7.10). Because the `drained` flag is per-process, resume re-runs the worker drain (safe: `workers.drain` is best-effort and the `workers` task recreates the set). `migrate:after` re-runs and so must be idempotent (Doctrine version-tracking skips applied migrations). Without `--resume`, a `deploy` that finds a `cutover_pending` release refuses (exit `4`) and tells the operator to `--resume` or `rollback`. As a defensive guard, any run that finds **more than one** `cutover_pending` (which INV-10 forbids) aborts with a clear state-corruption error rather than guessing.
+If state holds a `cutover_pending` release (a prior deploy died/​failed after cutover), `--resume` re-runs **only** the post-cutover tasks (`drain:red` → `migrate:after` → `workers` → `finalize`) against that recorded live black — it does **not** start a new black or re-cutover. Resume reads `current` and the `cutover_pending` release from the on-disk state; `drain:red` on resume re-checks whether the old `current` container is still running (the failed run likely already removed it) and skips it if gone (§7.10). Because the `drained` flag is per-process, resume re-runs the worker drain (safe: `workers.drain` is best-effort and the `workers` task recreates the set). `migrate:after` re-runs and so must be idempotent (Doctrine version-tracking skips applied migrations). Without `--resume`, a `deploy` that finds a `cutover_pending` release refuses (exit `4`) and tells the operator to `--resume`, `rollback`, or `unlock` (§4.4). As a defensive guard, any run that finds **more than one** `cutover_pending` (which INV-10 forbids) aborts with a clear state-corruption error rather than guessing.
 
 ### 4.3 State transitions (authoritative)
 
@@ -170,9 +170,27 @@ If state holds a `cutover_pending` release (a prior deploy died/​failed after 
 | `drain:red` | no state write; drains containers (see §7.10) |
 | finalize (deploy) | `R_new → active`; the release that was `current` at run start → `superseded`; `current = R_new` |
 | finalize (rollback) | `R_new → active`; the rolled-back-from `serving` → `rolled_back`; the run-start `current` (if different from `serving`) → `superseded`; the image-source **target stays `superseded`**; `current = R_new`. *(superseded vs rolled_back is informational only — both are retained and rollback-eligible, so no conflict when target == run-start current.)* |
+| unlock (§4.4) | the newest `cutover_pending` → `active`; any other pending → `rolled_back` (INV-10 repair); the run-start `current` → `superseded`; `current` = promoted release |
 | retention | evict beyond `keep_releases` (§7.13) |
 
 Because finalize always demotes the **run-start `current`** (not merely "the previous release"), a recovery run cleanly resolves a stale `current` left by a crashed deploy: no release is left `active`-but-not-`current`, and no container is left running-but-unrecorded (§7.10 reaps it).
+
+### 4.4 `dcd unlock [stage]` (the escape hatch)
+
+The last resort when `--resume` cannot finish and `rollback` is not wanted — typically a post-cutover step that keeps failing (`migrate:after`, `workers`) or a deploy process that hung holding the lock. `unlock` **accepts the release that is already live as the outcome of the deploy** and returns the stage to a clean, deployable state, so the *next* `dcd deploy` can run fresh and fix whatever is wrong. It is a **pure state repair**: it runs no Docker command at all.
+
+| # | Step | Detail |
+|---|------|--------|
+| 1 | host guard | as deploy/rollback (INV-8, exit `5`) — an escape hatch on the wrong box is still the wrong box |
+| 2 | report the lock | if a live process holds the flock, warn naming the sidecar holder **before** prompting: clearing it lets a second deploy start alongside that one, whose next state write would overwrite this unlock |
+| 3 | confirm | `Mark <container> as the successful release on <stage> and clear the lock?`; requires `--yes` when non-interactive (declined → exit `1`) |
+| 4 | promote | the newest `cutover_pending` release → `active`/`current` per the §4.3 table; a second pending (corrupt state) is demoted rather than refused — `unlock` is what an operator reaches for *because* state is broken. `--reason` is recorded on the promoted release |
+| 5 | persist | one state write, mode `0600`, as any finalize |
+| 6 | clear the lock | delete `.dcd.{stage}.lock` and its `.meta`, overriding a held flock (§2.5) |
+
+**Nothing else happens:** no `drain:red`, no `migrate:after`, no `workers`, no retention/image GC, and **no** hooks (YAML or Lua). A stuck deploy is usually stuck on exactly those, so none of them may stand between the operator and a deployable stage — and a broken or unreachable Docker daemon cannot block the repair. Every leftover is the next deploy's job: `preflight` reaps unrecorded containers (§7.1), `drain:red` reaps every stale app container, and `finalize` applies retention. `unlock` warns by name about each thing it left behind — the after-migration, the workers, and the previous container still running.
+
+With no `cutover_pending` release (a deploy that died *before* cutover, or a lock left behind by a killed process) `unlock` touches no state at all and only clears the lock. `--dry-run` prints the transition and the lock files it would remove, writing nothing. The command is idempotent: a second run reports nothing to promote and no lock present.
 
 ---
 
@@ -501,6 +519,7 @@ dcd <command> [stage] [flags]
 |---------|-----------|
 | `deploy [stage]` | run the recipe; `stage` optional if exactly one exists (or the config has no `stages:` block — the stages-less case §5.2.1 covers). `--resume` recovers a `cutover_pending` state (§4.2); a non-resume deploy that finds one refuses (exit 4). Stage selection is the **positional only** (there is no `--stage` flag) |
 | `rollback [stage]` | §4.1; requires `--yes` when non-interactive |
+| `unlock [stage]` | §4.4 — accept the incomplete release as deployed and clear the stage lock; requires `--yes` when non-interactive |
 | `status [stage]` | current + history from state: each release's status, images, age, `ran_migrations`, and any `cutover_pending` recovery hint |
 | `tasks [stage]` | print the resolved, ordered task plan (graph + hooks); no side effects |
 | `check [stage]` | validate config + stage merge + dotenv chain + interpolation + `--set` + plugin load; prints the §5.2.5 env observability report; no side effects |
@@ -529,8 +548,8 @@ dcd <command> [stage] [flags]
 | 0 | success | black is the new red |
 | 1 | pre-cutover failure | **red still serving**; black removed |
 | 2 | config / usage error | nothing ran |
-| 3 | stage lock held | another deploy in progress; nothing ran |
-| 4 | post-cutover incomplete (`drain:red`/`migrate:after`/`workers`), or a `deploy` found a `cutover_pending` state | **black is live**; recover with `--resume` (or `rollback`) |
+| 3 | stage lock held | another deploy in progress; nothing ran (`unlock` overrides it, §4.4) |
+| 4 | post-cutover incomplete (`drain:red`/`migrate:after`/`workers`), or a `deploy` found a `cutover_pending` state | **black is live**; recover with `--resume`, `rollback`, or `unlock` (§4.4) |
 | 5 | host guard mismatch (INV-8) | nothing ran |
 | 10 | Lua plugin error | reported with traceback |
 | 130 | interrupted (SIGINT/SIGTERM) pre-cutover | cleaned up; red serving |
@@ -638,6 +657,9 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | TC-039 | `check` env DX | chain + filters + shadowing process env | prints files found/skipped, per-layer counts, per-container key names, shadowed keys; **no values anywhere in output** | reserved key → error |
 | TC-040 | `--env-stdin` | dotenv doc on stdin; a confirming command without `--yes` | stdin layer overrides `.env.<stage>.local`; prompt → error demanding `--yes` | empty stdin = empty layer |
 | TC-041 | `--env-stdin` alone | a `.env`/`.env.local` sitting next to `dcd.yaml` | neither is discovered; `<stdin>` is the only layer and nothing is probed on disk | `--env-dir`/`--env-file` re-enables file layers under the stdin layer |
+| TC-042 | `unlock` promote | state w/ `cutover_pending` P and stale `current` C | P → `active`/`current`, C → `superseded`, one state write; **zero commands spawned** (no drain, retention, migration, worker, or hook); leftovers warned by name | no pending → state untouched, lock still cleared |
+| TC-043 | `unlock` on broken state | two pendings, no prior `current`, `--reason` given | newest pending promoted, older → `rolled_back`, reason recorded, no "left running" warning | `--dry-run` → plan lines only, nothing written or removed |
+| TC-044 | `unlock` lock override | flock held by a live process; stale `.meta` present | `is_held` true → loud warning naming the holder; both lock files removed anyway; second run removes nothing and succeeds | released flock + stale meta → no warning, meta still cleared |
 
 ### 10.2 Integration tests
 
@@ -650,6 +672,7 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | IT-005 | concurrent lock | two `dcd deploy` in parallel | one runs, other exit 3; killed holder's flock reclaimed | as above |
 | IT-006 | conditional recreate | redeploy with unchanged managed image | postgres/nginx `--no-recreate` (same container id) | as above |
 | IT-007 | env at rest + reboot survival | deploy with a 4-layer chain incl. a secret value; **chain dir outside `deploy_root`, passed via `--env-dir`** | `docker inspect` shows the value in container config; `docker stop`+`start` (env-less shell) preserves it; **no file under `deploy_root` contains the value** (recursive grep over dcd-written files) | rm containers/network; shred chain files |
+| IT-008 | unlock a stuck stage | deploy, then a deploy that fails in `migrate:after` (exit 4), with the flock held by hand | `dcd unlock it -y` exits 0: black promoted to `current`/`active`, the running container set **unchanged**, both lock files gone despite the live flock; the following plain `deploy` succeeds with no `--resume` and drains the leftover | as above |
 
 ### 10.3 Invariant → test map
 
@@ -703,9 +726,10 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | rollback/resume env drift | warning: `release <id> ran with env keys [+ADDED/-REMOVED] vs current chain` (not an error) | — | verify the chain before proceeding |
 | unknown config key | `config: unknown key 'servces' (did you mean 'services'?)` | 2 | fix key |
 | stage not found / ambiguous | `stage 'staging' not found; known: beta, prod` / `multiple stages; pass one of: …` | 2 | pass stage |
-| lock held | `another deploy holds prod (pid 4123 since 16:40)`; dead pid → reclaimed | 3 | wait/retry |
+| lock held | `another deploy holds prod (pid 4123 since 16:40)`; dead pid → reclaimed | 3 | wait/retry; `dcd unlock prod` if the holder is hung |
 | host guard mismatch | `stage prod expects host prod.example.internal, this is beta-box` | 5 | run on right host |
-| deploy finds `cutover_pending` | `prod has an incomplete release <c>; run 'dcd deploy --resume prod' or 'dcd rollback prod'` | 4 | resume/rollback |
+| deploy finds `cutover_pending` | `prod has an incomplete release <c>; run 'dcd deploy --resume prod', 'dcd rollback prod', or 'dcd unlock prod' to accept it as-is` | 4 | resume/rollback/unlock |
+| `unlock` declined at the prompt | `unlock declined (pass --yes to confirm)` — nothing promoted, lock untouched | 1 | re-run with `-y` |
 | rollback no previous / images gone | `no previous release for prod` / `target image <tag> not present and not pullable` | 1 | — |
 | Lua error | plugin path + traceback | 10 | fix plugin |
 

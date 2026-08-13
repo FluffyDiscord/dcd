@@ -23,6 +23,7 @@ dcd deploy prod          # do it
 | `dcd deploy [stage]` | the red-black deploy |
 | `dcd deploy --resume [stage]` | finish a deploy that died after the cutover |
 | `dcd rollback [stage]` | re-point to the previous release (code only — no migrations) |
+| `dcd unlock [stage]` | escape hatch: accept the stuck release as deployed and clear the stage lock |
 | `dcd status [stage]` | current release + history |
 | `dcd tasks [stage]` | print the step plan |
 | `dcd deploy --dry-run` | print every command, touch nothing |
@@ -41,6 +42,26 @@ containers via process-env passthrough — dcd writes no env file on the server.
 `--env-file .env.deploy` rebases the whole chain onto another base name
 (`.env.deploy` → `.env.deploy.local` → `.env.deploy.<stage>` → `.env.deploy.<stage>.local`),
 so dcd's chain can live beside the app's own `.env` files without colliding.
+
+## When a deploy gets stuck
+
+A deploy that dies **after** the cutover leaves the new container live and the release
+recorded as incomplete; `dcd deploy` then refuses (exit 4) until you pick a way out:
+
+```bash
+dcd status prod                # what is live, what is incomplete
+dcd deploy --resume prod       # finish it: drain the old one, migrate:after, workers, done
+dcd rollback prod              # go back to the previous release instead
+dcd unlock prod                # accept what is live as done, and clear the lock
+```
+
+`unlock` is the last resort — for when resuming keeps failing, or a killed deploy left the
+stage locked. It marks the incomplete release active and current, and removes the stage
+lock **even while another dcd holds it**. That is all it does: no containers are started,
+stopped, or removed, no migrations run, no workers are recreated, and no hooks fire — so
+nothing that already failed can block it. It warns about each leftover by name, and the
+next `dcd deploy` runs fresh and cleans them up. With nothing incomplete it only clears
+the lock.
 
 ## dcd.yaml
 
