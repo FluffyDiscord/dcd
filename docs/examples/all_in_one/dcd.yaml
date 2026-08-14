@@ -199,11 +199,18 @@ workers:
 
 # ── retention: cleanup after a successful deploy ─────────────────────────────
 # dcd keeps a window of old releases (so rollback works) and prunes the rest,
-# along with the images they used.
+# along with the images they used. Every tag dcd pulls is recorded in
+# dcd-state.json before the pull, so a deploy that dies before it finishes still
+# leaves its image reclaimable. `dcd gc <stage>` runs this cleanup on its own;
+# `dcd gc <stage> --all` also offers tags found on the host that no stage records.
 
 retention:
   keep_releases: 3        # superseded / rolled-back containers to keep  (default: 3)
   keep_managed_images: 2  # past tags per managed image to keep          (default: 2)
+  keep_images:            # per-image override of keep_managed_images    (default: none)
+    database: 1           # keys are docker.images logicals used by a service or the
+                          # worker template; release.image is rejected — keep_releases
+                          # is the knob that bounds it
 
 
 # ── plugins: Lua extensions ──────────────────────────────────────────────────

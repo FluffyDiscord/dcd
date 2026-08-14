@@ -27,6 +27,7 @@ dcd deploy prod          # do it
 | `dcd status [stage]` | current release + history |
 | `dcd tasks [stage]` | print the step plan |
 | `dcd deploy --dry-run` | print every command, touch nothing |
+| `dcd gc [stage]` | reclaim disk: remove image versions past the retention counts (`--all` also offers host tags dcd never recorded, after asking) |
 | `dcd check [stage]` | validate the config |
 | `dcd init` | scaffold a `dcd.yaml` (`--with-plugin` adds a Lua stub) |
 | `dcd deploy -v [stage]` | trace every command: argv, exit code, elapsed, output |

@@ -31,13 +31,14 @@
 |---|-----------|
 | INV-1 | Red serves continuously until black passes healthcheck **and** the cutover reload returns 0. Any failure **before** that point leaves red serving and removes black. |
 | INV-2 | **The point of no automatic return is the cutover reload exit 0.** Failures after it (`drain:red`, `migrate:after`, `workers`) never auto-rollback; black is already live. They stop the run, report, and exit `4`. A brief dual-serving window exists while nginx old workers drain in-flight requests — benign for idempotent HTTP; noted for non-idempotent POST/WS. |
-| INV-3 | The black release is **recorded in state at cutover** (status `cutover_pending`) before `drain:red`. `finalize` flips it to `active` and advances `current`. A crash between cutover and finalize therefore leaves a recoverable, recorded live release (recovered by `dcd deploy --resume`). |
+| INV-3 | The black **release** is **recorded in state at cutover** (status `cutover_pending`) before `drain:red`. `finalize` flips it to `active` and advances `current`. A crash between cutover and finalize therefore leaves a recoverable, recorded live release (recovered by `dcd deploy --resume`). The only earlier state write is the pull ledger (INV-11); it adds no `releases`/`current` change of its own, so recovery reads what it would have read without it. |
 | INV-4 | The stage lock is a `flock(2)` advisory lock: the OS releases it on process exit **including SIGKILL**. SIGINT/SIGTERM are caught and run orderly cleanup (pre-cutover: remove black; release lock). A dead-holder lock is reclaimable. |
 | INV-5 | Rollback never runs migrations (ADR-005); it re-deploys the previous release's images. |
 | INV-6 | Rollback to the **immediately previous** release is available while `keep_releases ≥ 1`; its images are retained (never pruned). Deeper/repeated rollback is bounded by `keep_releases` + registry retention; §4 verifies the target's images exist before acting. |
 | INV-8 | If a stage declares `host:` and the machine hostname does not match, `dcd` refuses to act (exit `5`). |
 | INV-9 | If `state.current` is set but that container is **not running**, the upstream file is reset to `cutover.fallback_backend` **before** any managed-service recreate, so a recreated nginx never points at a dead container (self-heal; mirrors the original script). |
 | INV-10 | **At most one `cutover_pending` release exists at any time.** The cutover append (§7.8) demotes any pre-existing `cutover_pending` → `rolled_back` in the same atomic state write, so a crash during a recovery run can never leave two. `serving` is therefore unambiguous. |
+| INV-11 | **Every tag dcd pulls is recorded before it is pulled** (`stages[].pulled[]`, §7.13), so image GC's world is a census of what dcd put on this host — not only of what reached cutover. A tag leaves the ledger only when `docker image rm` confirms it gone. Plugins cannot edit the ledger: it survives the `ctx.state` round-trip unchanged. |
 
 ---
 
@@ -171,7 +172,8 @@ If state holds a `cutover_pending` release (a prior deploy died/​failed after 
 | finalize (deploy) | `R_new → active`; the release that was `current` at run start → `superseded`; `current = R_new` |
 | finalize (rollback) | `R_new → active`; the rolled-back-from `serving` → `rolled_back`; the run-start `current` (if different from `serving`) → `superseded`; the image-source **target stays `superseded`**; `current = R_new`. *(superseded vs rolled_back is informational only — both are retained and rollback-eligible, so no conflict when target == run-start current.)* |
 | unlock (§4.4) | the newest `cutover_pending` → `active`; any other pending → `rolled_back` (INV-10 repair); the run-start `current` → `superseded`; `current` = promoted release |
-| retention | evict beyond `keep_releases` (§7.13) |
+| pull (§7.3) | append to `stages[].pulled[]` and persist, before pulling (INV-11); no release/`current` write |
+| retention | evict beyond `keep_releases` (§7.13); drop the ledger rows of tags removed |
 
 Because finalize always demotes the **run-start `current`** (not merely "the previous release"), a recovery run cleanly resolves a stale `current` left by a crashed deploy: no release is left `active`-but-not-`current`, and no container is left running-but-unrecorded (§7.10 reaps it).
 
@@ -295,7 +297,7 @@ workers:
     env_exclude: []
     volumes: ['${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log']
 
-retention: { keep_releases: 3, keep_managed_images: 2 }   # app releases + managed-image versions retained
+retention: { keep_releases: 3, keep_managed_images: 2, keep_images: {} }  # releases + image versions retained
 
 plugins: [plugins/centrifugo.lua]      # optional Lua
 
@@ -452,8 +454,9 @@ Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values
 - Mirrors the original script; runs before `infra` so a recreated nginx never points at a corpse.
 
 ### 7.3 `pull`
+- Record every tag about to be pulled in `stages[].pulled[]` (`{logical, tag, pulled_at}`, host clock; re-pulling a known tag refreshes its timestamp rather than duplicating the row) and write state **before** the first pull (INV-11). Purely additive — `releases`/`current` untouched.
 - `docker pull {docker.images.app}` *(Mutate)*; for each managed service with an `image:` → `docker pull {tag}`.
-- Failure → abort (red untouched).
+- Failure → abort (red untouched) — and the ledger now carries whatever landed on the host, so §7.13 can reclaim it on a later run.
 
 ### 7.4 `infra` (ordered; mirrors the original script)
 - For each service in **declared order**: desired = `docker.images[service.image]`; current = `docker inspect {container} --format '{{.Config.Image}}'` *(Read; missing ⇒ `none`)*.
@@ -503,9 +506,13 @@ Each task: inputs, the exact argv, the failure rule. `{…}` are resolved values
 - `compose up -d {name_filter}{name}…` — **explicit worker service list only; never a bare `up -d`; `--remove-orphans` is forbidden** (the app is `docker run`-managed and would be deleted) (§9).
 
 ### 7.13 `finalize` (mirrors the original script, corrected)
+- The pull ledger write (§7.3) persists the whole state document, so a `ctx.state` mutation made by a hook that ran *before* `pull` reaches disk with it; the ledger write itself adds no release/`current` change.
 - Apply the §4.3 finalize transition (deploy or rollback) — flip the `cutover_pending` release → `active`, reconcile the prior statuses exactly per §4.3, set `current = black` — then `fs.write(dcd-state.json, …, 0600)`. Any leftover `cutover_pending` was already demoted at cutover (INV-10), so finalize sees exactly one.
-- **Retention (state-based, not `docker images` parsing):** retain `current`, any `cutover_pending`, and the newest `keep_releases` releases with status in {`superseded`, `rolled_back`}; evict older ones — for each evicted release, `docker rm -f` any leftover container and `docker image rm {release.images.app}` **iff** no retained release and no running container references that image. Replaces the script's `docker image prune -a -f` (which would delete rollback targets — INV-6).
-- **Managed-image GC:** every `Release.images` records all resolved tags (app + each managed service). Retain the newest `keep_managed_images` distinct tags per managed image across `releases[].images`; `docker image rm` older unreferenced ones — bounds the disk growth the blanket prune used to cover. Never `docker image prune -a`.
+- **Retention (state-based):** retain `current`, any `cutover_pending`, and the newest `keep_releases` releases with status in {`superseded`, `rolled_back`}; evict older ones — for each evicted release, `docker rm -f` any leftover container and `docker image rm {release.images.app}` **iff** no retained release references that image. Replaces the script's `docker image prune -a -f` (which would delete rollback targets — INV-6).
+- **Managed-image GC:** retain the newest `keep_managed_images` distinct tags per logical (`retention.keep_images.<logical>` overrides the count for one managed service image; `release.image` is rejected there because `keep_releases` bounds it); `docker image rm` older unreferenced ones. Never `docker image prune -a`.
+- **The pull ledger (INV-11) is what makes that census complete.** `releases[]` only ever knew tags that reached cutover, so a deploy that pulled and then failed — or a reset `dcd-state.json` — left tags on the host that GC could never propose again; hosts filled up while retention reported satisfied. `pull` (§7.3) records every resolved tag in `stages[].pulled[]` **before** pulling, so the closed world matches the host from then on. Tags already present at upgrade time stay unrecorded and are reclaimable only through `dcd gc --all`. Tag order comes from the ledger's own host-clock `pulled_at`, never from `docker images --format {{.CreatedAt}}` (that is the image's *build* time on the builder, which reproducible builds pin to a constant).
+- **Cross-stage protection:** stages share one repository, so GC subtracts every tag any *other* stage **in the same `dcd-state.json`** records (release or ledger) before removing anything — a stage-local view would delete a sibling stage's rollback target (INV-6). Stages on separate `deploy_root`s have separate state files and so cannot see each other; `dcd gc --all` must not run there while another stage deploys. A tag leaves the ledger only once `docker image rm` **confirmed** it gone — one Docker refused is still on the host, and forgetting it would make it invisible to GC all over again.
+- Removal stays best-effort (`try_run`): `docker image rm` (never `-f`, never by image ID) refusing a still-referenced tag is the correct outcome and never fails the deploy.
 
 ---
 
@@ -522,6 +529,7 @@ dcd <command> [stage] [flags]
 | `unlock [stage]` | §4.4 — accept the incomplete release as deployed and clear the stage lock; requires `--yes` when non-interactive |
 | `status [stage]` | current + history from state: each release's status, images, age, `ran_migrations`, and any `cutover_pending` recovery hint |
 | `tasks [stage]` | print the resolved, ordered task plan (graph + hooks); no side effects |
+| `gc [stage] [--all]` | run §7.13 retention standalone, so a full host does not have to deploy to recover. Takes the stage lock. Default scope is what dcd recorded (release history + pull ledger) — the same authority `finalize` already has, so it just reports and removes. `--all` additionally lists tags Docker reports in the repositories this config resolves to that **no** stage records, prints the rule protecting every survivor, and asks before removing (`-y` to skip). Ownership is proved, never assumed: with `registry:` set that prefix is the operator's own declaration; without it, a repository must name a registry host (a dot, a port, or `localhost` in its first segment) — `bitnami/postgresql` is as much a Docker Hub name as `postgres`. Only logicals dcd itself pulls are considered. Unprovable repositories are skipped with a warning; the command refuses outright only when none is provable. Pair either form with `--dry-run` to change nothing |
 | `check [stage]` | validate config + stage merge + dotenv chain + interpolation + `--set` + plugin load; prints the §5.2.5 env observability report; no side effects |
 | `init` | scaffold config — see §8.4 |
 | `version` | binary version |
@@ -589,7 +597,7 @@ Generated Rust MUST be dumb-simple and readable: intention-revealing names, smal
 
 | Don't | Do Instead | Why |
 |-------|-----------|-----|
-| `docker image prune -a -f` after deploy | state-based eviction beyond `keep_releases` + managed-image GC (§7.13) | the blanket prune deletes the rollback target — a real bug in the original script (INV-6) |
+| `docker image prune -a -f` after deploy | state-based eviction beyond `keep_releases` + managed-image GC over the pull ledger (§7.13), with `dcd gc --all` as the operator-driven sweep for tags dcd never recorded | the blanket prune deletes the rollback target — a real bug in the original script (INV-6) |
 | `docker compose up -d` with no service list, or `--remove-orphans` | scope every compose `up` to explicit services; never `--remove-orphans` | a bare up / orphan-removal would recreate or **delete** the `docker run`-managed app containers (§7.12) |
 | Healthcheck via the shared `network_alias` (`app-rr`) | healthcheck the black **container name** (§7.7) | red & black share the alias; the alias resolves to red → false-positive health, cut over to a sick black |
 | Auto-rollback on a post-cutover failure | stop, report, `exit 4`, `--resume` after fixing | black is already live; tearing it down for a failed worker causes more disruption (INV-2) |
@@ -634,6 +642,9 @@ Unit tests use the effects seam (no Docker). Integration tests (`IT-*`) run agai
 | TC-016 | workers gen | dynamic stdout `async\nsched` / static | 2 `worker-*` services + footer; scoped `up -d worker-async worker-sched` | empty → none; `.`-names filtered |
 | TC-017 | finalize retention | 1 current + 5 superseded, `keep_releases` 3 | current + newest 3 superseded kept (4 total); oldest 2 evicted (rm container+image) | keep 1 keeps the rollback target; a `rolled_back` release is retained like `superseded` |
 | TC-018 | managed-image GC | 3 db tags across `releases[].images`, `keep_managed_images` 2 | oldest unreferenced db image removed | referenced by a retained release → kept |
+| TC-018b | pull ledger | a tag pulled by a deploy that never finalized, then two later deploys | reclaimed once past `keep_managed_images`, ledger row dropped | within the keep count → kept |
+| TC-018c | cross-stage protection | tag recorded by stage beta, past prod's keep count | prod GC keeps it (INV-6) | recorded nowhere else → removed |
+| TC-018d | `gc --all` | host tags: recorded, container-referenced, orphan, `<none>` | only the orphan proposed; each survivor reported with its rule | repository without `/` → refuses to sweep |
 | TC-019 | rollback plan | state w/ current+previous | deploys previous images, **no** migrate tasks (INV-5); verifies images exist | no previous → error; images gone → error |
 | TC-020 | resume plan | state w/ `cutover_pending` | runs only drain:red→migrate:after→workers→finalize against recorded black | no pending → refuse |
 | TC-021 | exit-code mapping | each `DcdError` | correct code (1/2/3/4/5/10/130) | post-cutover error → 4 |

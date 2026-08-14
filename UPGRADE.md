@@ -1,3 +1,35 @@
+UPGRADE FROM 0.4 to 0.5
+=======================
+
+Image GC only ever saw tags from finished deploys, so images pulled by a deploy that
+later failed stayed on the host forever. Disks filled up while retention looked fine.
+
+ * dcd now records every tag in `dcd-state.json` before pulling it. Old state files
+   work as-is; the record starts empty and fills from the next deploy
+
+ * Tags no old state file recorded are NOT reclaimed by deploying — dcd has no record
+   of them. A host that is already full needs one `dcd gc <stage> --all`
+
+ * From then on, images left by a failed deploy are reclaimed like any other. Images
+   of retained releases are still never removed, and a stage no longer removes another
+   stage's rollback target (stages sharing one deploy_root, i.e. one state file)
+
+ * New `dcd gc [stage]` — retention without deploying, for a host that is already
+   full. Removes only what dcd recorded
+
+ * New `dcd gc [stage] --all` — also offers tags on the host that dcd never recorded
+   (pulled by hand, or before the upgrade). Lists everything and asks first; `-y`
+   skips the prompt, `--dry-run` changes nothing. Skips Docker Hub repositories
+   (`postgres`, `bitnami/postgresql`) — those are not yours to delete
+
+ * New optional `retention.keep_images: {<image>: <count>}` — per-image override of
+   `keep_managed_images`. Rejected for `release.image`; `keep_releases` bounds that
+
+ * `workers.template.image` is now pulled and retention-bounded like every other
+   image. If yours is built on the host and never pushed, the deploy will now fail at
+   `pull` — push it, or point the template at an image dcd already pulls
+
+
 UPGRADE FROM 0.3 to 0.4
 =======================
 
