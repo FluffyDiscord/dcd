@@ -123,6 +123,21 @@ enum Command {
         /// Stage to plan (omit if the config defines exactly one)
         stage: Option<String>,
     },
+    /// Reclaim disk: remove image versions past the retention counts.
+    ///
+    /// By default it only removes tags dcd itself recorded — the release history and
+    /// the pull ledger — which is the same authority a deploy's own cleanup has.
+    /// `--all` additionally asks Docker what sits in this config's repositories and
+    /// offers tags no stage records: images pulled before dcd kept a ledger, left by
+    /// a reset state file, or pulled by hand. That path infers ownership, so it lists
+    /// every candidate and asks first. Pair either with --dry-run to change nothing.
+    Gc {
+        /// Stage to collect (omit if the config defines exactly one)
+        stage: Option<String>,
+        /// Also offer host tags no stage records (asks before removing)
+        #[arg(long)]
+        all: bool,
+    },
     /// Validate the config — stage merge, interpolation, overrides, and all rules.
     Check {
         /// Stage to validate (omit if the config defines exactly one)
@@ -150,6 +165,7 @@ fn stage_of(command: &Command) -> Option<&str> {
         | Command::Unlock { stage }
         | Command::Status { stage }
         | Command::Tasks { stage }
+        | Command::Gc { stage, .. }
         | Command::Check { stage } => stage.as_deref(),
         Command::Init { .. } => None,
     }
@@ -222,6 +238,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Unlock { .. } => unlock(&cfg, &cli, &reporter, &resolved),
         Command::Status { .. } => status(&cfg, &reporter),
+        Command::Gc { all, .. } => gc(&cfg, &cli, &reporter, *all, &resolved),
         Command::Tasks { .. } => tasks(&cfg, &reporter),
         Command::Check { .. } => check_report(&cfg, &reporter, &resolved, chain_base.as_deref()),
         Command::Init { .. } => unreachable!("handled above"),
@@ -355,6 +372,64 @@ fn execute(
             engine.rollback()
         }
     }
+}
+
+/// Standalone retention (spec §7.13). Takes the stage lock like a deploy so it can
+/// never race one, and prints the whole plan before touching anything.
+fn gc(
+    cfg: &Config,
+    cli: &Cli,
+    reporter: &Reporter,
+    sweep_all: bool,
+    resolved: &crate::dotenv::ResolvedEnv,
+) -> Result<()> {
+    host_guard(cfg)?;
+
+    let clock = SystemClock;
+    let holder = format!("pid {} since {}", std::process::id(), hhmmss(now_epoch()));
+    let _lock = StageLock::acquire(&cfg.deploy_root, &cfg.stage, &holder)?;
+
+    let state = load_state(&cfg.deploy_root)?;
+    let interrupt = Interrupt::install();
+    let fs = SystemFs;
+    let runner = engine_runner(cfg, cli, resolved);
+    let mut engine = Engine::new(
+        cfg.clone(),
+        runner.as_ref(),
+        &fs,
+        &clock,
+        reporter,
+        &interrupt,
+        state,
+        engine_options(cli, resolved),
+    );
+
+    let plan = engine.gc_plan(sweep_all)?;
+    for (tag, reason) in &plan.protected {
+        reporter.log(&format!("keeping {tag} — {reason}"));
+    }
+    for tag in &plan.recorded {
+        reporter.plan(&format!("remove {tag} (past its retention count)"));
+    }
+    for tag in &plan.orphans {
+        reporter.plan(&format!("remove {tag} (on the host, recorded by no stage)"));
+    }
+    if plan.is_empty() {
+        reporter.log(&format!("{}: nothing to reclaim", cfg.stage));
+        return Ok(());
+    }
+    if cli.dry_run {
+        return Ok(());
+    }
+    if !plan.orphans.is_empty() {
+        let prompt = format!("Remove {} image(s) listed above from {}?", plan.removals().len(), cfg.stage);
+        if !confirm(&prompt, cli.yes)? {
+            return Err(DcdError::PreCutover("gc declined (pass --yes to confirm)".to_string()));
+        }
+    }
+    let removed = engine.gc(&plan)?;
+    reporter.log(&format!("{}: reclaimed {removed} image(s)", cfg.stage));
+    Ok(())
 }
 
 fn engine_options(cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Options {
