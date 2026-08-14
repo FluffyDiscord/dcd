@@ -192,7 +192,12 @@ fn failed_healthcheck_aborts_pre_cutover_and_removes_black() {
     assert!(!calls.iter().any(|c| c.contains("nginx -s reload"))); // never cut over
 
     let state = engine.into_state();
-    assert!(state.stage("prod").is_none()); // state unchanged
+    let prod = state.stage("prod").unwrap();
+    assert!(prod.releases.is_empty()); // no release recorded pre-cutover (INV-3)
+    assert_eq!(prod.current, None);
+    // but the tags this deploy pulled are on the host, so they are on the ledger
+    let pulled: Vec<&str> = prod.pulled.iter().map(|p| p.tag.as_str()).collect();
+    assert_eq!(pulled, vec!["reg:app-1", "reg:db-1"]);
 }
 
 #[test]
@@ -511,6 +516,231 @@ fn finalize_garbage_collects_evicted_images() {
     assert!(calls.iter().any(|c| c == "docker image rm img1"));
     assert!(calls.iter().any(|c| c == "docker image rm img2"));
     assert!(!calls.iter().any(|c| c == "docker image rm imgC")); // current never removed
+}
+
+/// The defect: a deploy that pulled and then died left its tag on the host with no
+/// release entry, so GC could never see it again. The pull ledger makes it visible.
+#[test]
+fn a_tag_pulled_by_a_deploy_that_never_finalized_is_reclaimed_later() {
+    let mut state = State::default();
+    {
+        let prod = state.stage_mut("prod");
+        prod.record_pull("app", "reg:app-dead", 10);
+    }
+    let cfg = cfg(); // keep_managed_images 2
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    engine.deploy().unwrap();
+    // reg:app-dead is now 2nd-newest for `app` (keep 2) -> still held as the previous version
+    assert!(!runner.display_calls().iter().any(|c| c == "docker image rm reg:app-dead"));
+
+    // a further deploy pushes it past the keep count -> reclaimed, and the ledger drops it
+    let mut state = engine.into_state();
+    state.stage_mut("prod").record_pull("app", "reg:app-2", 2000);
+    let cfg2 = config::load(cfg_src(), Some("prod"), &["docker.images.app=app-3".to_string()], &HashMap::new()).unwrap();
+    let runner2 = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let clock2 = FixedClock(3000);
+    let mut engine2 = Engine::new(cfg2, &runner2, &fs, &clock2, &reporter, &interrupt, state, opts());
+    engine2.deploy().unwrap();
+    assert!(runner2.display_calls().iter().any(|c| c == "docker image rm reg:app-dead"));
+    let after = engine2.into_state();
+    let ledger: Vec<&str> = after.stage("prod").unwrap().pulled.iter().map(|p| p.tag.as_str()).collect();
+    assert!(!ledger.contains(&"reg:app-dead"));
+}
+
+#[test]
+fn a_registry_port_is_not_a_tag_separator() {
+    assert_eq!(repository_of("reg.example.com/team/app:sha-1"), "reg.example.com/team/app");
+    assert_eq!(repository_of("localhost:5000/app"), "localhost:5000/app");
+    assert_eq!(repository_of("localhost:5000/app:v2"), "localhost:5000/app");
+    assert_eq!(repository_of("reg.example.com/app@sha256:abc"), "reg.example.com/app");
+    assert_eq!(repository_of("postgres"), "postgres");
+}
+
+fn qualified_cfg() -> config::Config {
+    config::load(
+        cfg_src(),
+        Some("prod"),
+        &["registry=reg.example.com/demo".to_string()],
+        &HashMap::new(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn gc_all_offers_only_host_tags_no_stage_records_and_names_each_survivors_rule() {
+    let cfg = qualified_cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout(
+            "docker images reg.example.com/demo",
+            "reg.example.com/demo:app-1\nreg.example.com/demo:app-orphan\nreg.example.com/demo:nginx-live\nreg.example.com/demo:<none>\n",
+        )
+        .with_stdout("docker ps -a --format", "reg.example.com/demo:nginx-live\nunrelated:latest\n");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut state = State::default();
+    state.stage_mut("prod").record_pull("app", "reg.example.com/demo:app-1", 10);
+
+    let engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    let plan = engine.gc_plan(true).unwrap();
+
+    assert_eq!(plan.orphans, vec!["reg.example.com/demo:app-orphan".to_string()]);
+    let protected: Vec<&str> = plan.protected.iter().map(|(tag, _)| tag.as_str()).collect();
+    assert_eq!(protected, vec!["reg.example.com/demo:app-1", "reg.example.com/demo:nginx-live"]);
+    assert!(plan.protected[0].1.contains("pull ledger"));
+    assert!(plan.protected[1].1.contains("container"));
+    // an untagged image is never proposed: removing it by id would untag other repositories
+    assert!(!plan.removals().iter().any(|tag| tag.contains("<none>")));
+    // the host is only ever asked about repositories this config resolves to
+    let queries: Vec<String> = runner.display_calls().into_iter().filter(|c| c.starts_with("docker images")).collect();
+    assert_eq!(queries, vec!["docker images reg.example.com/demo --format {{.Repository}}:{{.Tag}}".to_string()]);
+}
+
+#[test]
+fn gc_without_all_proposes_recorded_tags_and_still_never_asks_the_host() {
+    let cfg = qualified_cfg(); // keep_managed_images 2
+    let runner = RecordingRunner::new();
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut state = State::default();
+    {
+        let prod = state.stage_mut("prod");
+        prod.record_pull("app", "reg.example.com/demo:app-1", 10);
+        prod.record_pull("app", "reg.example.com/demo:app-2", 20);
+        prod.record_pull("app", "reg.example.com/demo:app-3", 30);
+    }
+    let engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    let plan = engine.gc_plan(false).unwrap();
+    assert_eq!(plan.recorded, vec!["reg.example.com/demo:app-1".to_string()]);
+    assert!(plan.orphans.is_empty());
+    assert!(runner.display_calls().is_empty());
+}
+
+/// A tag Docker refuses to remove is still on the host, so it must stay on the ledger:
+/// forgetting it is exactly how a tag became invisible to GC in the first place.
+#[test]
+fn a_removal_docker_refuses_keeps_its_ledger_row() {
+    let cfg = qualified_cfg();
+    let runner = RecordingRunner::new().with_response(
+        "image rm reg.example.com/demo:app-1",
+        CmdOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: "image is being used by stopped container abc".into(),
+        },
+    );
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut state = State::default();
+    {
+        let prod = state.stage_mut("prod");
+        prod.record_pull("app", "reg.example.com/demo:app-1", 10);
+        prod.record_pull("app", "reg.example.com/demo:app-2", 20);
+        prod.record_pull("app", "reg.example.com/demo:app-3", 30);
+    }
+    let mut engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    let plan = engine.gc_plan(false).unwrap();
+    assert_eq!(engine.gc(&plan).unwrap(), 0);
+    let after = engine.into_state();
+    let ledger: Vec<&str> = after.stage("prod").unwrap().pulled.iter().map(|p| p.tag.as_str()).collect();
+    assert!(ledger.contains(&"reg.example.com/demo:app-1"));
+}
+
+/// A bare one-word repository is a Docker Hub library name; on a shared host those
+/// images belong to whoever pulled them, and dcd cannot show otherwise.
+#[test]
+fn gc_all_skips_a_public_library_repository_but_still_sweeps_the_provable_one() {
+    let src = cfg_src()
+        .replace("registry: reg\n", "")
+        .replace("app: app-1", "app: reg.example.com/demo:app-1")
+        .replace("database: db-1", "database: postgres:16");
+    let cfg = config::load(&src, Some("prod"), &[], &HashMap::new()).unwrap();
+    let runner = RecordingRunner::new().with_stdout("docker images reg.example.com/demo", "reg.example.com/demo:old\n");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
+    let plan = engine.gc_plan(true).unwrap();
+    assert_eq!(plan.orphans, vec!["reg.example.com/demo:old".to_string()]);
+    assert!(reporter.lines().iter().any(|line| line.contains("not sweeping 'postgres'")));
+    assert!(!runner.display_calls().iter().any(|c| c.contains("docker images postgres")));
+}
+
+/// A `/` proves nothing on its own: `bitnami/postgresql` is a Docker Hub namespace,
+/// not our registry. And an image no service or worker uses is not ours to sweep.
+#[test]
+fn gc_all_skips_a_namespaced_hub_image_and_an_image_nothing_uses() {
+    let src = cfg_src()
+        .replace("registry: reg\n", "")
+        .replace("app: app-1", "app: reg.example.com/demo:app-1\n    toolbox: ghcr.io/other/toolbox:1")
+        .replace("database: db-1", "database: bitnami/postgresql:16");
+    let cfg = config::load(&src, Some("prod"), &[], &HashMap::new()).unwrap();
+    let runner = RecordingRunner::new().with_stdout("docker images reg.example.com/demo", "reg.example.com/demo:old\n");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
+    let plan = engine.gc_plan(true).unwrap();
+    assert_eq!(plan.orphans, vec!["reg.example.com/demo:old".to_string()]);
+    assert!(reporter.lines().iter().any(|line| line.contains("not sweeping 'bitnami/postgresql'")));
+    // `toolbox` is declared but no service or worker template uses it — never queried
+    let queried: Vec<String> = runner.display_calls().into_iter().filter(|c| c.starts_with("docker images")).collect();
+    assert_eq!(queried.len(), 1, "{queried:?}");
+}
+
+#[test]
+fn gc_all_refuses_when_no_repository_can_be_shown_to_be_ours() {
+    let src = cfg_src().replace("registry: reg\n", "").replace("app: app-1", "app: postgres:16");
+    let cfg = config::load(&src, Some("prod"), &[], &HashMap::new()).unwrap();
+    let runner = RecordingRunner::new();
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts());
+    let err = engine.gc_plan(true).unwrap_err();
+    assert!(err.to_string().contains("no repository of demo can be shown"), "{err}");
+    assert!(runner.display_calls().is_empty());
+}
+
+/// Stages share one repository, so a stage-local view of "what is still needed"
+/// would delete a sibling stage's rollback target (INV-6).
+#[test]
+fn gc_never_removes_a_tag_another_stage_still_records() {
+    let mut state = State::default();
+    state.stage_mut("beta").record_pull("app", "reg:app-dead", 10);
+    {
+        let prod = state.stage_mut("prod");
+        prod.record_pull("app", "reg:app-dead", 10);
+        prod.record_pull("app", "reg:app-2", 20);
+    }
+    let cfg = cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(3000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, state, opts());
+    engine.deploy().unwrap();
+    assert!(!runner.display_calls().iter().any(|c| c == "docker image rm reg:app-dead"));
 }
 
 #[test]
@@ -858,4 +1088,31 @@ fn plugin_mutating_state_persists_through_the_engine() {
     );
     let prod = engine.into_state();
     assert_eq!(prod.stage("prod").unwrap().find("demo-app-1000").unwrap().reason.as_deref(), Some("plugin-stamped"));
+}
+
+/// `ctx.state` is a plugin's to shape — the pull ledger is not. Losing it would make
+/// every tag dcd pulled unreclaimable again, silently.
+#[test]
+fn a_plugin_cannot_wipe_the_pull_ledger() {
+    let cfg = cfg();
+    let plugin = r#"
+        after('cutover', function(ctx)
+          ctx.state.pulled = {}
+        end)
+    "#;
+    let host = crate::lua::LuaHost::load(&cfg, &[("p".into(), plugin.into())]).unwrap();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts())
+        .with_plugins(&host);
+    engine.deploy().unwrap();
+
+    let after = engine.into_state();
+    let ledger: Vec<&str> = after.stage("prod").unwrap().pulled.iter().map(|p| p.tag.as_str()).collect();
+    assert_eq!(ledger, vec!["reg:app-1", "reg:db-1"]);
 }

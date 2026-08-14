@@ -90,6 +90,32 @@ fn compose_files_append_on_stage() {
     assert_eq!(prod.compose.files, vec![PathBuf::from("base.yml")]); // prod adds none
 }
 
+fn with_keep_images(entry: &str) -> String {
+    sample().replace(
+        "retention: { keep_releases: 3 }",
+        &format!("retention: {{ keep_releases: 3, keep_images: {{ {entry} }} }}"),
+    )
+}
+
+#[test]
+fn keep_images_overrides_a_managed_service_image() {
+    let c = load(&with_keep_images("database: 1"), Some("prod"), &[], &env()).unwrap();
+    assert_eq!(c.retention.keep_images["database"], 1);
+    assert_eq!(c.retention.keep_managed_images, 2); // untouched default for the rest
+}
+
+#[test]
+fn keep_images_rejects_the_release_image_so_the_rollback_target_survives() {
+    let err = load(&with_keep_images("app: 0"), Some("prod"), &[], &env()).unwrap_err();
+    assert!(err.to_string().contains("it is release.image"), "{err}");
+}
+
+#[test]
+fn keep_images_rejects_an_image_no_service_uses() {
+    let err = load(&with_keep_images("cache: 1"), Some("prod"), &[], &env()).unwrap_err();
+    assert!(err.to_string().contains("no service or worker template uses"), "{err}");
+}
+
 #[test]
 fn set_override_applies_after_interpolation() {
     let c = load(sample(), Some("prod"), &["retention.keep_releases=9".to_string()], &env()).unwrap();

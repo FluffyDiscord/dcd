@@ -44,12 +44,72 @@ impl Release {
     }
 }
 
+/// One tag dcd pulled onto this host, recorded before the pull itself so a deploy
+/// that dies before `finalize` still leaves a reclaimable trace (spec §7.13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PulledImage {
+    pub logical: String,
+    pub tag: String,
+    pub pulled_at: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StageState {
     #[serde(default)]
     pub current: Option<String>,
     #[serde(default)]
     pub releases: Vec<Release>,
+    #[serde(default, deserialize_with = "de_lenient_seq")]
+    pub pulled: Vec<PulledImage>,
+}
+
+/// An empty Lua table round-trips as an empty *map*, not a sequence — the same
+/// ambiguity `config::de_lenient_map` handles from the other side. Without this a
+/// plugin touching `ctx.state` at all would abort the deploy after cutover.
+fn de_lenient_seq<'de, D>(deserializer: D) -> std::result::Result<Vec<PulledImage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SeqOrEmptyMap;
+    impl<'de> serde::de::Visitor<'de> for SeqOrEmptyMap {
+        type Value = Vec<PulledImage>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a sequence (or an empty map)")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut access: A) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(entry) = access.next_element()? {
+                out.push(entry);
+            }
+            Ok(out)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut access: A) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some((_, entry)) = access.next_entry::<serde::de::IgnoredAny, PulledImage>()? {
+                out.push(entry);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_any(SeqOrEmptyMap)
+}
+
+/// How many versions of each image to keep, as the engine resolves it from
+/// `retention`. Kept here (not in `config`) so state logic stays config-free.
+#[derive(Debug, Clone, Default)]
+pub struct KeepPolicy {
+    pub releases: u32,
+    pub managed_images: u32,
+    pub per_logical: IndexMap<String, u32>,
+}
+
+impl KeepPolicy {
+    pub fn images_of(&self, logical: &str) -> u32 {
+        self.per_logical.get(logical).copied().unwrap_or(self.managed_images)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +146,54 @@ impl State {
             self.stages.insert(stage.to_string(), StageState::default());
         }
         self.stages.get_mut(stage).expect("just inserted")
+    }
+
+    /// Tags safe to `docker image rm` on `stage`'s behalf: what that stage's history
+    /// and pull ledger propose, minus every tag another stage on this host still
+    /// records. Stages share one repository, so a stage-local view would delete a
+    /// sibling stage's rollback target (INV-6).
+    pub fn images_to_gc(&self, stage: &str, keep: &KeepPolicy, logicals: &[String]) -> Vec<String> {
+        let Some(state) = self.stage(stage) else {
+            return Vec::new();
+        };
+        let elsewhere = self.tags_recorded_outside(stage);
+        state
+            .gc_candidates(keep, logicals)
+            .into_iter()
+            .filter(|tag| !elsewhere.contains(tag))
+            .collect()
+    }
+
+    /// Every tag any other stage still names, in a release or in its pull ledger.
+    pub fn tags_recorded_outside(&self, stage: &str) -> HashSet<String> {
+        let mut recorded = HashSet::new();
+        for (name, other) in &self.stages {
+            if name == stage {
+                continue;
+            }
+            for release in &other.releases {
+                recorded.extend(release.images.values().cloned());
+            }
+            for entry in &other.pulled {
+                recorded.insert(entry.tag.clone());
+            }
+        }
+        recorded
+    }
+
+    /// Every tag any stage records — the ownership evidence the host-scoped sweep
+    /// subtracts before proposing an unattributable tag for removal.
+    pub fn all_recorded_tags(&self) -> HashSet<String> {
+        let mut recorded = HashSet::new();
+        for stage in self.stages.values() {
+            for release in &stage.releases {
+                recorded.extend(release.images.values().cloned());
+            }
+            for entry in &stage.pulled {
+                recorded.insert(entry.tag.clone());
+            }
+        }
+        recorded
     }
 }
 
@@ -223,29 +331,54 @@ impl StageState {
             .collect()
     }
 
-    /// Image tags safe to `docker image rm` after retention: app images of evicted
-    /// releases plus managed-image versions beyond `keep_managed`, excluding any tag
-    /// still referenced by a retained release (spec §7.13).
-    pub fn images_to_gc(&self, keep_releases: u32, keep_managed: u32, managed_logicals: &[String]) -> Vec<String> {
-        let evicted: HashSet<String> = self.evictions(keep_releases).into_iter().collect();
+    /// Record a tag dcd is about to pull. Re-pulling a known tag refreshes its
+    /// timestamp rather than duplicating it, so the ledger stays one row per tag.
+    pub fn record_pull(&mut self, logical: &str, tag: &str, at: u64) {
+        let known = self
+            .pulled
+            .iter_mut()
+            .find(|entry| entry.logical == logical && entry.tag == tag);
+        if let Some(entry) = known {
+            entry.pulled_at = at;
+            return;
+        }
+        self.pulled.push(PulledImage {
+            logical: logical.to_string(),
+            tag: tag.to_string(),
+            pulled_at: at,
+        });
+    }
+
+    /// Drop ledger rows for tags GC has decided are gone, so the ledger tracks the
+    /// host rather than growing forever.
+    pub fn forget_pulled(&mut self, removed: &[String]) {
+        self.pulled.retain(|entry| !removed.contains(&entry.tag));
+    }
+
+    /// Image tags safe to `docker image rm` after retention, from this stage's point
+    /// of view: app images of evicted releases, plus every logical's versions beyond
+    /// its keep count, minus any tag a retained release still references (spec §7.13).
+    /// The pull ledger is what makes a tag from a deploy that never finalized visible
+    /// here at all.
+    pub fn gc_candidates(&self, keep: &KeepPolicy, logicals: &[String]) -> Vec<String> {
+        let evicted: HashSet<String> = self.evictions(keep.releases).into_iter().collect();
         let retained: Vec<&Release> = self.releases.iter().filter(|r| !evicted.contains(&r.container)).collect();
+        let retained_tags: HashSet<&str> = retained.iter().flat_map(|r| r.images.values().map(String::as_str)).collect();
         let mut remove: Vec<String> = Vec::new();
 
-        let retained_app: HashSet<&str> = retained.iter().filter_map(|r| r.app_image()).collect();
         for release in &self.releases {
-            if evicted.contains(&release.container) {
-                if let Some(app) = release.app_image() {
-                    if !retained_app.contains(app) && !remove.iter().any(|t| t == app) {
-                        remove.push(app.to_string());
-                    }
-                }
+            let is_evicted = evicted.contains(&release.container);
+            let Some(app) = release.app_image() else {
+                continue;
+            };
+            if is_evicted && !retained_tags.contains(app) && !remove.iter().any(|t| t == app) {
+                remove.push(app.to_string());
             }
         }
 
-        for logical in managed_logicals {
-            let retained_tags: HashSet<&str> =
-                retained.iter().filter_map(|r| r.images.get(logical).map(String::as_str)).collect();
-            for tag in self.managed_image_versions(logical).into_iter().skip(keep_managed as usize) {
+        for logical in logicals {
+            let keep_count = keep.images_of(logical) as usize;
+            for tag in self.image_versions(logical).into_iter().skip(keep_count) {
                 if !retained_tags.contains(tag.as_str()) && !remove.contains(&tag) {
                     remove.push(tag);
                 }
@@ -254,8 +387,37 @@ impl StageState {
         remove
     }
 
-    /// Distinct tags ever recorded for a managed image, newest release first (GC input).
-    pub fn managed_image_versions(&self, logical: &str) -> Vec<String> {
+    /// Distinct tags known for a logical, newest first: the pull ledger by pull time,
+    /// then any tag only the release history knows (state written before the ledger
+    /// existed, so older than everything pulled since).
+    pub fn image_versions(&self, logical: &str) -> Vec<String> {
+        // rows are appended in pull order, so a later row wins a `pulled_at` tie —
+        // two pulls inside one clock second must not order newest-last
+        let mut ledger: Vec<(usize, &PulledImage)> = self
+            .pulled
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.logical == logical)
+            .collect();
+        ledger.sort_by_key(|(position, entry)| std::cmp::Reverse((entry.pulled_at, *position)));
+        let ledger: Vec<&PulledImage> = ledger.into_iter().map(|(_, entry)| entry).collect();
+        let mut versions: Vec<String> = Vec::new();
+        for entry in ledger {
+            if !versions.contains(&entry.tag) {
+                versions.push(entry.tag.clone());
+            }
+        }
+        for tag in self.recorded_image_versions(logical) {
+            if !versions.contains(&tag) {
+                versions.push(tag);
+            }
+        }
+        versions
+    }
+
+    /// Distinct tags for a logical as the release history alone records them,
+    /// newest release first.
+    pub fn recorded_image_versions(&self, logical: &str) -> Vec<String> {
         let mut seen = Vec::new();
         for release in self.releases.iter().rev() {
             if let Some(tag) = release.images.get(logical) {
@@ -284,6 +446,14 @@ mod tests {
             ran_migrations: false,
             reason: None,
             env_keys: Vec::new(),
+        }
+    }
+
+    fn keep(releases: u32, managed_images: u32) -> KeepPolicy {
+        KeepPolicy {
+            releases,
+            managed_images,
+            per_logical: IndexMap::new(),
         }
     }
 
@@ -432,7 +602,7 @@ mod tests {
         mk(1, "db-a");
         mk(2, "db-a");
         mk(3, "db-b");
-        assert_eq!(s.managed_image_versions("database"), vec!["db-b".to_string(), "db-a".to_string()]);
+        assert_eq!(s.recorded_image_versions("database"), vec!["db-b".to_string(), "db-a".to_string()]);
     }
 
     #[test]
@@ -445,7 +615,7 @@ mod tests {
         s.releases.push(release(4, "CUR", "appC", ReleaseStatus::Active));
         s.current = Some("CUR".into());
         // keep 1 superseded -> evict S1, S2 (oldest). S3 retained.
-        let gc = s.images_to_gc(1, 2, &[]);
+        let gc = s.gc_candidates(&keep(1, 2), &[]);
         // appA evicted (S1,S2 both evicted, not referenced by retained) -> removed once
         assert_eq!(gc, vec!["appA".to_string()]);
         // appB still referenced by retained S3 -> NOT removed; appC is current -> NOT removed
@@ -467,12 +637,12 @@ mod tests {
         s.current = Some("c3".into());
         // keep_managed 1 -> only newest db tag (db-c) retained; db-a/db-b candidates,
         // but db-b's release c2 may be retained by keep_releases. Use keep_releases large so nothing app-evicts.
-        let gc = s.images_to_gc(5, 1, &["database".to_string()]);
+        let gc = s.gc_candidates(&keep(5, 1), &["database".to_string()]);
         // db-c retained (current). db-b referenced by retained c2. db-a referenced by retained c1.
         // with keep_releases=5 all releases retained -> managed tags all referenced -> nothing removed.
         assert!(gc.is_empty());
         // now drop retention so c1 is evicted -> db-a becomes removable
-        let gc2 = s.images_to_gc(1, 1, &["database".to_string()]);
+        let gc2 = s.gc_candidates(&keep(1, 1), &["database".to_string()]);
         assert!(gc2.contains(&"db-a".to_string()));
     }
 

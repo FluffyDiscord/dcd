@@ -63,6 +63,18 @@ impl<'a> Docker<'a> {
         Argv::of(["docker", "image", "rm", tag])
     }
 
+    /// Tagged images in one repository. `<none>` tags are filtered by the caller —
+    /// removing by ID would untag the same layers in foreign repositories too.
+    pub fn images_in(&self, repository: &str) -> Argv {
+        Argv::of(["docker", "images", repository, "--format", "{{.Repository}}:{{.Tag}}"])
+    }
+
+    /// What every container on the host runs, stopped ones included: a stopped
+    /// container still pins its image, and its release may still be a rollback target.
+    pub fn container_images(&self) -> Argv {
+        Argv::of(["docker", "ps", "-a", "--format", "{{.Image}}"])
+    }
+
     pub fn ps_names(&self, name_prefix: &str, include_stopped: bool) -> Argv {
         let mut argv = vec!["docker".to_string(), "ps".to_string()];
         if include_stopped {
@@ -307,6 +319,17 @@ cutover:
             d.worker_ps_names("worker-").display(),
             "docker ps --filter label=com.docker.compose.project=demo --filter name=worker- --format {{.Names}}"
         );
+    }
+
+    #[test]
+    fn gc_queries_are_repository_scoped_and_include_stopped_containers() {
+        let cfg = config();
+        let d = Docker::new(&cfg);
+        assert_eq!(
+            d.images_in("reg.example.com/demo").display(),
+            "docker images reg.example.com/demo --format {{.Repository}}:{{.Tag}}"
+        );
+        assert_eq!(d.container_images().display(), "docker ps -a --format {{.Image}}");
     }
 
     #[test]

@@ -237,6 +237,8 @@ pub struct Retention {
     pub keep_releases: u32,
     #[serde(default = "two")]
     pub keep_managed_images: u32,
+    #[serde(default, deserialize_with = "de_lenient_map")]
+    pub keep_images: IndexMap<String, u32>,
 }
 
 impl Default for Retention {
@@ -244,6 +246,7 @@ impl Default for Retention {
         Retention {
             keep_releases: 3,
             keep_managed_images: 2,
+            keep_images: IndexMap::new(),
         }
     }
 }
@@ -607,8 +610,31 @@ fn validate(config: &Config) -> Result<()> {
         }
     }
 
+    validate_keep_images(config)?;
     validate_env_rules(config)?;
 
+    Ok(())
+}
+
+/// `retention.keep_images` overrides `keep_managed_images` for one image dcd manages.
+/// The release image is rejected because `keep_releases` is the knob that bounds it —
+/// two counts over one image would only be a way to disagree with yourself.
+fn validate_keep_images(config: &Config) -> Result<()> {
+    let service_images = config.docker.services.values().filter_map(|service| service.image.as_deref());
+    let worker_image = config.workers.as_ref().map(|workers| workers.template.image.as_str());
+    let managed: HashSet<&str> = service_images.chain(worker_image).collect();
+    for logical in config.retention.keep_images.keys() {
+        if logical == &config.release.image {
+            return Err(DcdError::Config(format!(
+                "retention.keep_images cannot set '{logical}': it is release.image, bound by retention.keep_releases"
+            )));
+        }
+        if !managed.contains(logical.as_str()) {
+            return Err(DcdError::Config(format!(
+                "retention.keep_images references image '{logical}' which no service or worker template uses"
+            )));
+        }
+    }
     Ok(())
 }
 

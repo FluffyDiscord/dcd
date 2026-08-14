@@ -398,6 +398,7 @@ mod tests {
                 reason: None,
                 env_keys: Vec::new(),
             }],
+            pulled: Vec::new(),
         }
     }
 

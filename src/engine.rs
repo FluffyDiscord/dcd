@@ -14,7 +14,7 @@ use crate::effects::{Access, Argv, Clock, CommandRunner, FileSystem, RunOpts};
 use crate::error::{DcdError, Result};
 use crate::lua::{HookHost, LuaHost};
 use crate::signal::Interrupt;
-use crate::state::{FinalizeKind, Release, ReleaseStatus, State};
+use crate::state::{FinalizeKind, KeepPolicy, Release, ReleaseStatus, State};
 use crate::ui::{Reporter, Status};
 
 pub const DEPLOY_STEPS: &[&str] = &[
@@ -79,6 +79,50 @@ impl Default for Options {
             container_env: BTreeMap::new(),
             interpolation_env: HashMap::new(),
         }
+    }
+}
+
+/// What a `dcd gc` run intends to do, so the operator can see it (and, for the
+/// host-scoped sweep, approve it) before anything is removed.
+#[derive(Debug)]
+pub struct GcPlan {
+    /// Tags this stage's release history and pull ledger say are past their keep count.
+    pub recorded: Vec<String>,
+    /// Tags found on the host in an owned repository that no stage records (`--all`).
+    pub orphans: Vec<String>,
+    /// Host tags left alone, each with the rule that spared it.
+    pub protected: Vec<(String, String)>,
+}
+
+impl GcPlan {
+    pub fn removals(&self) -> Vec<String> {
+        let mut all = self.recorded.clone();
+        all.extend(self.orphans.iter().cloned());
+        all
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.recorded.is_empty() && self.orphans.is_empty()
+    }
+}
+
+/// Whether a repository names a registry host, per Docker's own rule: the first path
+/// segment is a host only if it carries a dot, a port, or is `localhost`. Everything
+/// else — `postgres`, `bitnami/postgresql`, `library/redis` — is a Docker Hub name,
+/// which on a shared host belongs to whoever pulled it.
+fn names_a_registry_host(repository: &str) -> bool {
+    let first_segment = repository.split('/').next().unwrap_or(repository);
+    first_segment.contains('.') || first_segment.contains(':') || first_segment == "localhost"
+}
+
+/// The repository half of an image reference: everything before the tag, with any
+/// `@sha256:…` digest dropped. A `:` only separates a tag when nothing after it is a
+/// path separator — otherwise it is a registry port (`localhost:5000/app`).
+fn repository_of(reference: &str) -> String {
+    let without_digest = reference.split('@').next().unwrap_or(reference);
+    match without_digest.rfind(':') {
+        Some(colon) if !without_digest[colon + 1..].contains('/') => without_digest[..colon].to_string(),
+        _ => without_digest.to_string(),
     }
 }
 
@@ -167,6 +211,30 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Every logical dcd itself puts on the host, and therefore bounds versions for:
+    /// the release image, each managed service image, and the worker template's.
+    /// Untouched entries in `docker.images` are nobody's to reclaim.
+    fn gc_logicals(&self) -> Vec<String> {
+        let mut logicals = vec!["app".to_string()];
+        let service_images = self.cfg.docker.services.values().filter_map(|s| s.image.clone());
+        let worker_image = self.cfg.workers.as_ref().map(|w| w.template.image.clone());
+        for logical in service_images.chain(worker_image) {
+            if !logicals.contains(&logical) {
+                logicals.push(logical);
+            }
+        }
+        logicals
+    }
+
+    fn keep_policy(&self) -> KeepPolicy {
+        let retention = &self.cfg.retention;
+        KeepPolicy {
+            releases: retention.keep_releases,
+            managed_images: retention.keep_managed_images,
+            per_logical: retention.keep_images.clone(),
+        }
+    }
+
     fn resolved_images(&self) -> IndexMap<String, String> {
         self.cfg
             .docker
@@ -237,6 +305,150 @@ impl<'a> Engine<'a> {
             target.app_image().unwrap_or("?")
         ));
         self.drive(ROLLBACK_STEPS)
+    }
+
+    /// What `dcd gc` would remove. `sweep_all` additionally asks Docker what sits in
+    /// the repositories this config resolves to and proposes tags no stage records —
+    /// the only path that reclaims images pulled before dcd kept a ledger, and the
+    /// only one that infers ownership, which is why it never runs unattended.
+    pub fn gc_plan(&self, sweep_all: bool) -> Result<GcPlan> {
+        let keep = self.keep_policy();
+        let logicals = self.gc_logicals();
+        let recorded = self.state.images_to_gc(&self.cfg.stage, &keep, &logicals);
+        let mut plan = GcPlan {
+            recorded,
+            orphans: Vec::new(),
+            protected: Vec::new(),
+        };
+        if !sweep_all {
+            return Ok(plan);
+        }
+
+        let repositories = self.owned_repositories()?;
+        let recorded_anywhere = self.state.all_recorded_tags();
+        let in_use = self.container_images()?;
+        for repository in &repositories {
+            for tag in self.host_tags(repository)? {
+                if plan.recorded.contains(&tag) {
+                    continue;
+                }
+                if recorded_anywhere.contains(&tag) {
+                    plan.protected.push((tag, "a release or the pull ledger still records it".to_string()));
+                } else if in_use.contains(&tag) {
+                    plan.protected.push((tag, "a container references it".to_string()));
+                } else {
+                    plan.orphans.push(tag);
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Remove a plan's tags, best-effort: Docker refusing a tag that is still
+    /// referenced is the correct outcome and never fails the command.
+    pub fn gc(&mut self, plan: &GcPlan) -> Result<usize> {
+        let removed = self.remove_images(&plan.removals());
+        let stage = self.cfg.stage.clone();
+        self.state.stage_mut(&stage).forget_pulled(&removed);
+        self.persist_state()?;
+        Ok(removed.len())
+    }
+
+    /// `docker image rm` each tag, returning those Docker confirmed gone. A refusal
+    /// (still referenced) is reported and the tag stays known.
+    fn remove_images(&self, tags: &[String]) -> Vec<String> {
+        let mut removed: Vec<String> = Vec::new();
+        for tag in tags {
+            let rm = self.docker().image_rm(tag);
+            let Ok(out) = self.try_run(&rm, Access::Mutate) else {
+                self.reporter.warn(&format!("kept {tag}: docker could not be run"));
+                continue;
+            };
+            // an image that is already gone is the outcome we wanted: counting it as
+            // removed stops the same tag being re-proposed, and warned about, forever
+            let already_gone = out.stderr.contains("No such image");
+            if out.success() || already_gone {
+                if out.success() {
+                    self.reporter.log(&format!("removed {tag}"));
+                }
+                removed.push(tag.clone());
+            } else {
+                self.reporter.warn(&format!("kept {tag}: {}", out.stderr.trim()));
+            }
+        }
+        removed
+    }
+
+    /// The repositories this project+stage publishes to, skipping any that cannot be
+    /// shown to belong to it. An explicit `registry:` is the operator naming their own
+    /// prefix, so it is trusted unless it is a bare Docker Hub name; a repository
+    /// merely inferred from an image reference must name a registry host, or
+    /// `bitnami/postgresql` would look as much "ours" as `ghcr.io/us/app`. Only
+    /// logicals dcd itself puts on the host are considered. Skipping is per
+    /// repository — one public image must not disable the sweep for our own.
+    fn owned_repositories(&self) -> Result<Vec<String>> {
+        let declared = self.cfg.registry.is_some();
+        let references: Vec<String> = match &self.cfg.registry {
+            Some(registry) => vec![registry.clone()],
+            None => self
+                .gc_logicals()
+                .iter()
+                .filter_map(|logical| self.cfg.docker.images.get(logical).cloned())
+                .collect(),
+        };
+        let mut repositories: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for reference in &references {
+            let repository = repository_of(reference);
+            let has_host = names_a_registry_host(&repository);
+            let is_ours = if declared { has_host || repository.contains('/') } else { has_host };
+            if !is_ours {
+                if !skipped.contains(&repository) {
+                    self.reporter.warn(&format!(
+                        "not sweeping '{repository}': a Docker Hub name cannot be shown to belong to {}",
+                        self.cfg.project
+                    ));
+                    skipped.push(repository);
+                }
+                continue;
+            }
+            if !repositories.contains(&repository) {
+                repositories.push(repository);
+            }
+        }
+        if repositories.is_empty() {
+            return Err(DcdError::Config(format!(
+                "refusing to sweep: no repository of {} can be shown to belong to it (set `registry:` to one you own)",
+                self.cfg.project
+            )));
+        }
+        Ok(repositories)
+    }
+
+    fn host_tags(&self, repository: &str) -> Result<Vec<String>> {
+        let argv = self.docker().images_in(repository);
+        let out = self.read(&argv)?;
+        let tags = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.ends_with(":<none>"))
+            .map(String::from)
+            .collect();
+        Ok(tags)
+    }
+
+    fn container_images(&self) -> Result<HashSet<String>> {
+        let argv = self.docker().container_images();
+        let out = self.read(&argv)?;
+        let images = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect();
+        Ok(images)
     }
 
     pub fn resume(&mut self) -> Result<()> {
@@ -404,21 +616,35 @@ impl<'a> Engine<'a> {
 
     fn pull(&mut self) -> Result<Outcome> {
         let app = self.images.get("app").cloned().unwrap_or_default();
-        let pull_app = self.docker().pull(&app);
-        self.exec(&pull_app, Access::Mutate)?;
-        let managed: Vec<String> = self
-            .cfg
-            .docker
-            .services
-            .values()
-            .filter_map(|s| s.image.as_ref())
-            .filter_map(|logical| self.images.get(logical).cloned())
-            .collect();
-        for tag in managed {
-            let argv = self.docker().pull(&tag);
+        let mut pulls: Vec<(String, String)> = vec![("app".to_string(), app)];
+        for logical in self.gc_logicals().into_iter().skip(1) {
+            if let Some(tag) = self.images.get(&logical).cloned() {
+                pulls.push((logical, tag));
+            }
+        }
+        self.record_pulls(&pulls)?;
+        for (_, tag) in &pulls {
+            let argv = self.docker().pull(tag);
             self.exec(&argv, Access::Mutate)?;
         }
         Ok(Outcome::Done(None))
+    }
+
+    /// Write the pull ledger before pulling, so a deploy that dies before `finalize`
+    /// still leaves every tag it dropped on this host reclaimable (spec §7.13). Purely
+    /// additive: `releases` and `current` are untouched, so recovery reads the same
+    /// state it would have without this write (INV-3).
+    fn record_pulls(&mut self, pulls: &[(String, String)]) -> Result<()> {
+        let stage = self.cfg.stage.clone();
+        let at = self.clock.now_epoch();
+        let ledger = self.state.stage_mut(&stage);
+        for (logical, tag) in pulls {
+            if tag.is_empty() {
+                continue;
+            }
+            ledger.record_pull(logical, tag, at);
+        }
+        self.persist_state()
     }
 
     fn infra(&mut self) -> Result<Outcome> {
@@ -634,23 +860,24 @@ impl<'a> Engine<'a> {
         let stage = self.cfg.stage.clone();
         let container = self.container.clone();
         let serving_before = self.serving_before.clone();
-        let keep = self.cfg.retention.keep_releases;
-        let keep_managed = self.cfg.retention.keep_managed_images;
-        let managed: Vec<String> = self.cfg.docker.services.values().filter_map(|s| s.image.clone()).collect();
+        let keep = self.keep_policy();
+        let logicals = self.gc_logicals();
         self.state.stage_mut(&stage).finalize(&container, kind, serving_before.as_deref());
-        let (evictions, images) = self
-            .state
-            .stage(&stage)
-            .map(|s| (s.evictions(keep), s.images_to_gc(keep, keep_managed, &managed)))
-            .unwrap_or_default();
+        let evictions = self.state.stage(&stage).map(|s| s.evictions(keep.releases)).unwrap_or_default();
+        let images = self.state.images_to_gc(&stage, &keep, &logicals);
         self.persist_state()?;
         for container in &evictions {
             let rm = self.docker().rm_f(container);
             let _ = self.try_run(&rm, Access::Mutate);
         }
-        for image in &images {
-            let rm = self.docker().image_rm(image);
-            let _ = self.try_run(&rm, Access::Mutate);
+        let removed = self.remove_images(&images);
+        // only tags Docker confirmed gone leave the ledger: one it refused is still on
+        // the host, and forgetting it would make it invisible again (INV-11)
+        self.state.stage_mut(&stage).forget_pulled(&removed);
+        // the release is already recorded and live; failing the deploy over unpruned
+        // bookkeeping would report a successful cutover as a failure with nothing to resume
+        if self.persist_state().is_err() {
+            self.reporter.warn("pull ledger not pruned; the next deploy or `dcd gc` retries it");
         }
         Ok(Outcome::Done(Some(format!("current = {}", self.container))))
     }
@@ -693,9 +920,12 @@ impl<'a> Engine<'a> {
     /// Adopt a `ctx.state` a plugin mutated into the current stage. Persisted immediately
     /// once past cutover so the change survives a crash (matching INV-3).
     fn apply_synced_state(&mut self, value: serde_yaml::Value) -> Result<()> {
-        let stage: crate::state::StageState =
+        let mut stage: crate::state::StageState =
             serde_yaml::from_value(value).map_err(|e| self.classify(format!("ctx.state: {e}")))?;
         let key = self.cfg.stage.clone();
+        // the pull ledger is dcd's record of what it put on this host, not a plugin's
+        // to edit: a round-trip that dropped it would make those tags unreclaimable
+        stage.pulled = self.state.stage_mut(&key).pulled.clone();
         *self.state.stage_mut(&key) = stage;
         if self.post_cutover {
             self.persist_state()?;
