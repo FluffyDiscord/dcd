@@ -20,6 +20,7 @@ fn release(id: u64, container: &str, app: &str, status: ReleaseStatus) -> Releas
         ran_migrations: false,
         reason: None,
         env_keys: Vec::new(),
+        reaped: false,
     }
 }
 

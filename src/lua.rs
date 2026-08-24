@@ -397,6 +397,7 @@ mod tests {
                 ran_migrations: false,
                 reason: None,
                 env_keys: Vec::new(),
+                reaped: false,
             }],
             pulled: Vec::new(),
         }

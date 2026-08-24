@@ -36,6 +36,11 @@ pub struct Release {
     pub reason: Option<String>,
     #[serde(default)]
     pub env_keys: Vec<String>,
+    /// Retention has already removed this release's container and settled its image.
+    /// The row stays for history (`dcd status`); GC stops proposing it. Defaults false,
+    /// so a state written by an older dcd gets one final cleanup pass and then settles.
+    #[serde(default)]
+    pub reaped: bool,
 }
 
 impl Release {
@@ -335,6 +340,9 @@ impl StageState {
         retained
             .into_iter()
             .skip(keep_releases as usize)
+            // a reaped release is already torn down: re-proposing it makes every later
+            // deploy repeat the same dead `docker rm -f`/`image rm` calls forever
+            .filter(|r| !r.reaped)
             .map(|r| r.container.clone())
             .filter(|c| Some(c) != serving.as_ref() && Some(c.clone()) != self.current)
             .filter(|c| Some(c) != rollback_container.as_ref())
@@ -363,6 +371,30 @@ impl StageState {
     /// host rather than growing forever.
     pub fn forget_pulled(&mut self, removed: &[String]) {
         self.pulled.retain(|entry| !removed.contains(&entry.tag));
+    }
+
+    /// Mark evicted releases whose teardown is complete, so retention converges instead
+    /// of re-proposing the same dead containers and tags on every deploy (spec §7.13
+    /// "evict older ones" — the artifacts were evicted, the rows never were).
+    ///
+    /// Only releases whose container Docker confirmed gone are marked, so a removal that
+    /// genuinely failed is retried next run. An image is settled when it was removed, or
+    /// when it was never proposed because a live release still references it. One that
+    /// was proposed and refused leaves the release unreaped: the image is still on the
+    /// host and this row is evidence dcd put it there (INV-11).
+    pub fn mark_reaped(&mut self, containers: &[String], proposed: &[String], removed: &[String]) {
+        for release in &mut self.releases {
+            if !containers.contains(&release.container) {
+                continue;
+            }
+            let settled = match release.images.get("app") {
+                Some(image) => !proposed.contains(image) || removed.contains(image),
+                None => true,
+            };
+            if settled {
+                release.reaped = true;
+            }
+        }
     }
 
     /// Image tags safe to `docker image rm` after retention, from this stage's point
@@ -456,6 +488,7 @@ mod tests {
             ran_migrations: false,
             reason: None,
             env_keys: Vec::new(),
+            reaped: false,
         }
     }
 
@@ -629,6 +662,87 @@ mod tests {
         assert_eq!(s.rollback_target().map(|r| r.container.as_str()), Some("c1"));
         assert!(!s.evictions(1).contains(&"c1".to_string()));
         assert!(!s.gc_candidates(&keep(1, 1), &[]).contains(&"imgA".to_string()));
+    }
+
+    #[test]
+    fn mark_reaped_settles_an_evicted_release_whose_image_is_gone() {
+        let mut s = StageState::default();
+        s.releases.push(release(1, "OLD", "appA", ReleaseStatus::Superseded));
+        s.releases.push(release(2, "CUR", "appB", ReleaseStatus::Active));
+        s.current = Some("CUR".into());
+
+        let gone = vec!["appA".to_string()];
+        s.mark_reaped(&["OLD".to_string()], &gone, &gone);
+
+        assert!(s.find("OLD").unwrap().reaped);
+        assert!(!s.find("CUR").unwrap().reaped);
+        // the row stays: `dcd status` is the deploy history, retention is not a delete
+        assert_eq!(s.releases.len(), 2);
+    }
+
+    #[test]
+    fn mark_reaped_leaves_a_release_whose_image_docker_refused() {
+        let mut s = StageState::default();
+        s.releases.push(release(1, "OLD", "appA", ReleaseStatus::Superseded));
+        s.current = Some("CUR".into());
+
+        // proposed, but Docker refused it: the image is still on the host and this row is
+        // the evidence dcd put it there (INV-11), so it must stay proposable
+        s.mark_reaped(&["OLD".to_string()], &["appA".to_string()], &[]);
+
+        assert!(!s.find("OLD").unwrap().reaped);
+    }
+
+    #[test]
+    fn mark_reaped_settles_a_release_sharing_a_live_image() {
+        let mut s = StageState::default();
+        // same-tag redeploy: the image is never proposed because the live release needs
+        // it, but the superseded row is still finished business
+        s.releases.push(release(1, "OLD", "appA", ReleaseStatus::Superseded));
+        s.releases.push(release(2, "CUR", "appA", ReleaseStatus::Active));
+        s.current = Some("CUR".into());
+
+        s.mark_reaped(&["OLD".to_string()], &[], &[]);
+
+        assert!(s.find("OLD").unwrap().reaped);
+    }
+
+    #[test]
+    fn mark_reaped_ignores_a_container_docker_did_not_confirm_gone() {
+        let mut s = StageState::default();
+        s.releases.push(release(1, "STUCK", "appA", ReleaseStatus::Superseded));
+        s.current = Some("CUR".into());
+
+        // the removal failed, so "STUCK" is absent from the confirmed list
+        s.mark_reaped(&[], &["appA".to_string()], &["appA".to_string()]);
+
+        assert!(!s.find("STUCK").unwrap().reaped);
+    }
+
+    #[test]
+    fn retention_converges_instead_of_reproposing_the_same_dead_work() {
+        let mut s = StageState::default();
+        for id in 1..=6 {
+            s.releases
+                .push(release(id, &format!("R{id}"), &format!("app{id}"), ReleaseStatus::Superseded));
+        }
+        s.releases.push(release(7, "CUR", "appCur", ReleaseStatus::Active));
+        s.current = Some("CUR".into());
+
+        let first = s.evictions(1);
+        assert!(!first.is_empty(), "the first pass has dead releases to evict");
+        let proposed = s.gc_candidates(&keep(1, 1), &[]);
+        s.mark_reaped(&first, &proposed, &proposed);
+
+        // the bug this guards: every later deploy re-issued the same `docker rm -f` and
+        // `docker image rm` for releases torn down long ago, forever
+        assert!(
+            s.evictions(1).is_empty(),
+            "evictions re-proposed settled releases: {:?}",
+            s.evictions(1)
+        );
+        // and none of the history was thrown away to achieve it
+        assert_eq!(s.releases.len(), 7);
     }
 
     #[test]

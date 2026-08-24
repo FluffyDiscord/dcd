@@ -347,11 +347,38 @@ impl<'a> Engine<'a> {
     /// Remove a plan's tags, best-effort: Docker refusing a tag that is still
     /// referenced is the correct outcome and never fails the command.
     pub fn gc(&mut self, plan: &GcPlan) -> Result<usize> {
-        let removed = self.remove_images(&plan.removals());
+        let proposed = plan.removals();
+        let removed = self.remove_images(&proposed);
         let stage = self.cfg.stage.clone();
+        let keep = self.keep_policy();
+        // gc removes images only; a release whose container is still around stays
+        // evictable, so only rows whose container is already gone are settled here
+        let evicted = self.state.stage(&stage).map(|s| s.evictions(keep.releases)).unwrap_or_default();
+        let gone = self.containers_absent(&evicted);
         self.state.stage_mut(&stage).forget_pulled(&removed);
+        self.state.stage_mut(&stage).mark_reaped(&gone, &proposed, &removed);
         self.persist_state()?;
         Ok(removed.len())
+    }
+
+    /// Of `containers`, those Docker no longer has. `dcd gc` never removes containers, so
+    /// it may only settle rows whose container a previous run already tore down. One
+    /// listing, not one probe per container; a listing that fails settles nothing.
+    fn containers_absent(&self, containers: &[String]) -> Vec<String> {
+        let prefix = format!("{}-", self.cfg.release.container_prefix);
+        let argv = self.docker().ps_names(&prefix, true);
+        let Ok(out) = self.try_run(&argv, Access::Read) else {
+            return Vec::new();
+        };
+        if !out.success() {
+            return Vec::new();
+        }
+        let present: Vec<&str> = out.stdout.lines().map(str::trim).filter(|n| !n.is_empty()).collect();
+        containers
+            .iter()
+            .filter(|container| !present.contains(&container.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// `docker image rm` each tag, returning those Docker confirmed gone. A refusal
@@ -785,6 +812,7 @@ impl<'a> Engine<'a> {
             ran_migrations: self.ran_migrations,
             reason: self.opts.reason.clone(),
             env_keys: self.release_env_keys()?,
+            reaped: false,
         };
         let stage = self.cfg.stage.clone();
         self.state.stage_mut(&stage).record_cutover(release);
@@ -866,14 +894,24 @@ impl<'a> Engine<'a> {
         let evictions = self.state.stage(&stage).map(|s| s.evictions(keep.releases)).unwrap_or_default();
         let images = self.state.images_to_gc(&stage, &keep, &logicals);
         self.persist_state()?;
+        // only containers Docker confirmed gone are reaped below: a removal that really
+        // failed must stay evictable, or a stuck container would never be retried
+        let mut torn_down: Vec<String> = Vec::new();
         for container in &evictions {
             let rm = self.docker().rm_f(container);
-            let _ = self.try_run(&rm, Access::Mutate);
+            if let Ok(out) = self.try_run(&rm, Access::Mutate) {
+                if out.success() {
+                    torn_down.push(container.clone());
+                }
+            }
         }
         let removed = self.remove_images(&images);
         // only tags Docker confirmed gone leave the ledger: one it refused is still on
         // the host, and forgetting it would make it invisible again (INV-11)
         self.state.stage_mut(&stage).forget_pulled(&removed);
+        // mark the evicted releases settled, or `evictions`/`gc_candidates` re-derive the
+        // same dead containers and tags from `releases` on every subsequent deploy
+        self.state.stage_mut(&stage).mark_reaped(&torn_down, &images, &removed);
         // the release is already recorded and live; failing the deploy over unpruned
         // bookkeeping would report a successful cutover as a failure with nothing to resume
         if self.persist_state().is_err() {

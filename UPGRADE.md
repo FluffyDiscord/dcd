@@ -1,3 +1,30 @@
+UPGRADE FROM 0.5.1 to 0.5.2
+===========================
+
+Bug fix, no configuration change. Retention now converges instead of repeating itself.
+
+ * Evicting a release removed its container and image but never marked the release row
+   done, so `evictions`/`gc_candidates` re-derived the same long-dead work from
+   `releases[]` on **every** later deploy. `docker rm -f` answers `0` for a container that
+   is already gone and `docker image rm` answers `1 / No such image`, so the repetition
+   never showed up in an exit code — it just grew with the release history until deploy
+   logs were dominated by dozens of no-op removals
+
+ * `Release` gains `reaped: bool` in `dcd-state.json`, set once a release's teardown is
+   complete. It defaults to `false`, so no migration is needed: an existing state file
+   gets one final cleanup pass on the next deploy and settles afterwards
+
+ * **History is not deleted.** Evicted releases keep their rows and stay visible in
+   `dcd status`; only the retention pass ignores them
+
+ * A release is reaped only when Docker confirmed its container gone *and* its image is
+   settled. An image that was proposed for removal and refused leaves the release
+   unreaped, so it stays proposable — that row is the only evidence dcd put the image on
+   the host (INV-11)
+
+ * `dcd gc` settles rows too, but only for releases whose container is already gone: `gc`
+   removes images, never containers
+
 UPGRADE FROM 0.5.0 to 0.5.1
 ===========================
 
