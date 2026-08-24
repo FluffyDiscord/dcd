@@ -205,8 +205,9 @@ workers:
 # `dcd gc <stage> --all` also offers tags found on the host that no stage records.
 
 retention:
-  keep_releases: 3        # superseded / rolled-back containers to keep  (default: 3)
-  keep_managed_images: 2  # past tags per managed image to keep          (default: 2)
+  keep_releases: 1        # superseded / rolled-back containers to keep  (default: 1)
+  keep_managed_images: 1  # tags kept per managed image, newest first,     (default: 1)
+                          # INCLUDING the one in use — 1 keeps no previous version
   keep_images:            # per-image override of keep_managed_images    (default: none)
     database: 1           # keys are docker.images logicals used by a service or the
                           # worker template; release.image is rejected — keep_releases
@@ -252,4 +253,4 @@ stages:
   beta:
     deploy_root: /srv/allinone-beta
     compose: { files: [docker-compose.beta.yml] }   # appended after the base files
-    retention: { keep_releases: 1 }
+    retention: { keep_releases: 3 }

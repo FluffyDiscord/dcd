@@ -492,7 +492,7 @@ fn resume_refuses_more_than_one_pending() {
 
 #[test]
 fn finalize_garbage_collects_evicted_images() {
-    let cfg = cfg(); // retention defaults: keep_releases 3
+    let cfg = cfg(); // retention defaults: keep_releases 1
     let runner = RecordingRunner::new()
         .with_stdout("inspect demo-postgres", "reg:db-1")
         .with_stdout("list-transports", "async");
@@ -527,7 +527,7 @@ fn a_tag_pulled_by_a_deploy_that_never_finalized_is_reclaimed_later() {
         let prod = state.stage_mut("prod");
         prod.record_pull("app", "reg:app-dead", 10);
     }
-    let cfg = cfg(); // keep_managed_images 2
+    let cfg = cfg(); // keep_managed_images 1
     let runner = RecordingRunner::new()
         .with_stdout("inspect demo-postgres", "reg:db-1")
         .with_stdout("list-transports", "async");
@@ -537,21 +537,10 @@ fn a_tag_pulled_by_a_deploy_that_never_finalized_is_reclaimed_later() {
     let interrupt = Interrupt::inert();
     let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, opts());
     engine.deploy().unwrap();
-    // reg:app-dead is now 2nd-newest for `app` (keep 2) -> still held as the previous version
-    assert!(!runner.display_calls().iter().any(|c| c == "docker image rm reg:app-dead"));
-
-    // a further deploy pushes it past the keep count -> reclaimed, and the ledger drops it
-    let mut state = engine.into_state();
-    state.stage_mut("prod").record_pull("app", "reg:app-2", 2000);
-    let cfg2 = config::load(cfg_src(), Some("prod"), &["docker.images.app=app-3".to_string()], &HashMap::new()).unwrap();
-    let runner2 = RecordingRunner::new()
-        .with_stdout("inspect demo-postgres", "reg:db-1")
-        .with_stdout("list-transports", "async");
-    let clock2 = FixedClock(3000);
-    let mut engine2 = Engine::new(cfg2, &runner2, &fs, &clock2, &reporter, &interrupt, state, opts());
-    engine2.deploy().unwrap();
-    assert!(runner2.display_calls().iter().any(|c| c == "docker image rm reg:app-dead"));
-    let after = engine2.into_state();
+    // keep_managed_images defaults to 1, so the tag the dead deploy left is past the keep
+    // count as soon as this deploy pulls its own -> reclaimed here, and the ledger drops it
+    assert!(runner.display_calls().iter().any(|c| c == "docker image rm reg:app-dead"));
+    let after = engine.into_state();
     let ledger: Vec<&str> = after.stage("prod").unwrap().pulled.iter().map(|p| p.tag.as_str()).collect();
     assert!(!ledger.contains(&"reg:app-dead"));
 }
@@ -608,7 +597,7 @@ fn gc_all_offers_only_host_tags_no_stage_records_and_names_each_survivors_rule()
 
 #[test]
 fn gc_without_all_proposes_recorded_tags_and_still_never_asks_the_host() {
-    let cfg = qualified_cfg(); // keep_managed_images 2
+    let cfg = qualified_cfg(); // keep_managed_images 1
     let runner = RecordingRunner::new();
     let fs = MemoryFs::new();
     let clock = FixedClock(1000);
@@ -623,7 +612,11 @@ fn gc_without_all_proposes_recorded_tags_and_still_never_asks_the_host() {
     }
     let engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, state, opts());
     let plan = engine.gc_plan(false).unwrap();
-    assert_eq!(plan.recorded, vec!["reg.example.com/demo:app-1".to_string()]);
+    // keep_managed_images defaults to 1 — the newest tag is the only one kept
+    assert_eq!(
+        plan.recorded,
+        vec!["reg.example.com/demo:app-2".to_string(), "reg.example.com/demo:app-1".to_string()]
+    );
     assert!(plan.orphans.is_empty());
     assert!(runner.display_calls().is_empty());
 }
@@ -654,10 +647,12 @@ fn a_removal_docker_refuses_keeps_its_ledger_row() {
     }
     let mut engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, state, opts());
     let plan = engine.gc_plan(false).unwrap();
-    assert_eq!(engine.gc(&plan).unwrap(), 0);
+    // at keep_managed_images 1 the plan is app-2 + app-1; docker refuses only app-1
+    assert_eq!(engine.gc(&plan).unwrap(), 1);
     let after = engine.into_state();
     let ledger: Vec<&str> = after.stage("prod").unwrap().pulled.iter().map(|p| p.tag.as_str()).collect();
     assert!(ledger.contains(&"reg.example.com/demo:app-1"));
+    assert!(!ledger.contains(&"reg.example.com/demo:app-2"));
 }
 
 /// A bare one-word repository is a Docker Hub library name; on a shared host those

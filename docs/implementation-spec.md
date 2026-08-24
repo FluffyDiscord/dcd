@@ -34,7 +34,7 @@
 | INV-3 | The black **release** is **recorded in state at cutover** (status `cutover_pending`) before `drain:red`. `finalize` flips it to `active` and advances `current`. A crash between cutover and finalize therefore leaves a recoverable, recorded live release (recovered by `dcd deploy --resume`). The only earlier state write is the pull ledger (INV-11); it adds no `releases`/`current` change of its own, so recovery reads what it would have read without it. |
 | INV-4 | The stage lock is a `flock(2)` advisory lock: the OS releases it on process exit **including SIGKILL**. SIGINT/SIGTERM are caught and run orderly cleanup (pre-cutover: remove black; release lock). A dead-holder lock is reclaimable. |
 | INV-5 | Rollback never runs migrations (ADR-005); it re-deploys the previous release's images. |
-| INV-6 | Rollback to the **immediately previous** release is available while `keep_releases ≥ 1`; its images are retained (never pruned). Deeper/repeated rollback is bounded by `keep_releases` + registry retention; §4 verifies the target's images exist before acting. |
+| INV-6 | Rollback to the **immediately previous** release is available while `keep_releases ≥ 1` (0 is rejected at load); its images are retained (never pruned). Retention spares `rollback_target()`'s release explicitly rather than relying on it falling inside `keep_releases` — after a same-tag redeploy the target sits outside that window, since `rollback_target` skips releases carrying the serving image. Deeper/repeated rollback is bounded by `keep_releases` + registry retention; §4 verifies the target's images exist before acting. |
 | INV-8 | If a stage declares `host:` and the machine hostname does not match, `dcd` refuses to act (exit `5`). |
 | INV-9 | If `state.current` is set but that container is **not running**, the upstream file is reset to `cutover.fallback_backend` **before** any managed-service recreate, so a recreated nginx never points at a dead container (self-heal; mirrors the original script). |
 | INV-10 | **At most one `cutover_pending` release exists at any time.** The cutover append (§7.8) demotes any pre-existing `cutover_pending` → `rolled_back` in the same atomic state write, so a crash during a recovery run can never leave two. `serving` is therefore unambiguous. |
@@ -297,7 +297,7 @@ workers:
     env_exclude: []
     volumes: ['${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log']
 
-retention: { keep_releases: 3, keep_managed_images: 2, keep_images: {} }  # releases + image versions retained
+retention: { keep_releases: 1, keep_managed_images: 1, keep_images: {} }  # releases + image versions retained
 
 plugins: [plugins/centrifugo.lua]      # optional Lua
 

@@ -53,7 +53,8 @@ directories: [ … ]         # optional — host paths to mkdir/chown before dep
 release: { … }             # required — the app: image, container_prefix, healthcheck, run, migrate?, drain?
 cutover: { … }             # required — backend_port + the nginx reload
 workers: { … }             # optional — background consumers
-retention: { … }           # optional — keep_releases (default 3), keep_managed_images (default 2),
+retention: { … }           # optional — keep_releases (default 1; 0 rejected), keep_managed_images
+                           #            (default 1, counts the tag in use),
                            #            keep_images (per-image override of keep_managed_images)
 plugins: [ … ]             # optional — Lua extension files
 hooks: { … }               # optional — zero-Lua before_/after_<step> actions
@@ -204,6 +205,7 @@ Validation rules (all reported by `check` with the offending path):
 | `execs in 'X' … not a declared service container` | `exec_in` names a container with no service | add a `docker.services` entry whose `container:` is `X` |
 | `healthcheck.cmd must reference {container}` | hardcoded host/alias in the probe | use `http://{container}:<port>/…` |
 | `retention.keep_images cannot set 'X': it is release.image` | per-image count on the release image | remove it; tune `keep_releases` instead |
+| `retention.keep_releases must be at least 1` | `keep_releases: 0` | use 1 or more; 0 leaves no local rollback target |
 | `retention.keep_images references image 'X' which no service or worker template uses` | count for an unmanaged image | drop the key, or give `X` a `docker.services` entry |
 | `not sweeping 'X'` / `no repository of P can be shown` (from `dcd gc --all`) | the repository is a Docker Hub name (`postgres`, `bitnami/postgresql`), not a registry host | expected for public images; set `registry:` to a repository you own so yours is swept |
 | `unknown field 'X'` | typo, or pre-`docker:` schema | nest under `docker:` / fix the key |

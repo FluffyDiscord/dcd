@@ -97,11 +97,43 @@ fn with_keep_images(entry: &str) -> String {
     )
 }
 
+/// Two paths reach a default: no `retention:` block at all (struct Default) and a
+/// block with the key omitted (the serde field default). A test that exercises only
+/// the first passes even if a field default is wrong, so both are asserted here.
+#[test]
+fn retention_defaults_to_one_release_and_one_managed_image() {
+    let bare = sample()
+        .replace("retention: { keep_releases: 3 }\n", "")
+        .replace("    retention: { keep_releases: 5 }\n", "");
+    let c = load(&bare, Some("prod"), &[], &env()).unwrap();
+    assert_eq!(c.retention.keep_releases, 1);
+    assert_eq!(c.retention.keep_managed_images, 1);
+
+    let only_images = bare.replace("stages:", "retention: { keep_managed_images: 4 }\nstages:");
+    let c = load(&only_images, Some("prod"), &[], &env()).unwrap();
+    assert_eq!(c.retention.keep_releases, 1);
+    assert_eq!(c.retention.keep_managed_images, 4);
+
+    let only_releases = bare.replace("stages:", "retention: { keep_releases: 4 }\nstages:");
+    let c = load(&only_releases, Some("prod"), &[], &env()).unwrap();
+    assert_eq!(c.retention.keep_releases, 4);
+    assert_eq!(c.retention.keep_managed_images, 1);
+}
+
+#[test]
+fn keep_releases_zero_is_rejected_so_a_rollback_target_always_survives() {
+    let bare = sample()
+        .replace("retention: { keep_releases: 3 }", "retention: { keep_releases: 0 }")
+        .replace("    retention: { keep_releases: 5 }\n", "");
+    let err = load(&bare, Some("prod"), &[], &env()).unwrap_err();
+    assert!(err.to_string().contains("keep_releases"), "{err}");
+}
+
 #[test]
 fn keep_images_overrides_a_managed_service_image() {
     let c = load(&with_keep_images("database: 1"), Some("prod"), &[], &env()).unwrap();
     assert_eq!(c.retention.keep_images["database"], 1);
-    assert_eq!(c.retention.keep_managed_images, 2); // untouched default for the rest
+    assert_eq!(c.retention.keep_managed_images, 1); // untouched default for the rest
 }
 
 #[test]

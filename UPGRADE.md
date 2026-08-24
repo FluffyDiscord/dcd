@@ -1,3 +1,39 @@
+UPGRADE FROM 0.5.0 to 0.5.1
+===========================
+
+**BREAKING DEFAULT CHANGE — a behaviour change shipped in a patch release.** Retention now
+keeps one previous release instead of three. Configs that already set `retention` explicitly
+are unaffected; everyone else keeps less history after upgrading.
+
+ * To keep the old behaviour, set it explicitly:
+
+   ```yaml
+   retention:
+     keep_releases: 3
+     keep_managed_images: 2
+   ```
+
+ * `retention.keep_releases` defaults to 1 (was 3), `retention.keep_managed_images` to 1
+   (was 2). Retention counts superseded releases *in addition to* the current one, so a
+   stage now holds **current + 1 previous = 2 release images**, down from current + 3 = 4
+
+ * `keep_managed_images` counts tags kept per managed image, newest first, **including the
+   one in use** — so 1 keeps the running tag and no previous version
+
+ * Rollback to the immediately previous release still works. INV-6 is now enforced directly:
+   retention spares the rollback target whatever `keep_releases` says. Before this release a
+   same-tag redeploy could put the real target outside the keep window and delete its image,
+   which `keep_releases: 1` would have made routine
+
+ * `retention.keep_releases: 0` is now rejected at `dcd check` — at 0 there is no local
+   rollback target at all and `dcd rollback` depends on the tag still being pullable
+
+ * **If you are upgrading because the disk is full, run `dcd gc <stage>` first.** A deploy
+   pulls its new image (step 3) long before it reclaims anything (step 12), so it needs
+   headroom before it frees any. `dcd gc` reclaims images only — evicted release containers
+   are reaped by the next deploy, and a tag a stopped container still pins is kept
+
+
 UPGRADE FROM 0.4 to 0.5
 =======================
 

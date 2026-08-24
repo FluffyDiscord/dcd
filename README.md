@@ -121,7 +121,7 @@ Routed through the engine, so they're **dry-run-safe** (and observable in `--dry
 
 ### `ctx` — data
 
-`cfg` and `state` are **live**: assign to them with plain Lua (`ctx.cfg.retention.keep_releases = 1`)
+`cfg` and `state` are **live**: assign to them with plain Lua (`ctx.cfg.retention.keep_releases = 5`)
 and the engine reads the change back before the next step — there is no setter function. The
 deploy then honors it: config for steps not yet run, state for what gets persisted. (Structural
 fields fixed at deploy start — `images`, the container name, `deploy_root` — are snapshots.)
@@ -169,19 +169,19 @@ Debian-slim and an Alpine flavour. The binary is statically linked, so either fl
 copied into any base image:
 
 ```dockerfile
-COPY --from=ghcr.io/fluffydiscord/dcd:0.5.0 /usr/local/bin/dcd /usr/local/bin/dcd
+COPY --from=ghcr.io/fluffydiscord/dcd:0.5.1 /usr/local/bin/dcd /usr/local/bin/dcd
 ```
 
 | Tag | What it points at |
 |-----|-------------------|
-| `0.5.0`, `0.5`, `latest` | Debian-slim, the release `v0.5.0` |
-| `0.5.0-alpine`, `0.5-alpine`, `latest-alpine` | Alpine, the same release |
+| `0.5.1`, `0.5`, `latest` | Debian-slim, the release `v0.5.1` |
+| `0.5.1-alpine`, `0.5-alpine`, `latest-alpine` | Alpine, the same release |
 | `edge`, `edge-alpine` | the current `master` |
 
 Tag a release to publish one:
 
 ```bash
-git tag v0.5.0 && git push origin v0.5.0
+git tag v0.5.1 && git push origin v0.5.1
 ```
 
 ## Build & test

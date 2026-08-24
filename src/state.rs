@@ -314,9 +314,18 @@ impl StageState {
     }
 
     /// Containers to evict on retention: superseded/rolled-back releases beyond
-    /// the newest `keep_releases`, never the serving or current one (INV-6).
+    /// the newest `keep_releases`, never the serving or current one, and never the
+    /// rollback target (INV-6).
+    ///
+    /// The rollback target is retained explicitly rather than assumed to fall inside
+    /// `keep_releases`: `rollback_target` skips releases carrying the serving image
+    /// (a no-op rollback), so after a same-tag redeploy the newest superseded release
+    /// is not the target. At `keep_releases: 1` that lands the real target outside the
+    /// keep window, and INV-6's guarantee — the target's image is never pruned — would
+    /// break for exactly the deploys that reuse a tag.
     pub fn evictions(&self, keep_releases: u32) -> Vec<String> {
         let serving = self.serving().map(|r| r.container.clone());
+        let rollback_container = self.rollback_target().map(|r| r.container.clone());
         let mut retained: Vec<&Release> = self
             .releases
             .iter()
@@ -328,6 +337,7 @@ impl StageState {
             .skip(keep_releases as usize)
             .map(|r| r.container.clone())
             .filter(|c| Some(c) != serving.as_ref() && Some(c.clone()) != self.current)
+            .filter(|c| Some(c) != rollback_container.as_ref())
             .collect()
     }
 
@@ -603,6 +613,22 @@ mod tests {
         mk(2, "db-a");
         mk(3, "db-b");
         assert_eq!(s.recorded_image_versions("database"), vec!["db-b".to_string(), "db-a".to_string()]);
+    }
+
+    /// INV-6 at the tightest setting: `rollback_target` skips releases carrying the
+    /// serving image, so after a same-tag redeploy the real target sits outside the
+    /// newest `keep_releases`. Retention must still spare it and its image.
+    #[test]
+    fn a_same_tag_redeploy_keeps_its_rollback_target_at_keep_one() {
+        let mut s = StageState::default();
+        s.releases.push(release(1, "c1", "imgA", ReleaseStatus::Superseded));
+        s.releases.push(release(2, "c2", "imgB", ReleaseStatus::Superseded));
+        s.releases.push(release(3, "c3", "imgB", ReleaseStatus::Active));
+        s.current = Some("c3".into());
+
+        assert_eq!(s.rollback_target().map(|r| r.container.as_str()), Some("c1"));
+        assert!(!s.evictions(1).contains(&"c1".to_string()));
+        assert!(!s.gc_candidates(&keep(1, 1), &[]).contains(&"imgA".to_string()));
     }
 
     #[test]
