@@ -1,8 +1,10 @@
 name: images
 
+# Tags only. A branch push publishes nothing: every image this repository ships is
+# addressable by an immutable version, so a consumer can never be silently moved onto
+# a different build.
 on:
   push:
-    branches: [master]
     tags: ['v*']
   workflow_dispatch:
 
@@ -82,13 +84,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # NO MOVING TAGS. `latest` is off permanently: metadata-action's `latest=auto`
+          # marks any non-prerelease semver as latest without comparing versions, so
+          # re-pushing an OLD tag silently repoints it at an older build - and anything
+          # pulling `latest` gets downgraded without a config change. `{{major}}.{{minor}}`
+          # and `edge` move for the same reason and are gone with it.
           flavor: |
-            latest=auto
-            suffix=${{ matrix.suffix }},onlatest=true
+            latest=false
+            suffix=${{ matrix.suffix }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=edge,enable={{is_default_branch}}
 
       - uses: docker/build-push-action@v6
         with:
