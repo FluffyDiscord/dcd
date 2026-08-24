@@ -169,7 +169,7 @@ Debian-slim and an Alpine flavour. The binary is statically linked, so either fl
 copied into any base image:
 
 ```dockerfile
-COPY --from=ghcr.io/fluffydiscord/dcd:0.5.2 /usr/local/bin/dcd /usr/local/bin/dcd
+COPY --from=ghcr.io/fluffydiscord/dcd:0.5.3 /usr/local/bin/dcd /usr/local/bin/dcd
 ```
 
 **Every tag is immutable and names one exact version — there is no `latest`, no `edge`, and
@@ -178,13 +178,13 @@ the version you want and change it deliberately.
 
 | Tag | What it points at |
 |-----|-------------------|
-| `0.5.2` | Debian-slim, the release `v0.5.2` |
-| `0.5.2-alpine` | Alpine, the same release |
+| `0.5.3` | Debian-slim, the release `v0.5.3` |
+| `0.5.3-alpine` | Alpine, the same release |
 
 Tag a release to publish one:
 
 ```bash
-git tag v0.5.2 && git push origin v0.5.2
+git tag v0.5.3 && git push origin v0.5.3
 ```
 
 ## Build & test

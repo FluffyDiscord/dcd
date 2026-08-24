@@ -1,7 +1,18 @@
-UPGRADE FROM 0.5.1 to 0.5.2
+UPGRADE FROM 0.5.1 to 0.5.3
 ===========================
 
 Bug fix, no configuration change. Retention now converges instead of repeating itself.
+
+**0.5.2 was withdrawn** — its images were deleted before anyone could consume them. It
+carried this same fix, but was tagged before `latest` was removed, so its build published
+moving tags. Use 0.5.3.
+
+ * **No moving tags.** `latest`, `latest-alpine`, `edge`, `edge-alpine` and the
+   `{{major}}.{{minor}}` tags are gone from the registry and can no longer be produced:
+   the publish workflow sets `latest=false`, emits only `{{version}}`, and runs on tag
+   pushes alone. `latest` marked whichever non-prerelease semver built last rather than
+   the newest, so pushing an old tag silently downgraded every consumer. Pin an exact
+   version — `ghcr.io/fluffydiscord/dcd:0.5.3`
 
  * Evicting a release removed its container and image but never marked the release row
    done, so `evictions`/`gc_candidates` re-derived the same long-dead work from
