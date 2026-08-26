@@ -83,10 +83,16 @@ impl SshTarget {
         let Some((host, port)) = self.target.rsplit_once(':') else {
             return (self.target.clone(), None);
         };
-        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
-            return (host.to_string(), Some(port.to_string()));
+        if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            return (self.target.clone(), None);
         }
-        (self.target.clone(), None)
+        // A bare IPv6 address is all colons: `2001:db8::1` would split into host
+        // `2001:db8:` and port `1`. Only the bracketed form carries a port.
+        let bracketed = host.ends_with(']');
+        if host.contains(':') && !bracketed {
+            return (self.target.clone(), None);
+        }
+        (host.to_string(), Some(port.to_string()))
     }
 
     fn options(&self) -> Vec<String> {
@@ -474,6 +480,24 @@ mod tests {
     }
 
 
+
+    /// A bare IPv6 address is all colons, so splitting on the last one invents a
+    /// port and truncates the host. Only the bracketed form carries a port.
+    #[test]
+    fn an_ipv6_target_is_not_split_into_a_port() {
+        let bare = SshTarget::new("2001:db8::1", PathBuf::from("/run/dcd/cm-%C"));
+        let argv = bare.invocation().display();
+        assert!(argv.contains("2001:db8::1"), "{argv}");
+        assert!(!argv.contains(" -p "), "a bare v6 address carries no port: {argv}");
+
+        let bracketed = SshTarget::new("[2001:db8::1]:2222", PathBuf::from("/run/dcd/cm-%C"));
+        let argv = bracketed.invocation().display();
+        assert!(argv.contains("-p 2222"), "{argv}");
+        assert!(argv.contains("[2001:db8::1]"), "{argv}");
+
+        let user = SshTarget::new("deploy@2001:db8::1", PathBuf::from("/run/dcd/cm-%C"));
+        assert!(!user.invocation().display().contains(" -p "), "{}", user.invocation().display());
+    }
 
     /// OpenSSH takes the port as a flag; a target chosen at run time cannot rely
     /// on an ssh_config Host alias to carry it.
