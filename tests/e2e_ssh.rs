@@ -40,6 +40,12 @@ fn docker(args: &[&str]) -> std::process::Output {
     Command::new("docker").args(args).output().expect("docker available")
 }
 
+/// For `Drop` only: a panic here would land during unwind from a failing
+/// assertion and abort the process, losing the failure it was reporting.
+fn docker_quietly(args: &[&str]) -> Option<std::process::Output> {
+    Command::new("docker").args(args).output().ok()
+}
+
 /// dcd resolves `ssh` through PATH and adds its own options, so shadowing the
 /// binary is the only way to hand a test's key and host-key policy to it. The
 /// shim also pins `BatchMode` — dcd already sets it, but the shim is what
@@ -67,6 +73,12 @@ fn write_ssh_shim(bin: &Path, config: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+/// The suite is about shell quoting; its own helper must not be the thing that
+/// breaks on a metacharacter.
+fn shell_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
 fn run(program: &str, args: &[&str]) {
@@ -111,10 +123,12 @@ impl Fixture {
         .unwrap();
         write_ssh_shim(&bin, &config);
 
-        let context = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ssh-deploy");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ssh-deploy");
+        let context = base.join("context");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::copy(source.join("Dockerfile"), context.join("Dockerfile")).unwrap();
         std::fs::copy(base.join("id_ed25519.pub"), context.join("authorized_key")).unwrap();
         run("docker", &["build", "-q", "-t", IMAGE, context.to_str().unwrap()]);
-        let _ = std::fs::remove_file(context.join("authorized_key"));
 
         let _ = docker(&["rm", "-f", CONTAINER]);
         run(
@@ -258,18 +272,42 @@ networks:
 
     fn on_target(&self, script: &str) -> String {
         let out = docker(&["exec", CONTAINER, "sh", "-c", script]);
+        assert!(
+            out.status.code().is_some(),
+            "docker exec did not run on the target: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// `grep -rl` exits 1 when it finds nothing and 2 when it could not look. Only
+    /// the first is a clean result — without the distinction the leak assertion
+    /// passes identically when the path is absent or the exec failed.
+    fn grep_on_target(&self, needle: &str, path: &str) -> Vec<String> {
+        let script = format!("grep -rl -- {} {}", shell_quote(needle), shell_quote(path));
+        let out = docker(&["exec", CONTAINER, "sh", "-c", &script]);
+        let code = out.status.code();
+        assert!(
+            matches!(code, Some(0) | Some(1)),
+            "grep could not search {path} (exit {code:?}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let containers = docker(&["ps", "-aq", "--filter", &format!("name=^{}", self.project)]);
-        for id in String::from_utf8_lossy(&containers.stdout).split_whitespace() {
-            docker(&["rm", "-f", id]);
+        if let Some(containers) = docker_quietly(&["ps", "-aq", "--filter", &format!("name=^{}", self.project)]) {
+            for id in String::from_utf8_lossy(&containers.stdout).split_whitespace() {
+                docker_quietly(&["rm", "-f", id]);
+            }
         }
-        docker(&["network", "rm", &format!("{}_net", self.project)]);
-        docker(&["rm", "-f", CONTAINER]);
+        docker_quietly(&["network", "rm", &format!("{}_net", self.project)]);
+        docker_quietly(&["rm", "-f", CONTAINER]);
         let _ = std::fs::remove_dir_all(self.workdir.parent().unwrap_or(Path::new("/nonexistent")));
     }
 }
@@ -310,7 +348,18 @@ fn it_009_and_it_016_a_full_red_black_deploy_runs_over_ssh() {
     assert_eq!(black.len(), 1, "the old release must be drained, got {black:?}");
     assert_ne!(black[0], red, "the second deploy must create a new container");
 
-    // INV-12: nothing dcd wrote on the target carries the value.
-    let leak = fx.on_target(&format!("grep -rl {SECRET} {DEPLOY_ROOT} 2>/dev/null"));
-    assert!(leak.trim().is_empty(), "secret at rest on the target: {leak}");
+    // INV-12: nothing dcd wrote on the target carries the value. The positive
+    // control is what proves the search works — otherwise "found nothing" and
+    // "never looked" are the same result.
+    let planted = format!("{DEPLOY_ROOT}/planted-control");
+    fx.on_target(&format!("printf %s {} > {planted}", shell_quote(SECRET)));
+    let control = fx.grep_on_target(SECRET, DEPLOY_ROOT);
+    assert!(
+        control.iter().any(|hit| hit.contains("planted-control")),
+        "the search cannot find a secret that IS there: {control:?}"
+    );
+    fx.on_target(&format!("rm -f {planted}"));
+
+    let leak = fx.grep_on_target(SECRET, DEPLOY_ROOT);
+    assert!(leak.is_empty(), "secret at rest on the target: {leak:?}");
 }
