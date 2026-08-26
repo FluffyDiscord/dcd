@@ -260,6 +260,8 @@ token is expanded everywhere afterwards, so `{project}-foo` namespaces per stage
 | `workers.service 'X' must not equal release.service` | one service used for both | declare a second compose service (same image is fine) |
 | `workers.name_prefix 'X' overlaps release container prefix` | prefixes collide | rename one; `--filter name=` is an unanchored match |
 | `release.healthcheck.cmd must reference {container}` | hardcoded host/alias in the probe | use `http://{container}:<port>/…` |
+| `flock is required on the target` / `base64 is required…` | a minimal target image without them | install `util-linux` / `coreutils` (busybox provides both) |
+| `state has more than one cutover_pending release` | corrupt state | `dcd unlock <stage>` accepts the newest and demotes the rest |
 | `directories path 'X' must be relative` / `must not contain '..'` | escaping path | make it relative to `deploy_root` |
 | `retention.keep_images cannot set 'X': it is release.service` | per-service count on the release | remove it; tune `keep_releases` |
 | `retention.keep_releases must be at least 1` | `keep_releases: 0` | use 1 or more; 0 leaves no local rollback target |
