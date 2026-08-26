@@ -1,0 +1,182 @@
+{
+  "name": "roadrunner_app",
+  "networks": {
+    "default": {
+      "name": "acme_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "app": {
+      "profiles": [
+        "dcd-release"
+      ],
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "TZ": "UTC"
+      },
+      "image": "reg.example.com:app-1",
+      "networks": {
+        "default": {
+          "aliases": [
+            "app-rr"
+          ]
+        }
+      },
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/acme/.docker/logs/symfony",
+          "target": "/usr/src/myapp/var/log",
+          "bind": {}
+        }
+      ]
+    },
+    "centrifugo": {
+      "command": [
+        "centrifugo",
+        "-c",
+        "/etc/centrifugo/config.json"
+      ],
+      "container_name": "acme-centrifugo",
+      "entrypoint": null,
+      "image": "centrifugo/centrifugo:v5",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/acme/.docker/centrifugo",
+          "target": "/etc/centrifugo",
+          "read_only": true,
+          "bind": {}
+        }
+      ]
+    },
+    "nginx": {
+      "command": null,
+      "container_name": "acme-nginx",
+      "entrypoint": null,
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "test",
+          "-f",
+          "/var/run/nginx.pid"
+        ],
+        "interval": "1s",
+        "retries": 30
+      },
+      "image": "reg.example.com:nginx-1",
+      "networks": {
+        "default": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 80,
+          "published": "80",
+          "protocol": "tcp"
+        }
+      ],
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/acme/nginx-upstream.conf",
+          "target": "/etc/nginx/conf.d/upstream.conf",
+          "read_only": true,
+          "bind": {}
+        }
+      ]
+    },
+    "postgres": {
+      "command": null,
+      "container_name": "acme-postgres",
+      "entrypoint": null,
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "app",
+          "-h",
+          "127.0.0.1"
+        ],
+        "interval": "1s",
+        "retries": 60
+      },
+      "image": "reg.example.com:db-1",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/acme/.docker/postgres",
+          "target": "/var/lib/postgresql/data",
+          "bind": {}
+        }
+      ]
+    },
+    "valkey": {
+      "command": null,
+      "container_name": "acme-valkey",
+      "entrypoint": null,
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "valkey-cli",
+          "ping"
+        ],
+        "interval": "1s",
+        "retries": 30
+      },
+      "image": "valkey/valkey:8-alpine",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/acme/.docker/valkey/data",
+          "target": "/data",
+          "bind": {}
+        }
+      ]
+    },
+    "worker": {
+      "profiles": [
+        "dcd-release"
+      ],
+      "command": null,
+      "entrypoint": [
+        "php",
+        "bin/console",
+        "messenger:consume"
+      ],
+      "environment": {
+        "TZ": "UTC"
+      },
+      "image": "reg.example.com:app-1",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/acme/.docker/logs/symfony",
+          "target": "/usr/src/myapp/var/log",
+          "bind": {}
+        }
+      ]
+    }
+  }
+}
