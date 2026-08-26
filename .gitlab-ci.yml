@@ -14,12 +14,13 @@ test:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
   before_script:
-    - apt-get update && apt-get install -y --no-install-recommends docker.io
+    - apt-get update && apt-get install -y --no-install-recommends docker.io openssh-client
     - rustup component add clippy
   script:
     - cargo clippy --all-targets -- -D warnings
     - cargo test --locked
     - DCD_E2E=1 cargo test --locked --test e2e -- --test-threads=1
+    - DCD_E2E=1 cargo test --locked --test ssh_shells -- --test-threads=1
   cache:
     key: $CI_COMMIT_REF_SLUG
     paths:
