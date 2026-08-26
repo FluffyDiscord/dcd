@@ -18,8 +18,11 @@ use dcd::effects::{Access, Argv, CommandRunner, RunOpts, SshRunner};
 use dcd::ssh::SshTarget;
 
 const IMAGE: &str = "dcd-ssh-shells";
-const CONTAINER: &str = "dcd-ssh-shells";
-const PORT: u16 = 22322;
+/// Per-test, not shared. Three tests in one binary running against one container
+/// name, one port and one scratch directory tear each other's fixtures down —
+/// `Fixture::start` opens by removing that directory and `docker rm -f`ing that
+/// name, so whichever test starts second deletes the first's key mid-run.
+const BASE_PORT: u16 = 22322;
 
 /// Each user's login shell. `sh` here is busybox, which is what most container
 /// images actually give you.
@@ -66,28 +69,36 @@ fn enabled() -> bool {
 
 struct Fixture {
     dir: PathBuf,
+    container: String,
+    port: u16,
 }
 
 impl Fixture {
-    fn start() -> Fixture {
-        let dir = std::env::temp_dir().join(format!("dcd-ssh-shells-{}", std::process::id()));
+    fn start(tag: &str, port_offset: u16) -> Fixture {
+        let container = format!("dcd-ssh-shells-{}-{tag}", std::process::id());
+        let port = BASE_PORT + port_offset;
+        let dir = std::env::temp_dir().join(&container);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
         let key = dir.join("id");
         run("ssh-keygen", &["-t", "ed25519", "-N", "", "-q", "-f", key.to_str().unwrap()]);
 
-        let context = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ssh-shells");
+        // Built from a private copy of the context: staging the key into the git
+        // working tree races the other fixtures and survives a failed build.
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ssh-shells");
+        let context = dir.join("context");
+        std::fs::create_dir_all(&context).expect("build context");
+        std::fs::copy(source.join("Dockerfile"), context.join("Dockerfile")).expect("stage the Dockerfile");
         std::fs::copy(dir.join("id.pub"), context.join("authorized_key")).expect("stage the key");
         run("docker", &["build", "-q", "-t", IMAGE, context.to_str().unwrap()]);
-        let _ = std::fs::remove_file(context.join("authorized_key"));
 
-        let _ = Command::new("docker").args(["rm", "-f", CONTAINER]).output();
+        let _ = Command::new("docker").args(["rm", "-f", &container]).output();
         run(
             "docker",
-            &["run", "-d", "--name", CONTAINER, "-p", &format!("{PORT}:22"), IMAGE],
+            &["run", "-d", "--name", &container, "-p", &format!("{port}:22"), IMAGE],
         );
-        Fixture { dir }
+        Fixture { dir, container, port }
     }
 
     /// dcd builds its own ssh argv, so the fixture key and host-key policy are
@@ -104,7 +115,7 @@ impl Fixture {
             )
             .expect("ssh config");
         }
-        SshTarget::new(format!("{user}@127.0.0.1:{PORT}"), self.dir.join("cm-%C")).with_config_file(config)
+        SshTarget::new(format!("{user}@127.0.0.1:{}", self.port), self.dir.join("cm-%C")).with_config_file(config)
     }
 
     fn wait_for_sshd(&self) {
@@ -124,7 +135,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = Command::new("docker").args(["rm", "-f", CONTAINER]).output();
+        let _ = Command::new("docker").args(["rm", "-f", &self.container]).output();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -145,7 +156,7 @@ fn every_login_shell_delivers_arguments_byte_identically() {
     if !enabled() {
         return;
     }
-    let fixture = Fixture::start();
+    let fixture = Fixture::start("args", 0);
     fixture.wait_for_sshd();
 
     for (user, shell) in SHELLS {
@@ -166,7 +177,7 @@ fn every_login_shell_delivers_env_values_without_argv_exposure() {
     if !enabled() {
         return;
     }
-    let fixture = Fixture::start();
+    let fixture = Fixture::start("env", 1);
     fixture.wait_for_sshd();
 
     let secret = "hunter2 $(id) `id` 'quoted' \"double\" ;rm -rf /";
@@ -199,7 +210,7 @@ fn a_missing_deploy_root_aborts_under_every_login_shell() {
     if !enabled() {
         return;
     }
-    let fixture = Fixture::start();
+    let fixture = Fixture::start("root", 2);
     fixture.wait_for_sshd();
 
     for (user, shell) in SHELLS {
