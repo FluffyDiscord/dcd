@@ -233,7 +233,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         stdin_document.as_deref(),
         &process_env,
     )?;
-    let cfg = config::load(&source, stage_of(&cli.command), &sets, &resolved.interpolation_env)?;
+    let mut cfg = config::load(&source, stage_of(&cli.command), &sets, &resolved.interpolation_env)?;
+    materialise_release_run(&mut cfg, &config_dir)?;
     let reporter = Reporter::auto(cli.json, cli.verbose);
 
     // Spec §2.7: over ~107 bytes ssh FAILS rather than degrading to an
@@ -307,12 +308,18 @@ fn dispatch_command(
         Command::Gc { all, .. } => gc(&cfg, cli, reporter, *all, resolved),
         Command::Tasks { .. } => tasks(&cfg, reporter),
         Command::Check { .. } => {
-            check_report(&cfg, reporter, resolved, chain_base, engine_fs(&cfg, cli, resolved).as_ref())?;
-            // Resolving the model is what proves every service reference and every
-            // health gate — the failure `check` exists to catch before a deploy
-            // touches anything.
-            resolve_compose_model(&cfg, cli, resolved)?;
+            check_report(&cfg, reporter, resolved, chain_base)?;
+            // Every failure `check` exists to catch, before a deploy touches
+            // anything: plugin sources load, the model resolves, every service
+            // reference exists, every health gate is declared.
+            let plugins = load_plugins(&cfg, &config_dir)?;
+            if !plugins.is_empty() {
+                LuaHost::load(&cfg, &plugins).map_err(DcdError::Lua)?;
+                reporter.log(&format!("plugins: {} loaded", plugins.len()));
+            }
+            let model = resolve_compose_model(&cfg, cli, resolved)?;
             reporter.log("compose: every referenced service exists and declares a health gate");
+            warn_compose_shape(&cfg, &model, reporter);
             Ok(())
         }
         Command::Init { .. } | Command::Schema => unreachable!("handled above"),
@@ -326,7 +333,6 @@ fn check_report(
     reporter: &Reporter,
     resolved: &crate::dotenv::ResolvedEnv,
     chain_base: Option<&Path>,
-    fs: &dyn FileSystem,
 ) -> Result<()> {
     for layer in &resolved.layers {
         reporter.log(&format!("env: loaded {} ({} keys)", layer.label, layer.values.len()));
@@ -358,13 +364,13 @@ fn check_report(
     let compose_keys: Vec<&str> = resolved.container_env.keys().map(String::as_str).collect();
     reporter.log(&format!("env: compose receives: [{}]", compose_keys.join(", ")));
 
-    // `deploy_root` is on the TARGET under ssh, so this has to go through the
-    // effects seam: probing the local path both misses the real stray file and
-    // false-positives on a workstation that happens to have the same directory.
+    // Local only. `deploy_root` is on the TARGET under ssh, and probing it would
+    // both address the wrong machine and make `check` — documented as opening no
+    // connection — pay a ConnectTimeout in a CI lint job with no ssh access.
     let stray = cfg.deploy_root.join(".env");
     let base_real = chain_base.and_then(|base| base.canonicalize().ok());
     let is_same_file = base_real.is_some() && stray.canonicalize().ok() == base_real;
-    if fs.exists(&stray).unwrap_or(false) && !is_same_file {
+    if cfg.ssh.is_none() && stray.exists() && !is_same_file {
         reporter.warn(&format!(
             "{} exists but is not part of dcd's chain — compose never reads it (dcd pins compose's --env-file to /dev/null)",
             stray.display()
@@ -599,6 +605,78 @@ fn prepare_control_directory() -> Result<()> {
         .map_err(|e| DcdError::Config(format!("cannot make {} private: {e}", dir.display())))
 }
 
+/// The §5.1/§7.0 shape warnings: everything dcd can see in the resolved model that
+/// will not fail until the deploy is already running. dcd uploads the compose
+/// DOCUMENTS and nothing they reference, and Docker answers a missing bind source
+/// by silently creating an empty directory — so a router whose config never
+/// arrived starts cleanly and serves nothing.
+fn warn_compose_shape(cfg: &Config, model: &ComposeModel, reporter: &Reporter) {
+    let release = cfg.release.service_name(&cfg.project);
+
+    // `compose config` absolutizes a relative bind source against the compose
+    // file's own directory — so what identifies one is that it resolves INSIDE the
+    // checkout. Those paths do not exist on the target, and Docker answers a
+    // missing bind source by silently creating an empty directory.
+    let checkout = std::env::current_dir().ok();
+    if cfg.ssh.is_some() {
+        if let Some(checkout) = &checkout {
+            for (name, service) in &model.services {
+                for source in service.bind_sources() {
+                    if !Path::new(&source).starts_with(checkout) {
+                        continue;
+                    }
+                    let relative = Path::new(&source).strip_prefix(checkout).unwrap_or(Path::new(&source));
+                    // dcd writes the upstream file itself, and `directories:` is
+                    // exactly the knob for "pre-create this on the target" — so
+                    // neither is a path the operator has been left to place.
+                    if relative == cfg.cutover.upstream_file {
+                        continue;
+                    }
+                    if cfg.directories.iter().any(|directory| relative.starts_with(&directory.path)) {
+                        continue;
+                    }
+                    reporter.warn(&format!(
+                        "{name} bind-mounts {}, which dcd does not upload — it must already exist under {} on the target, or Docker will silently mount an empty directory",
+                        relative.display(),
+                        cfg.deploy_root.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(service) = model.service(&release) {
+        if !service.ports.is_empty() {
+            reporter.warn(&format!(
+                "{release} declares ports: — the release is reached through {}, and a published port would collide between red and black",
+                cfg.cutover.service
+            ));
+        }
+        if !service.profiles.iter().any(|profile| cfg.compose.profiles.contains(profile)) {
+            reporter.warn(&format!(
+                "{release} declares no profile in {:?} — a hand-run `docker compose up` would start a second copy beside the release dcd deploys",
+                cfg.compose.profiles
+            ));
+        }
+    }
+
+    let upstream = cfg.deploy_root.join(&cfg.cutover.upstream_file);
+    let router = model.service(&cfg.cutover.service);
+    let mounts_upstream = router.is_some_and(|service| {
+        service
+            .bind_sources()
+            .iter()
+            .any(|source| upstream.ends_with(source.trim_start_matches("./")) || source.ends_with(&cfg.cutover.upstream_file.display().to_string()))
+    });
+    if !mounts_upstream {
+        reporter.warn(&format!(
+            "{} does not bind-mount {} — dcd writes the upstream file on the target, but only your compose file can put it inside the router",
+            cfg.cutover.service,
+            cfg.cutover.upstream_file.display()
+        ));
+    }
+}
+
 /// The escape hatch (spec §4.4): promote the stuck release and drop the stage lock —
 /// deliberately overriding a live flock, since the whole point is to unstick a deploy that
 /// will never release it. State and lock files only; loads no plugins, runs no Docker.
@@ -648,7 +726,12 @@ fn unlock(cfg: &Config, cli: &Cli, reporter: &Reporter, resolved: &crate::dotenv
         &interrupt,
         state,
         engine_options(cfg, cli, resolved),
-        resolve_compose_model(cfg, cli, resolved)?,
+        // Deliberately empty: spec §4.4 makes `unlock` a pure state repair that
+        // runs no Docker command, and `Engine::unlock` reads no container fact.
+        // Resolving the model here would run `docker compose config` and full
+        // model validation — locking the operator out of the escape hatch for
+        // exactly the compose drift that stranded the deploy.
+        ComposeModel::default(),
     );
     match engine.unlock()? {
         Some(container) => reporter.log(&format!("{stage}: {container} is now active and current")),
@@ -793,7 +876,7 @@ fn remote_hostname(target: &SshTarget) -> Result<String> {
     let argv = Argv::of(["sh", "-c", "hostname -f 2>/dev/null || hostname"]);
     let out = runner
         .run(&argv, Access::Read, &RunOpts::default())
-        .map_err(|e| DcdError::Config(format!("cannot reach {}: {e}", target.target())))?;
+        .map_err(|e| DcdError::Transport(format!("cannot reach {}: {e}", target.target())))?;
     Ok(out.stdout.trim().to_string())
 }
 
@@ -821,6 +904,24 @@ fn host_check(expected: Option<&str>, actual: &str, stage: &str) -> Result<()> {
 ///
 /// Its stdout is parsed and never traced: `compose config` inlines resolved env
 /// values, so printing it would dump the whole secret set (spec §8.2).
+/// `release.run` is the fallback for a project with no compose service for its app
+/// (spec §5.3). Rendering it into a real compose document and appending it to
+/// `compose.files` is what keeps ONE creation path: from here on the run-based
+/// release is indistinguishable from a declared service — it resolves in the
+/// model, uploads with `sync`, pulls, and is created by `compose run`.
+fn materialise_release_run(cfg: &mut Config, config_dir: &Path) -> Result<()> {
+    let Some(run) = cfg.release.run.clone() else {
+        return Ok(());
+    };
+    let service = cfg.release.service_name(&cfg.project);
+    let document = compose::render_run_document(&service, &run);
+    let path = config_dir.join(format!("dcd-release-run.{}.yml", cfg.stage));
+    std::fs::write(&path, document)
+        .map_err(|e| DcdError::Config(format!("cannot write {}: {e}", path.display())))?;
+    cfg.compose.files.push(path);
+    Ok(())
+}
+
 fn resolve_compose_model(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Result<ComposeModel> {
     let argv = compose::config_argv(&cfg.project, &cfg.compose.files, &cfg.compose.profiles);
     // The chain has to reach compose, or every `image: ${REGISTRY}:${APP_TAG}`
@@ -1007,7 +1108,7 @@ impl ConfigureHost<'_> {
 
 impl HookHost for ConfigureHost<'_> {
     fn run_host(&self, cmd: &str) -> std::result::Result<String, String> {
-        let full = format!("cd {} && {}", self.deploy_root.display(), cmd);
+        let full = format!("cd {} && {}", crate::ssh::quote(&self.deploy_root.display().to_string()), cmd);
         self.run_traced(Argv::of(["sh", "-c", &full]))
     }
 
@@ -1232,7 +1333,7 @@ mod tests {
         let resolved =
             crate::dotenv::resolve_documents(&documents, &config_env, Vec::new()).unwrap();
         let reporter = Reporter::capture(crate::ui::Mode::Plain);
-        check_report(&cfg, &reporter, &resolved, Some(Path::new(".")), &SystemFs).unwrap();
+        check_report(&cfg, &reporter, &resolved, Some(Path::new("."))).unwrap();
 
         let output = reporter.lines().join("\n");
         assert!(output.contains("APP_SECRET"), "key names are printed: {output}");
