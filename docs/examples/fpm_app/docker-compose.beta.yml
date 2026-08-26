@@ -2,7 +2,7 @@
 # (stages.beta.compose.files in dcd.yaml). Prod never loads it.
 #
 # Adds mailpit: a catch-all SMTP sink + web UI for the staging box. It is declared in
-# stages.beta.docker.services (dcd.yaml) so dcd starts it and keeps it across deploys, like the
+# stages.beta.services (dcd.yaml) so dcd starts it and keeps it across deploys, like the
 # other side services — no manual start. SMTP (1025) is INTENTIONALLY unauthenticated and reachable
 # only inside the beta-webapp_default network (never published, never relays off-box): it is a sink,
 # mail never leaves the machine. Only the web UI is published host-local (127.0.0.1) for the system
@@ -25,6 +25,10 @@ services:
 
   mailpit:
     image: axllent/mailpit:v1.21.8
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8025/livez"]
+      interval: 1s
+      retries: 30
     container_name: ${COMPOSE_PROJECT_NAME}-mailpit
     restart: unless-stopped
     environment:
@@ -33,3 +37,4 @@ services:
       MP_MAX_MESSAGES: "5000"      # in-memory sink; messages are not persisted across recreation
     ports:
       - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"   # UI only — the host nginx proxies /mailpit here
+

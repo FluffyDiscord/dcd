@@ -3,239 +3,217 @@
 #
 # Every option dcd understands is here, with a description and its default. Read
 # it top to bottom to learn the shape; it is NOT a starter — a real config only
-# sets what it customizes (see ../roadrunner_app/dcd.yaml for a lean, production one).
+# sets what it customizes (see ../roadrunner_app/ for a lean, production one).
+#
+# THE ORGANISING RULE: your compose file declares CONTAINERS; dcd declares
+# ORCHESTRATION. Images, env, volumes, restart policies, network aliases,
+# entrypoints and healthchecks all live in docker-compose.yml, where you were
+# already writing them. What is left here is what compose cannot express: which
+# service is cut over to, how traffic switches, migrations, drain, worker
+# discovery, recreate policy, retention and hooks.
+#
+# dcd runs on the DEPLOYING machine (a CI runner or a workstation) and reaches
+# the server over SSH. Nothing is installed there: the compose files travel from
+# your checkout, and dcd owns only dcd-state.json, the upstream file and the
+# generated image override.
 #
 # Conventions used below:
 #   • `# default: X`  — the line can be deleted to get X.
 #   • `${VAR}` / `${VAR:-fallback}` interpolate at load time from the RESOLVED
 #     ENVIRONMENT: the process env layered over the Symfony-style dotenv chain
 #     (.env → .env.local → .env.<stage> → .env.<stage>.local, later wins, real
-#     env wins over all files; cross-layer references resolve Symfony-8.1-style)
-#     read from the config file's directory (override: `--env-dir`; rebase the
-#     chain onto another base name with `--env-file .env.deploy` when the app
-#     owns `.env`; add a disk-free top layer from stdin with `--env-stdin`).
-#     Values containing ${...} must use block style, never flow `{ }`.
-#   • Every key DEFINED in a chain file is also delivered to the app/migrate/
-#     worker containers via process-env passthrough — nothing is written to
-#     disk; filter per container with env_include/env_exclude below. Keys that
-#     exist only in the process env are never delivered (commit a secret-free
-#     `.env` naming the keys; CI supplies values by exporting them).
-#   • Override at the command line with `--set docker.images.app=v2` (any path) or
-#     the shorthand `--image app=v2`.
-#
-# This file is valid: `dcd check prod` accepts it, `dcd deploy prod --dry-run`
-# prints the whole plan without touching anything.
+#     env wins over all files) read from the config file's directory (override:
+#     `--env-dir`; rebase with `--env-file .env.deploy`; add a disk-free top
+#     layer from stdin with `--env-stdin`).
+#   • Every key DEFINED in a chain file is delivered to the release, migrate and
+#     worker containers as a bare `-e KEY`, and to compose as process env —
+#     values never enter an argv, on either machine, and nothing is written to
+#     disk.
+#   • Override at the command line with `--set retention.keep_releases=5` (any
+#     path) or `--image <service>=<ref>`.
 
 
 # ── The basics ───────────────────────────────────────────────────────────────
-# Identity and where things run.
 
-version: 1             # config schema version — only 1 exists.   (default: 1)
-project: allinone      # names the deploy: compose project, state file, … (default: the deploy_root folder name)
-network: allinone_net  # the docker network every container joins.   (default: <project>_default)
-# Both are optional. Omit them and dcd derives project from the deploy_root folder and network as
-# <project>_default, and injects compose.env.COMPOSE_PROJECT_NAME. The {project} token is then expanded
-# everywhere — e.g. `container: '{project}-nginx'` namespaces per stage (prod vs beta on one host).
+version: 2             # config schema version. v1 configs are NOT accepted; see UPGRADE.md
+project: allinone      # names the deploy: compose project, state file, containers  (default: the deploy_root folder name)
 
-# registry + deploy_root are read from the environment when omitted, so CI almost
-# never sets them. Shown here only for completeness:
-registry: registry.example.com  # image prefix. default: $REGISTRY, then $CI_REGISTRY_IMAGE
-deploy_root: /srv/allinone      # where dcd runs on the server. default: $DEPLOY_ROOT, else "."
+# Where dcd reaches, and where it works once there.
+ssh: deploy@prod.example.internal   # a scalar: user@host, host, or an ~/.ssh/config Host alias.
+                                    # OMIT to drive a local Docker socket instead (default: none)
+                                    # Override per run with `--ssh <target>`.
+deploy_root: /srv/allinone          # absolute path ON THE TARGET   (default: $DEPLOY_ROOT, else ".")
+host: prod.example.internal         # refuse to run unless the TARGET's hostname matches (default: none)
 
-
-# ── docker: images + the containers beside the app ───────────────────────────
-# Everything container-related lives under `docker`: the images dcd pulls and
-# runs, and the long-lived "services" (database, router, cache) that sit next to
-# the app. Only the app (`release`, below) ever has traffic cut over to it.
-
-docker:
-
-  # Logical name → image tag. `release.image` and every `services.*.image` refer
-  # to these names; the pulled ref is "<registry>:<tag>". CI overrides a single
-  # tag with `--image app=<tag>` (which sets `docker.images.app`).
-  images:
-    app: ${APP_TAG:-v1.0.0}
-    database: postgres-16
-    web: nginx-1.27
-
-  # Long-lived side containers. dcd starts them, and recreates them per `recreate`,
-  # but never routes user traffic to them.
-  services:
-
-    # Recreated only when its image tag changes (the usual choice for a database).
-    postgres:
-      image: database               # a name from docker.images (omit if pinned in compose)
-      container: allinone-postgres   # its container_name — how dcd and exec_in reach it
-      recreate: on-image-change      # on-image-change | always | never   (default: on-image-change)
-      on_recreate_drain_workers: true  # stop workers before recreating this  (default: false)
-      wait:                          # readiness gate, polled after (re)create (optional)
-        exec_in: allinone-postgres   #   run the probe inside this container
-        cmd: 'pg_isready -U app -h 127.0.0.1'
-        retries: 60                  #   attempts before failing   (default: 60)
-        interval: 1s                 #   delay between attempts     (default: 1s — "250ms"/"2s"/"5m")
-
-    # A router whose image is pinned in compose, so dcd just keeps it running.
-    web:
-      image: web
-      container: allinone-web
-      wait: { exec_in: allinone-web, cmd: 'test -f /var/run/nginx.pid', retries: 30 }
-
-    # A cache with no managed image — only started and waited on.
-    cache:
-      container: allinone-cache
-      recreate: never
-      wait: { exec_in: allinone-cache, cmd: 'redis-cli ping' }
+registry: registry.example.com      # OPTIONAL, and used ONLY by `dcd gc --all` as the ownership proof
+                                    # for repositories it may prune. Images come from compose.
 
 
-# ── compose: how dcd drives `docker compose` ─────────────────────────────────
-# `env:` is injected into every compose command's process environment (compose
-# substitutes ${VAR} in compose files from it) — dcd writes NO env file, and it
-# pins compose's implicit `.env` discovery off with `--env-file /dev/null`.
+# ── compose: the files that declare your containers ──────────────────────────
 
 compose:
-  files: [docker-compose.prod.yml]  # -f files, in order (a stage may append more)
-  env:                              # process env for every compose call; may set COMPOSE_*
-    COMPOSE_PROJECT_NAME: allinone
-    REGISTRY: ${REGISTRY:-registry.example.com}
-    APP_TAG: ${APP_TAG:-v1.0.0}
+  files: [docker-compose.prod.yml]  # -f files, in order (a stage APPENDS more). Uploaded to
+                                    # deploy_root at the start of every deploy.
+  profiles: [dcd-release]           # profiles enabled when RESOLVING the model  (default: [dcd-release])
+                                    # A service carrying `profiles:` is invisible to dcd without this.
+                                    # NEVER passed to `up` — that would start the release as an
+                                    # ordinary container beside the one dcd is deploying.
+  env: {}                           # OPTIONAL per-key override. By default the whole resolved chain
+                                    # is passed to compose, so you do not re-list REGISTRY/APP_TAG/…
 
 
 # ── directories: host paths to pre-create ────────────────────────────────────
-# Ensured to exist (mkdir -p) before the deploy, optionally chowned/chmodded.
+# Ensured to exist on the TARGET before the deploy, optionally chowned/chmodded.
 # Useful for bind-mount targets that must exist before a container starts.
+# NOTE: dcd uploads the compose documents and nothing they reference — file
+# CONTENT for a bind mount must already be on the target.
 
 directories:                                     # default: [] (none)
   - { path: .docker/logs, owner: '1000:1000' }   # owner optional — "uid:gid"
   - { path: .docker/data, mode: '0750' }         # mode optional — octal string
-  - { path: .docker/cache }                       # path only
+  - { path: .docker/cache }                      # path only
+                                                 # Paths must be relative and may not contain '..'.
 
 
 # ── release: the app being deployed ──────────────────────────────────────────
-# dcd builds a fresh ("black") container next to the live ("red") one, waits for
-# the healthcheck, atomically cuts traffic over, then drains and removes red.
+# dcd creates a fresh ("black") container from your compose service next to the
+# live ("red") one, waits for its health gate, atomically cuts traffic over,
+# then drains and removes red.
 
 release:
-  image: app                      # a name from docker.images
-  container_prefix: allinone-app  # black containers are named "<prefix>-<timestamp>"
+  service: app                    # the compose service to deploy. Mark it `profiles: ["dcd-release"]`
+                                  # so a hand-run `docker compose up` does not start a second copy.
+  container_prefix: allinone-app  # black containers are "<prefix>-<timestamp>"  (default: {project}-{service})
 
-  run:                            # how the container is `docker run`
-    network_alias: app            # alias other containers reach it by      (optional)
-    restart: unless-stopped       # docker restart policy                   (default: unless-stopped)
-    env_file: app.env             # --env-file for `docker run`: an operator-managed host env-file
-                                  # (KEY=VALUE), resolved against deploy_root. Also fed to the
-                                  # migrate:before container. The dotenv chain usually replaces this;
-                                  # any delivered key overrides the same key in the file.
-                                  #                                          (optional, default: none)
-    env: { TZ: UTC }              # extra vars, delivered as bare `-e KEY` + process env — values
-                                  # never appear in argv or on disk         (default: none)
-    env_include: []               # full-match regexes: chain keys delivered (empty = all)
-    env_exclude: []               # full-match regexes: chain keys withheld; exclude wins
-    volumes:                      # -v bind mounts                          (default: none)
-      - '${DEPLOY_ROOT:-/srv/allinone}/.docker/logs:/var/log/app'
-
-  # Gates the cutover — dcd polls this until it succeeds. The probe runs inside a
-  # service container and targets the new container by name: {container} is filled
-  # in with it. NEVER point it at the network_alias, which still resolves to red.
+  # THE HEALTH GATE IS MANDATORY. By default it is the service's own compose
+  # `healthcheck:`, which dcd polls with `docker inspect`. `dcd check` refuses a
+  # release with no gate at all — an ungated cutover is the one failure red-black
+  # exists to prevent.
+  #
+  # Use this escape hatch instead when the image cannot probe itself (no curl/wget):
+  # the probe runs from ANOTHER service and must target the black by {container}.
   healthcheck:
-    exec_in: allinone-web
-    cmd: 'curl -sf http://{container}:8080/health'
-    retries: 60                   # attempts before aborting the deploy     (default: 60)
-    interval: 2s                  # delay between attempts                  (default: 2s)
+    exec_in: web                  # a compose SERVICE name; dcd resolves its container
+    cmd: 'curl -sf http://{container}:8080/health'   # {container} is required — never an alias:
+                                  # red and black share the service's network aliases, so an alias
+                                  # resolves to red and the probe passes falsely.
+    retries: 60                   # attempts before aborting the deploy   (default: 60)
+    interval: 2s                  # delay between attempts                (default: 2s)
 
   # Optional expand-contract migrations. `before` runs in a throwaway container
   # ahead of cutover (additive changes only); `after` runs in the new container
-  # once it is live (the contract step).
+  # once it is live (the contract step). The first word becomes the entrypoint.
   migrate:
     before: 'app migrate --phase before'
     after: 'app migrate --phase after'
 
   drain: 'app graceful-stop'      # run inside the OLD container before removing it  (optional)
 
+  # run: {...}                    # THE FALLBACK, for a project with no compose service for the app.
+                                  # Mutually exclusive with `service:`. It keeps every v1 field
+                                  # (image, network, network_alias, restart, entrypoint, command,
+                                  # env_file, env, env_include, env_exclude, volumes) and is rendered
+                                  # into a one-service compose document internally, so the engine
+                                  # keeps exactly one creation path.
+
 
 # ── cutover: the atomic traffic switch ───────────────────────────────────────
-# dcd writes the new backend into an nginx upstream file and reloads. The reload
-# returning 0 is the point of no return — everything after it is post-cutover.
+# dcd writes the new backend into an upstream file and reloads the router. The
+# reload returning 0 is the point of no return.
+#
+# The router must bind-mount {deploy_root}/{upstream_file} — only your compose
+# file can put it inside the container.
 
 cutover:
-  backend_port: 8080                     # the new container's port nginx points at
-  upstream_file: nginx-upstream.conf     # the file dcd writes, relative to deploy_root   (default: nginx-upstream.conf)
-  template: 'set $backend "{backend}";'  # what gets written; {backend} = "<container>:<port>"  (default: this)
-  fallback_backend: '127.0.0.1:8080'     # written when nothing is live yet               (default: 127.0.0.1:8080)
-  validate: { exec_in: allinone-web, cmd: 'nginx -t' }       # check config before reloading  (optional)
-  reload:   { exec_in: allinone-web, cmd: 'nginx -s reload' }  # apply the switch              (required)
+  service: web                           # the router, as a compose SERVICE name
+  backend_port: 8080                     # the new container's port the router points at
+  upstream_file: nginx-upstream.conf     # written relative to deploy_root       (default: this)
+  template: 'set $backend "{backend}";'  # {backend} = "<container>:<port>"      (default: this)
+  fallback_backend: '127.0.0.1:8080'     # written when nothing is live yet      (default: this)
+  validate: { exec_in: web, cmd: 'nginx -t' }        # check config before reloading  (optional)
+  reload:   { exec_in: web, cmd: 'nginx -s reload' } # apply the switch              (required)
+
+
+# ── services: policy for the containers beside the app ───────────────────────
+# POLICY ONLY. Names, images and readiness come from your compose file; declare
+# here only what compose cannot say. A service you never need to override does
+# not need an entry at all.
+#
+# EVERY service listed here MUST have a health gate — its own compose
+# `healthcheck:`, or a `wait:` probe below. `dcd check` fails otherwise, because
+# `compose up --wait` returns as soon as a container is RUNNING when it declares
+# no healthcheck, which would let dcd cut over to a database that is not ready.
+
+services:                                      # default: {} (none)
+  postgres:
+    recreate: on-image-change                  # on-image-change | always | never  (default: on-image-change)
+    on_recreate_drain_workers: true            # stop workers before recreating this  (default: false)
+  cache:
+    recreate: never
+    wait:                                      # readiness override for a service with no compose healthcheck
+      exec_in: cache                           #   a compose service   (default: the service being waited on)
+      cmd: 'redis-cli ping'
+      retries: 60                              #   attempts before failing   (default: 60)
+      interval: 1s                             #   delay between attempts    (default: 1s — "250ms"/"2s"/"5m")
 
 
 # ── workers: background queue consumers ──────────────────────────────────────
-# Optional. dcd discovers the worker set, renders one container per worker from
-# `template`, writes them to their own compose file, and (re)starts them after
-# cutover.
+# Optional. dcd discovers the worker set and runs ONE container per name from a
+# SINGLE compose service — no generated compose file.
 
 workers:
-  name_filter: 'worker-'        # prefix for discovered names + their containers  (default: worker-)
-  drain: 'app workers:stop'     # run inside each worker before stopping it        (optional)
-  stop_timeout: 120s            # `docker stop --timeout` when draining            (default: 120s)
-  compose_file: docker-compose.workers.yml  # where the rendered file is written   (default: docker-compose.workers.yml)
-
-  # The worker set comes from exactly ONE of these two:
-  provider:
-    command_in_release: 'app messenger:transports'  # prints one worker name per line, OR…
+  service: worker               # ONE compose service. MUST NOT be release.service: discovery is by
+                                # service label, so sharing it would make worker drain stop the
+                                # container serving traffic.
+  provider:                     # the worker set comes from exactly ONE of these:
+    command_in_release: 'app messenger:transports'   # prints one worker name per line, OR…
     # static: [default, mailer]                      # …a fixed, hand-written list
-    exclude: [failed]           # names to drop from whatever the provider returns  (default: none)
-
-  # Each discovered worker name is rendered into a container from this template.
-  template:
-    image: app                  # a name from docker.images
-    entrypoint: ['app', 'messenger:consume']
-    command: ['{name}', '--limit=100']  # {name} is replaced with each worker's name
-    stop_signal: SIGTERM        # signal sent on stop          (default: SIGTERM)
-    stop_grace_period: 120s     # grace before SIGKILL         (default: 120s)
-    restart: unless-stopped     # docker restart policy        (default: unless-stopped)
-    env: { TZ: UTC }            # extra vars; the generated compose file lists key NAMES only,
-                                # values ride the compose process env    (default: none)
-    env_include: []             # chain filters, as in release.run
-    env_exclude: []
-    volumes: []                 # -v bind mounts               (default: none)
+  exclude: [failed]             # names dropped from whatever the provider returns  (default: none)
+  args: ['--memory-limit=256M'] # appended after each worker name, overriding the service's
+                                # `command` while keeping its entrypoint            (default: none)
+  drain: 'app workers:stop'     # run inside each worker before stopping it         (optional)
+  name_prefix: 'worker-'        # container naming ONLY, never discovery  (default: worker-)
+                                # Must not overlap release.container_prefix.
+  stop_timeout: 120s            # `docker stop --timeout` when draining   (default: 120s)
+  stop_signal: SIGTERM          # `docker stop --signal`                  (default: SIGTERM)
 
 
 # ── retention: cleanup after a successful deploy ─────────────────────────────
 # dcd keeps a window of old releases (so rollback works) and prunes the rest,
 # along with the images they used. Every tag dcd pulls is recorded in
-# dcd-state.json before the pull, so a deploy that dies before it finishes still
-# leaves its image reclaimable. `dcd gc <stage>` runs this cleanup on its own;
-# `dcd gc <stage> --all` also offers tags found on the host that no stage records.
+# dcd-state.json before the pull, so a deploy that dies still leaves its image
+# reclaimable. `dcd gc <stage>` runs this cleanup on its own.
 
 retention:
   keep_releases: 1        # superseded / rolled-back containers to keep  (default: 1)
-  keep_managed_images: 1  # tags kept per managed image, newest first,     (default: 1)
+  keep_managed_images: 1  # tags kept per image, newest first,             (default: 1)
                           # INCLUDING the one in use — 1 keeps no previous version
-  keep_images:            # per-image override of keep_managed_images    (default: none)
-    database: 1           # keys are docker.images logicals used by a service or the
-                          # worker template; release.image is rejected — keep_releases
-                          # is the knob that bounds it
+  keep_images:            # per-SERVICE override of keep_managed_images  (default: none)
+    postgres: 2           # keys are compose service names; release.service is rejected —
+                          # keep_releases is the knob that bounds it
 
 
 # ── plugins: Lua extensions ──────────────────────────────────────────────────
-# Loaded at startup. They register tasks and before/after hooks, and can read AND
-# mutate `ctx.cfg` / `ctx.state` live (the deploy honors the change). See the Lua
-# reference in the README.
+# Read and executed on the DEPLOYING machine, in dcd's own process — nothing on
+# the target ever reads a .lua file. Paths resolve against THIS FILE's directory.
 
-plugins: [plugins/app.lua]  # files relative to deploy_root  (default: none)
+plugins: [plugins/app.lua]  # default: none
 
 
 # ── hooks: zero-Lua actions wired into the pipeline ──────────────────────────
-# Run shell / docker actions before or after any step — no plugin needed. The
-# steps, in order, are:
-#   preflight · ensure_upstream · pull · infra · migrate:before · start:black ·
-#   healthcheck · cutover · drain:red · migrate:after · workers · finalize
+# Run shell / docker actions before or after any step. The steps, in order, are:
+#   sync · preflight · ensure_upstream · pull · infra · migrate:before ·
+#   start:black · healthcheck · cutover · drain:red · migrate:after · workers ·
+#   finalize
 # A slot key is `before_<step>` or `after_<step>`, with ':' written as '_'
 # (e.g. after_healthcheck, before_migrate_before).
 
 hooks:                                       # default: {} (none)
   before_pull:
-    - 'echo deploying ${APP_TAG:-v1.0.0}'    # a bare string runs on the host, in deploy_root
+    - 'echo deploying'                       # a bare string runs on the target, in deploy_root
   after_healthcheck:
-    - exec_in_release: 'app cache:warm'                          # run inside the new container
-    - exec_in: { service: allinone-web, cmd: 'nginx -s reload' } # run inside a service container
+    - exec_in_release: 'app cache:warm'                    # run inside the new container
+    - exec_in: { service: web, cmd: 'nginx -s reload' }    # run inside a service container
     - cp_from_release: { from: /tmp/out.json, to: .docker/out.json }  # copy a file out of the app
     - cp_to_release:   { from: .docker/in.json, to: /tmp/in.json }    # copy a file into the app
     - docker:  ['image', 'prune', '-f']      # a raw `docker …` call
@@ -245,12 +223,12 @@ hooks:                                       # default: {} (none)
 # ── stages: named deploy targets ─────────────────────────────────────────────
 # Pick one with `dcd deploy <stage>`. The chosen stage is deep-merged over
 # everything above: scalars replace, maps merge, and `compose.files` append.
-# `host:` may also be set at the top level to guard every stage at once.
 
 stages:
-  prod:
-    host: prod.example.internal   # dcd refuses to run unless `hostname` matches  (optional)
+  prod: {}
   beta:
+    ssh: deploy@beta.example.internal
+    host: beta.example.internal
     deploy_root: /srv/allinone-beta
     compose: { files: [docker-compose.beta.yml] }   # appended after the base files
     retention: { keep_releases: 3 }

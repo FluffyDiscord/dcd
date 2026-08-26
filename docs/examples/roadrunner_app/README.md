@@ -1,18 +1,20 @@
 # Wiring `dcd` into an existing deploy
 
-This replaces a hand-rolled deploy script with `dcd` + [`dcd.yaml`](dcd.yaml). The build stage is
-unchanged (it still produces the app / database / nginx images); only the **deploy**
-stage changes — it ships the `dcd` binary + `dcd.yaml` and runs `dcd deploy prod`.
+This replaces a hand-rolled deploy script with `dcd` + [`dcd.yaml`](dcd.yaml) and
+[`docker-compose.prod.yml`](docker-compose.prod.yml). The build stage is unchanged (it still
+produces the app / database / nginx images); the **deploy** stage becomes a single
+`dcd deploy prod` from the checkout — dcd runs on the CI runner and drives the server over
+SSH, so nothing is copied there by hand.
 
 ## What maps to what
 
 | the original script did | `dcd` does |
 |---------------------|------------|
 | red-black `docker run` + nginx-upstream cutover | the built-in `docker-redblack` recipe |
-| conditional postgres/nginx recreate on image change | `docker.services.*.recreate: on-image-change` |
-| drain workers before DB recreate | `docker.services.postgres.on_recreate_drain_workers: true` |
+| conditional postgres/nginx recreate on image change | `services.*.recreate: on-image-change` (the default) |
+| drain workers before DB recreate | `services.postgres.on_recreate_drain_workers: true` |
 | `app:db:migrate before/after` | `release.migrate.before/after` |
-| `app:worker:list` → workers compose | `workers.provider.command_in_release` + `template` |
+| `app:worker:list` → workers compose | `workers.provider.command_in_release` + one `worker` compose service |
 | `app:realtime:config` + `docker cp` + start | the `hooks.after_healthcheck` block |
 | `bin/graceful-stop.sh` graceful drain | `release.drain` |
 | `docker image prune -a` (deleted rollback targets!) | state-based retention — **fixed**, plus `dcd rollback` |
@@ -31,39 +33,36 @@ deploy:
     - eval $(ssh-agent -s)
     - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+    - ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
   script:
-    # Fetch the dcd binary built by the docker-compose-deployer pipeline
-    # (GitLab job artifact / package registry / release — pick your source):
+    # Fetch the dcd binary — it runs HERE, on the runner, not on the server.
     - 'curl -fsSL -o dcd "$DCD_BINARY_URL" && chmod +x dcd'
 
     - ssh $SSH_USER@$SSH_HOST -p $SSH_PORT
         "docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
-    - ssh $SSH_USER@$SSH_HOST -p $SSH_PORT "mkdir -p $DEPLOY_ROOT"
 
-    - scp -P $SSH_PORT dcd            $SSH_USER@$SSH_HOST:$DEPLOY_ROOT/dcd
-    - scp -P $SSH_PORT dcd.yaml       $SSH_USER@$SSH_HOST:$DEPLOY_ROOT/dcd.yaml
-    - scp -P $SSH_PORT docker-compose.prod.yml $SSH_USER@$SSH_HOST:$DEPLOY_ROOT/docker-compose.prod.yml
-    - scp -P $SSH_PORT bin/graceful-stop.sh $SSH_USER@$SSH_HOST:$DEPLOY_ROOT/bin/graceful-stop.sh
-    - ssh $SSH_USER@$SSH_HOST -p $SSH_PORT "chmod +x $DEPLOY_ROOT/dcd"
-
-    - ssh $SSH_USER@$SSH_HOST -p $SSH_PORT
-        "cd $DEPLOY_ROOT &&
-         REGISTRY=$CI_REGISTRY/$CI_PROJECT_PATH
-         DEPLOY_ROOT=$DEPLOY_ROOT
-         MAXMIND_ACCOUNT_ID=$MAXMIND_ACCOUNT_ID
-         MAXMIND_LICENSE_KEY=$MAXMIND_LICENSE_KEY
-         ./dcd deploy prod
-           --image app=$DOCKER_IMAGE_TAG_APP
-           --image database=$DOCKER_IMAGE_TAG_DATABASE
-           --image nginx=$DOCKER_IMAGE_TAG_NGINX"
+    - export DEPLOY_SSH="$SSH_USER@$SSH_HOST"
+    - ./dcd deploy prod --yes --image app=$DOCKER_IMAGE_TAG_APP
 
     - ssh $SSH_USER@$SSH_HOST -p $SSH_PORT "rm ~/.docker/config.json 2>/dev/null || true"
 ```
 
-`dcd.yaml` lives in the repo and is `scp`-ed each deploy. The same CI variables as before
-are reused (`SSH_*`, `DEPLOY_ROOT`, `MAXMIND_*`, the registry vars). `--image …=$DOCKER_IMAGE_TAG_*`
-threads in the tags the build stage produced.
+No `scp`, no `mkdir`, no `chmod +x` on the server, and no remote `cd`. `dcd.yaml` and
+`docker-compose.prod.yml` live in the repo and are uploaded by the `sync` step at the start of
+every deploy. `deploy_root` is created if missing.
+
+**Note the shape of the secrets.** The old pipeline put `MAXMIND_LICENSE_KEY=…` on the remote
+`ssh` command line, which exposed it in the server's process list. dcd reads the dotenv chain
+next to `dcd.yaml` and streams the values over ssh **stdin**, so no value appears in any argv on
+either machine. Keep a secret-free `.env` in the repo naming the keys and let CI export the
+values, or pipe a document with `--env-stdin`.
+
+`--image app=$DOCKER_IMAGE_TAG_APP` names a **compose service** and pins that exact image ref
+for the release; the database and nginx tags come from the compose file's own `${…}` variables,
+which dcd passes through from the resolved chain.
+
+Use a non-default ssh port or a jump host by putting it in `~/.ssh/config` and setting
+`DEPLOY_SSH` to the `Host` alias — dcd does not re-implement ssh configuration.
 
 ## Operating it
 
@@ -77,12 +76,22 @@ dcd deploy prod --dry-run # print the whole plan, touch nothing
 
 ## Notes
 
-- `docker-compose.prod.yml` is unchanged; `compose.env` values ride the compose process
-  environment (no file is written), and the generated workers compose file carries env key
-  names only. Exporting the vars over ssh (as above) works because the process env is the
-  top layer of dcd's dotenv chain; a `.env.prod.local` next to `dcd.yaml` — or
-  `--env-stdin` — replaces the inline exports if preferred.
-- The `nginx` prod image must still `include` the upstream file `dcd` writes
-  (`nginx-upstream.conf`) — that wiring already exists in acme's nginx config.
-- Add `host: <prod-hostname>` under `stages.prod` to make `dcd` refuse to run on the
-  wrong machine.
+- **`docker-compose.prod.yml` now declares the app and its workers too**, each with
+  `profiles: ["dcd-release"]` so a hand-run `docker compose up` never starts a second copy
+  beside the release. dcd creates them with `docker compose run` and addresses them by name
+  afterwards.
+- **Every service dcd manages declares a `healthcheck:`** — that is mandatory, and `dcd check`
+  fails without it. Without a gate, `compose up --wait` returns as soon as a container is
+  *running*, so the deploy could cut over to a database that has not finished starting.
+  The app itself is the exception here: its image carries no probe, so `release.healthcheck`
+  runs `curl` from the nginx container against the new container by name.
+- The nginx service must bind-mount the upstream file dcd writes
+  (`${DEPLOY_ROOT}/nginx-upstream.conf`) — dcd writes it on the target, but only the compose
+  file can put it inside the router.
+- **dcd uploads the compose documents and nothing they reference.** Bind-mount sources and
+  `env_file:` targets must already exist on the target; the `directories:` block creates the
+  directories, but not their contents. `dcd check` warns, naming each path.
+- Values from the dotenv chain reach the containers as bare `-e KEY`, with the values
+  travelling over ssh stdin — nothing is written to disk on either machine.
+- `host: <prod-hostname>` under `stages.prod` makes dcd refuse to run unless the **target**
+  reports that name. It is worth more now than it was: an ssh alias can be repointed.
