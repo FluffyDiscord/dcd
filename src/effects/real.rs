@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{enforce_check, Access, Argv, Clock, CmdOutput, CommandRunner, FileSystem, RunError, RunOpts};
+use crate::ssh::SshTarget;
 
 /// Spawns every child with the chain runner env and `deploy_root` as its cwd
 /// (spec §5.2.4); per-command `RunOpts::env` overlays win over the runner env.
@@ -17,6 +18,13 @@ pub struct SystemRunner {
 impl SystemRunner {
     pub fn with_context(env: BTreeMap<String, String>, cwd: PathBuf) -> Self {
         SystemRunner { env, cwd: Some(cwd) }
+    }
+
+    /// The resolved chain, but in dcd's OWN working directory: `docker compose
+    /// config` reads the compose files from the checkout, on this machine, while
+    /// still needing the chain to interpolate `${REGISTRY}` and friends.
+    pub fn with_env(env: BTreeMap<String, String>) -> Self {
+        SystemRunner { env, cwd: None }
     }
 }
 
@@ -37,12 +45,7 @@ impl CommandRunner for SystemRunner {
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
-        let output = command
-            .output()
-            .map_err(|source| RunError::Spawn {
-                argv: argv.display(),
-                source,
-            })?;
+        let output = run_with_stdin(command, argv, opts.stdin.as_deref())?;
 
         let out = CmdOutput {
             code: output.status.code().unwrap_or(-1),
@@ -51,6 +54,42 @@ impl CommandRunner for SystemRunner {
         };
         enforce_check(argv, out, opts)
     }
+}
+
+/// Spawns a child, optionally piping bytes to its stdin, and waits for it. The
+/// stdin write happens on this thread between spawn and wait: the payloads dcd
+/// sends (an env document, a compose file) are far below a pipe buffer, and a
+/// child that never reads its stdin still gets EOF when the handle drops.
+fn run_with_stdin(
+    mut command: Command,
+    argv: &Argv,
+    stdin: Option<&[u8]>,
+) -> Result<std::process::Output, RunError> {
+    let Some(payload) = stdin else {
+        return command.output().map_err(|source| RunError::Spawn {
+            argv: argv.display(),
+            source,
+        });
+    };
+
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| RunError::Spawn {
+            argv: argv.display(),
+            source,
+        })?;
+    if let Some(mut pipe) = child.stdin.take() {
+        let _ = pipe.write_all(payload);
+    }
+    child.wait_with_output().map_err(|source| RunError::Spawn {
+        argv: argv.display(),
+        source,
+    })
 }
 
 pub struct SystemFs;
@@ -74,8 +113,8 @@ impl FileSystem for SystemFs {
         fs::read(path)
     }
 
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
+    fn exists(&self, path: &Path) -> std::io::Result<bool> {
+        Ok(path.exists())
     }
 
     fn remove(&self, path: &Path) -> std::io::Result<()> {
@@ -114,6 +153,173 @@ fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Runs every command on the target through one multiplexed ssh connection
+/// (ADR-014). The env overlay does NOT cross the wire as a process env — it is
+/// rendered into a document on stdin and sourced there, so no value ever reaches
+/// an argv on either machine (INV-12).
+pub struct SshRunner {
+    target: SshTarget,
+    env: BTreeMap<String, String>,
+    deploy_root: PathBuf,
+}
+
+impl SshRunner {
+    pub fn new(target: SshTarget, env: BTreeMap<String, String>, deploy_root: PathBuf) -> Self {
+        SshRunner {
+            target,
+            env,
+            deploy_root,
+        }
+    }
+
+    pub fn target(&self) -> &SshTarget {
+        &self.target
+    }
+
+}
+
+impl CommandRunner for SshRunner {
+    fn run(&self, argv: &Argv, _access: Access, opts: &RunOpts) -> Result<CmdOutput, RunError> {
+        let mut delivered = self.env.clone();
+        if let Some(overlay) = &opts.env {
+            delivered.extend(overlay.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        let script = self.target.script_for(argv, Some(&self.deploy_root), &delivered);
+        let out = self.send(&script, argv)?;
+        enforce_check(argv, out, opts)
+    }
+}
+
+impl SshRunner {
+    /// One ssh invocation, script on stdin. Nothing here is quoted for the login
+    /// shell, because the login shell only ever sees the word `sh`.
+    fn send(&self, script: &[u8], argv: &Argv) -> Result<CmdOutput, RunError> {
+        let invocation = self.target.invocation();
+        let (program, args) = invocation.0.split_first().expect("the invocation always starts with ssh");
+        let mut command = Command::new(program);
+        command.args(args);
+        let output = run_with_stdin(command, &invocation, Some(script))?;
+
+        let out = CmdOutput {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        };
+
+        // ssh exits 255 for its OWN failures — auth, DNS, a dropped connection.
+        // Reporting that as an ordinary non-zero would let the engine classify a
+        // severed link as an application failure, and the best-effort call sites
+        // would swallow it and keep issuing commands (spec §2.7).
+        if out.code == 255 && out.stdout.is_empty() {
+            return Err(RunError::NonZero {
+                argv: argv.display(),
+                code: 255,
+                stdout: out.stdout,
+                stderr: format!(
+                    "connection to {} lost or refused: {}",
+                    self.target.target(),
+                    out.stderr.trim()
+                ),
+            });
+        }
+        Ok(out)
+    }
+
+    /// A file operation, as a script with its payload embedded. Uploads cannot use
+    /// a second stdin stream — stdin already carries the script, and a shell
+    /// reading a script from a pipe does not hand the remainder to the command it
+    /// runs (verified) — so bytes ride as base64 inside the script itself.
+    fn file_op(&self, script: String) -> Result<CmdOutput, RunError> {
+        self.send(script.as_bytes(), &Argv::of(["sh"]))
+    }
+}
+
+/// The five file operations dcd owns, as commands on the target. Writes are
+/// always staged and renamed: `persist_state` is the INV-3 write, and a torn
+/// `dcd-state.json` would fail every later command on that stage, `unlock`
+/// included.
+pub struct SshFs {
+    runner: SshRunner,
+}
+
+impl SshFs {
+    pub fn new(runner: SshRunner) -> Self {
+        SshFs { runner }
+    }
+
+    fn run(&self, script: String) -> std::io::Result<CmdOutput> {
+        self.runner
+            .file_op(script)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn checked(&self, script: String, what: &str) -> std::io::Result<()> {
+        let out = self.run(script)?;
+        if out.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!("{what}: {}", out.stderr.trim())))
+    }
+}
+
+impl FileSystem for SshFs {
+    fn write(&self, path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+        self.checked(crate::ssh::write_file_script(&path.display().to_string(), bytes, mode), "write")
+    }
+
+    /// `MISSING` distinguishes "the target says it is not there" from every other
+    /// way the command can fail. Without it a dropped connection reads as a missing
+    /// file, and `load_state` treats a live stage as a fresh one.
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        let quoted = crate::ssh::quote(&path.display().to_string());
+        let out = self.run(format!("if [ -e {quoted} ]; then exec cat {quoted}; else exit {MISSING}; fi\n"))?;
+        if out.code == MISSING {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.display().to_string(),
+            ));
+        }
+        if !out.success() {
+            return Err(std::io::Error::other(format!(
+                "cannot read {} (exit {}): {}",
+                path.display(),
+                out.code,
+                out.stderr.trim()
+            )));
+        }
+        Ok(out.stdout.into_bytes())
+    }
+
+    fn exists(&self, path: &Path) -> std::io::Result<bool> {
+        let quoted = crate::ssh::quote(&path.display().to_string());
+        let out = self.run(format!("if [ -e {quoted} ]; then exit 0; else exit {MISSING}; fi\n"))?;
+        match out.code {
+            0 => Ok(true),
+            MISSING => Ok(false),
+            code => Err(std::io::Error::other(format!(
+                "cannot test {} (exit {}): {}",
+                path.display(),
+                code,
+                out.stderr.trim()
+            ))),
+        }
+    }
+
+    fn remove(&self, path: &Path) -> std::io::Result<()> {
+        let quoted = crate::ssh::quote(&path.display().to_string());
+        self.checked(format!("exec rm -f {quoted}\n"), "remove")
+    }
+
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        let quoted = crate::ssh::quote(&path.display().to_string());
+        self.checked(format!("exec mkdir -p {quoted}\n"), "mkdir")
+    }
+}
+
+/// The exit status `SshFs` reserves for "the path is not there", so it is never
+/// confused with a transport failure or a shell that could not run.
+const MISSING: i32 = 66;
+
 pub struct SystemClock;
 
 impl Clock for SystemClock {
@@ -146,7 +352,7 @@ mod tests {
         let overlay: BTreeMap<String, String> =
             [("DCD_TEST_SHARED".to_string(), "from-overlay".to_string())].into_iter().collect();
         let out = runner
-            .run(&argv, Access::Read, &RunOpts { check: true, env: Some(overlay) })
+            .run(&argv, Access::Read, &RunOpts { check: true, env: Some(overlay), stdin: None })
             .unwrap();
 
         let lines: Vec<&str> = out.stdout.lines().collect();
