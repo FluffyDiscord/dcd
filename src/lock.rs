@@ -32,6 +32,11 @@ pub enum StageLock {
 pub struct LeasedLock {
     stage: String,
     child: Option<std::process::Child>,
+    /// Shared with the heartbeat thread so `Drop` can close the write end. Owning
+    /// it solely in the thread made the documented EOF release dead code: `Drop`
+    /// found `child.stdin` already `None`, and `wait()` then blocked until the
+    /// thread woke from its sleep — trading a 51 ms release for a 10 s stall.
+    channel: std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>>,
     beating: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -44,8 +49,12 @@ impl std::fmt::Debug for LeasedLock {
 impl Drop for LeasedLock {
     fn drop(&mut self) {
         self.beating.store(false, std::sync::atomic::Ordering::Relaxed);
+        // EOF: the remote holder's `read` returns, the shell exits, the kernel
+        // drops the flock. Closing the channel is what makes that immediate.
+        if let Ok(mut channel) = self.channel.lock() {
+            drop(channel.take());
+        }
         if let Some(mut child) = self.child.take() {
-            drop(child.stdin.take()); // EOF: the remote holder exits, the kernel drops the lock
             let _ = child.wait();
         }
     }
@@ -118,7 +127,7 @@ impl LeasedLock {
                 Err(_) => (None, String::new()),
             };
             return match code {
-                Some(255) => Err(DcdError::Config(format!(
+                Some(255) => Err(DcdError::Transport(format!(
                     "cannot reach {} to take the {stage} lock: {stderr}",
                     target.target()
                 ))),
@@ -135,13 +144,27 @@ impl LeasedLock {
         LeasedLock::write_holder(target, deploy_root, stage, holder);
 
         let beating = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let channel = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            child.stdin.take().expect("stdin is piped"),
+        )));
         let ticking = beating.clone();
+        let beating_channel = channel.clone();
         std::thread::spawn(move || {
             use std::io::Write;
+            // Slept in slices so the thread notices a dropped lock promptly instead
+            // of holding the channel open for a whole heartbeat after the run ends.
+            let slice = std::time::Duration::from_millis(200);
+            let slices = LeasedLock::heartbeat_seconds() * 5;
             while ticking.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_secs(LeasedLock::heartbeat_seconds()));
-                if !ticking.load(std::sync::atomic::Ordering::Relaxed) || writeln!(stdin).is_err() {
+                for _ in 0..slices {
+                    if !ticking.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(slice);
+                }
+                let Ok(mut guard) = beating_channel.lock() else { return };
+                let Some(stdin) = guard.as_mut() else { return };
+                if writeln!(stdin).is_err() {
                     return;
                 }
                 let _ = stdin.flush();
@@ -151,6 +174,7 @@ impl LeasedLock {
         Ok(StageLock::Leased(LeasedLock {
             stage: stage.to_string(),
             child: Some(child),
+            channel,
             beating,
         }))
     }
