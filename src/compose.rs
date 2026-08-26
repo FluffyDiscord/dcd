@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::effects::Argv;
 use crate::error::{DcdError, Result};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ComposeModel {
     #[serde(default)]
     pub services: IndexMap<String, ComposeService>,
@@ -185,6 +185,71 @@ impl ComposeService {
     }
 }
 
+/// Renders `release.run` (spec §5.3) into a one-service compose document, so a
+/// project with no compose service for its app still travels the SAME creation
+/// path as every other release — `compose run` against a declared service. The
+/// alternative was a second `docker run` path and a second chance to drift from
+/// the red-black invariants.
+///
+/// Env is deliberately absent: values reach the container as bare `-e KEY` from
+/// the resolved chain (INV-12), and writing them here would put them on disk.
+pub fn render_run_document(service: &str, run: &crate::config::RunSpec) -> String {
+    let mut document = serde_yaml::Mapping::new();
+    let mut definition = serde_yaml::Mapping::new();
+
+    let key = |name: &str| serde_yaml::Value::String(name.to_string());
+    let text = |value: &str| serde_yaml::Value::String(value.to_string());
+    let list = |values: &[String]| {
+        serde_yaml::Value::Sequence(values.iter().map(|value| text(value)).collect())
+    };
+
+    definition.insert(key("image"), text(&run.image));
+    definition.insert(key("restart"), text(&run.restart));
+    definition.insert(key("profiles"), list(&[DCD_RELEASE_PROFILE.to_string()]));
+    if !run.entrypoint.is_empty() {
+        definition.insert(key("entrypoint"), list(&run.entrypoint));
+    }
+    if !run.command.is_empty() {
+        definition.insert(key("command"), list(&run.command));
+    }
+    if !run.volumes.is_empty() {
+        definition.insert(key("volumes"), list(&run.volumes));
+    }
+    if let Some(env_file) = &run.env_file {
+        definition.insert(key("env_file"), list(&[env_file.display().to_string()][..]));
+    }
+
+    if let Some(network) = &run.network {
+        let mut attachment = serde_yaml::Mapping::new();
+        if let Some(alias) = &run.network_alias {
+            let mut aliases = serde_yaml::Mapping::new();
+            aliases.insert(key("aliases"), list(std::slice::from_ref(alias)));
+            attachment.insert(text(network), serde_yaml::Value::Mapping(aliases));
+        } else {
+            attachment.insert(text(network), serde_yaml::Value::Null);
+        }
+        definition.insert(key("networks"), serde_yaml::Value::Mapping(attachment));
+
+        let mut declared = serde_yaml::Mapping::new();
+        let mut external = serde_yaml::Mapping::new();
+        external.insert(key("name"), text(network));
+        external.insert(key("external"), serde_yaml::Value::Bool(true));
+        declared.insert(text(network), serde_yaml::Value::Mapping(external));
+        document.insert(key("networks"), serde_yaml::Value::Mapping(declared));
+    }
+
+    let mut services = serde_yaml::Mapping::new();
+    services.insert(text(service), serde_yaml::Value::Mapping(definition));
+    document.insert(key("services"), serde_yaml::Value::Mapping(services));
+
+    serde_yaml::to_string(&serde_yaml::Value::Mapping(document))
+        .unwrap_or_else(|_| format!("services:\n  {service}:\n    image: {}\n", run.image))
+}
+
+/// The profile the release service carries, so a hand-run `compose up` cannot
+/// start a second copy beside the one dcd is deploying.
+pub const DCD_RELEASE_PROFILE: &str = "dcd-release";
+
 /// `compose --profile … config --format json`. The profile flags are mandatory:
 /// a service carrying `profiles:` is absent from the model without them, so the
 /// operator's own `release.service` would read as undeclared (spec §7 preamble).
@@ -222,6 +287,49 @@ mod tests {
     /// A service names a network by its compose KEY; `docker network inspect`
     /// needs the name in the top-level block. Reading the key made preflight warn
     /// that the network was missing on every single deploy.
+    /// `release.run` was accepted, validated, documented and in the JSON Schema —
+    /// and never rendered, so `check` said "config ok" and the deploy then ran
+    /// `compose run` against a service no compose file declared.
+    #[test]
+    fn the_run_fallback_renders_a_service_the_model_can_resolve() {
+        let run = crate::config::RunSpec {
+            image: "reg/app:v1".to_string(),
+            network: Some("acme_default".to_string()),
+            network_alias: Some("app".to_string()),
+            restart: "unless-stopped".to_string(),
+            entrypoint: vec!["/entrypoint.sh".to_string()],
+            command: vec!["serve".to_string()],
+            volumes: vec!["./data:/data".to_string()],
+            ..Default::default()
+        };
+        let document = render_run_document("demo-release", &run);
+        let model = serde_yaml::from_str::<serde_yaml::Value>(&document).expect("valid YAML");
+
+        let service = &model["services"]["demo-release"];
+        assert_eq!(service["image"].as_str(), Some("reg/app:v1"));
+        assert_eq!(service["restart"].as_str(), Some("unless-stopped"));
+        assert_eq!(service["profiles"][0].as_str(), Some("dcd-release"));
+        assert_eq!(service["entrypoint"][0].as_str(), Some("/entrypoint.sh"));
+        assert_eq!(service["networks"]["acme_default"]["aliases"][0].as_str(), Some("app"));
+        assert_eq!(model["networks"]["acme_default"]["external"].as_bool(), Some(true));
+    }
+
+    /// INV-12: the generated document lands on disk, so no env value may enter it.
+    #[test]
+    fn the_run_fallback_never_writes_an_env_value() {
+        let mut env = indexmap::IndexMap::new();
+        env.insert("APP_SECRET".to_string(), "hunter2".to_string());
+        let run = crate::config::RunSpec {
+            image: "reg/app:v1".to_string(),
+            restart: "unless-stopped".to_string(),
+            env,
+            ..Default::default()
+        };
+        let document = render_run_document("demo-release", &run);
+        assert!(!document.contains("hunter2"), "a value reached disk: {document}");
+        assert!(!document.contains("APP_SECRET"), "{document}");
+    }
+
     #[test]
     fn a_network_is_reported_under_the_name_docker_knows_it_by() {
         assert_eq!(roadrunner().network_names(), vec!["acme_default".to_string()]);
