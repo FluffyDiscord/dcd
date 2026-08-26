@@ -1,7 +1,7 @@
 # dcd — Strategic Blueprint (Strategic)
 
 **Document type:** Strategic
-**Status:** Decided (2026-06-11), revised post-gate-review
+**Status:** Decided (2026-06-11); **v2 revision 2026-08-25** — execution locus and container dialect changed (ADR-001 superseded, ADR-013/014 added). Backwards compatibility with v1 configs is explicitly not provided.
 **Implementation detail lives in:** [Implementation Spec](implementation-spec.md)
 
 ---
@@ -43,16 +43,22 @@ Structural, not cosmetic: a **typed, tested Rust recipe + typed config** cures
 the three root sins of the script (untyped, untested, hardcoded) directly.
 Shelling out to the `docker` CLI (not a Docker API client) means the tool's
 actions are exactly the commands an operator would run by hand — auditable in
-`--dry-run`, debuggable by copy-paste, immune to Engine-API drift. A single
-static binary deploys with zero runtime dependencies on the server beyond the
-`docker` CLI already present. The PHP-Deployer hook model is proven and liked;
+`--dry-run`, debuggable by copy-paste, immune to Engine-API drift. In v2 the
+binary runs on the **deploying machine**: the server needs only `docker`, `sshd`
+and a POSIX shell, and **nothing dcd-authored is installed there**. The second
+structural cure is that container *definition* moves entirely to compose
+(ADR-013) — dcd stopped re-spelling image/env/volume/restart/alias options in a
+private dialect, so the config carries orchestration policy only.
+The PHP-Deployer hook model is proven and liked;
 keeping it (without an over-built task graph) gives extensibility at low weight.
 
 ## 4. Core architecture decision (7Q-4)
 
 | Decision | Choice | ADR |
 |----------|--------|-----|
-| Execution locus | Runs **on the target server**, local Docker socket | ADR-001 |
+| Execution locus | Runs **on the deploying machine**; the target is reached over **SSH** | ADR-001 (v2; supersedes ADR-001 v1) |
+| Container dialect | **Compose owns container definition**; dcd owns orchestration policy | ADR-013 |
+| SSH mechanics | Shell out to the `ssh` binary, one multiplexed connection per run | ADR-014 |
 | Engine shape | **Fixed linear recipe + before/after hook slots** (one built-in: `docker-redblack`) | ADR-002 |
 | Extensibility | **Embedded Lua (mlua)**, sandboxed; PHP-Deployer-style globals + `ctx` | ADR-003 |
 | Docker interface | **Shell out to `docker` / `docker compose` CLI** | ADR-004 |
@@ -77,7 +83,7 @@ removing the general-graph machinery while preserving the PHP-Deployer feel.
 | `mlua` (Lua 5.4, vendored) | Mature embedded-Lua binding, sandboxable, no system Lua dependency | "extensible like PHP Deployer", static binary |
 | `clap` (derive) | De-facto Rust CLI framework: help, errors, completions | "PERFECT DX" |
 | `serde` + `serde_yaml` (or `serde_yml`) | Typed config parse with precise error spans | typed config, good errors |
-| `signal-hook` + `fs2`/`rustix` flock | Caught signals + OS-released advisory lock | INV-4 (lock survives SIGKILL) |
+| `signal-hook` + `fs2`/`rustix` flock | Caught signals + OS-released advisory lock, locally and (leased, over ssh) on the target | INV-4 (the lock cannot outlive its holder, in either mode) |
 | Shell out to `docker` | Parity with the current script; `docker compose` has no API | ADR-004 |
 | `musl` static target | Runs on any x86-64 Linux server without glibc concerns | ship one file, "on the server" |
 
@@ -94,7 +100,10 @@ concurrency lock with crash recovery; adaptive output.
 |----------|-----------|
 | **A second live project** | Decided 2026-06-11: the candidate second project is symlink/PHP-FPM/MariaDB/build-on-server/SSH-remote — every axis dcd excludes. v1 targets parity with the current production deploy + a synthetic generality test; a second project is revisited post-v1 |
 | Image **build/push** | Stays in CI where BuildKit secrets + content-hash caching live (the existing CI pipeline); building on the server needs source there |
-| **SSH-remote transport** | `dcd` runs on the server; server selection is CI's SSH target. Deferred as a future `Executor` impl |
+| ~~**SSH-remote transport**~~ | **Adopted in v2** (ADR-001/014). v1 deferred it as "a future `Executor` impl"; that is what v2 builds |
+| **Non-Linux deploying machines** | Decided 2026-08-25: deploys run from a Linux CI runner or Linux workstation only. No macOS/Windows client |
+| **A persistent remote shell** (one `ssh` session fed commands on stdin) | Connection *reuse* is mandatory (ADR-014), but each command stays a separate, individually traceable, dry-run-gated `ssh` invocation. Measured: multiplexing alone removes 81% of per-command overhead |
+| **Pushing the dcd binary to the server** | Considered and rejected 2026-08-25 (ADR-001 alternatives): it preserves more invariants for free, but the deciding binary would run on the remote again — inverting the stated goal |
 | **Down-migration rollback** | Expand-contract makes DB rollback unnecessary and usually lossy (ADR-005) |
 | **Non-Docker deploy** (symlink, k8s, swarm) | Out of scope; the recipe is Docker-CLI + compose specific |
 | **A user-definable task DAG** | One fixed recipe + hook slots covers the need; a general graph is unjustified weight (ADR-002) |
