@@ -105,7 +105,7 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
     assert!(has("docker pull reg:app-1"));
     assert!(has("docker pull reg:db-1"));
     assert!(has("docker inspect demo-postgres --format {{.Config.Image}}"));
-    assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml up -d --no-recreate --wait postgres"));
+    assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml up -d --no-recreate --wait --wait-timeout 120 postgres"));
     assert!(has("docker exec demo-postgres sh -c pg_isready"));
     assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run --rm -T --no-deps --entrypoint migrate app before"));
     assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run -d --name demo-app-1000 --use-aliases --no-deps app"));
@@ -142,7 +142,9 @@ fn verbose_traces_every_command_the_recipe_runs() {
     let reporter = Reporter::capture_verbose(Mode::Plain);
     let interrupt = Interrupt::inert();
 
-    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts(), model());
+    let mut traced_opts = opts();
+    traced_opts.container_env = [("APP_SECRET".to_string(), "hunter2".to_string())].into_iter().collect();
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), traced_opts, model());
     engine.deploy().unwrap();
 
     let lines = reporter.lines();
@@ -154,8 +156,11 @@ fn verbose_traces_every_command_the_recipe_runs() {
     // captured stdout is surfaced instead of being dropped
     assert!(lines.iter().any(|line| line == "  | async"));
 
-    // env values never reach the trace — passthrough is a bare `-e KEY` (§5.2.4)
-    assert!(!lines.iter().any(|line| line.contains("TZ=")));
+    // env values never reach the trace — passthrough is a bare `-e KEY` (§5.2.4).
+    // Asserted against a value the run actually carries, or it proves nothing.
+    let trace = lines.join("\n");
+    assert!(trace.contains("-e APP_SECRET"), "the key name is what travels: {trace}");
+    assert!(!trace.contains("hunter2"), "a value reached the trace: {trace}");
 }
 
 #[test]
@@ -776,7 +781,7 @@ fn infra_drains_workers_before_recreating_db_and_waits_after() {
     let calls = runner.display_calls();
     let idx = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap_or(usize::MAX);
     let stop = idx("docker stop --signal");
-    let recreate = idx("up -d --wait postgres");
+    let recreate = idx("up -d --wait --wait-timeout 120 postgres");
     let wait = idx("sh -c pg_isready");
     assert!(stop < recreate, "worker drain must precede DB recreate");
     assert!(recreate < wait, "wait gate must follow recreate");
@@ -872,7 +877,7 @@ fn chain_env_reaches_containers_as_bare_keys_with_overlays() {
     assert_eq!(overlay.get("REGISTRY").map(String::as_str), Some("reg"));
 
     // and so do the plain compose calls
-    let overlay = runner.env_overlay_of("up -d --no-recreate --wait postgres").unwrap();
+    let overlay = runner.env_overlay_of("up -d --no-recreate --wait --wait-timeout 120 postgres").unwrap();
     assert_eq!(overlay.get("REGISTRY").map(String::as_str), Some("reg"));
 
     // v2 writes no workers file at all, so there is one fewer place a value could rest
@@ -937,7 +942,7 @@ fn rollback_warns_when_recorded_env_keys_drift_from_the_chain() {
         st.current = Some("demo-app-2".into());
     }
     let mut options = opts();
-    options.container_env = [("NEW_KEY".to_string(), "v".to_string())].into_iter().collect();
+    options.container_env = [("NEW_KEY".to_string(), "secret-value".to_string())].into_iter().collect();
 
     let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, state, options, model());
     engine.rollback().unwrap();
@@ -946,7 +951,8 @@ fn rollback_warns_when_recorded_env_keys_drift_from_the_chain() {
     let warned = warned.expect("expected a drift warning");
     assert!(warned.contains("+NEW_KEY"), "got: {warned}");
     assert!(warned.contains("-DB_URL"), "got: {warned}");
-    assert!(!warned.contains('v') || warned.contains("env"), "values never printed");
+    // The VALUE of NEW_KEY is "secret-value"; only its NAME may be reported.
+    assert!(!warned.contains("secret-value"), "the drift warning printed a value: {warned}");
 }
 
 #[test]
