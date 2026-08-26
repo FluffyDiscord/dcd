@@ -296,6 +296,11 @@ impl<'a> Engine<'a> {
     }
 
     pub fn rollback(&mut self) -> Result<()> {
+        if self.stage().map(|s| s.pending_count()).unwrap_or(0) > 1 {
+            return Err(DcdError::Config(
+                "state has more than one cutover_pending release — refusing".to_string(),
+            ));
+        }
         let target = self
             .stage()
             .and_then(|s| s.rollback_target())
@@ -483,9 +488,8 @@ impl<'a> Engine<'a> {
 
     fn container_images(&self) -> Result<HashSet<String>> {
         let argv = self.docker().container_images();
-        let out = self.read(&argv)?;
-        let images = out
-            .stdout
+        let listing = self.list(&argv)?;
+        let images = listing
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
@@ -638,6 +642,14 @@ impl<'a> Engine<'a> {
             let bytes = std::fs::read(file)
                 .map_err(|e| DcdError::Config(format!("cannot read {}: {e}", file.display())))?;
             let target = self.resolve(file);
+            // `infra/docker-compose.yml` uploads to {deploy_root}/infra/…, and the
+            // write is a redirect — it fails on a fresh target unless the parent
+            // is there first.
+            if let Some(parent) = target.parent() {
+                if parent != self.deploy_root {
+                    self.mkdir(parent)?;
+                }
+            }
             self.fs_write(&target, &bytes, None, "compose file")?;
             uploaded += 1;
         }
@@ -668,20 +680,54 @@ impl<'a> Engine<'a> {
                     .warn(&format!("network {network} does not exist yet; compose will create it"));
             }
         }
-        let dirs = self.cfg.directories.iter().map(|d| (d.path.clone(), d.owner.clone())).collect::<Vec<_>>();
-        for (path, owner) in dirs {
+        self.require_target_tools()?;
+        let dirs = self
+            .cfg
+            .directories
+            .iter()
+            .map(|d| (d.path.clone(), d.owner.clone(), d.mode.clone()))
+            .collect::<Vec<_>>();
+        for (path, owner, mode) in dirs {
             let resolved = self.resolve(&path);
             self.mkdir(&resolved)?;
+            let mount = format!("{}:/wd", self.deploy_root.display());
+            let target = format!("/wd/{}", path.display());
             if let Some(owner) = owner {
-                let mount = format!("{}:/wd", self.deploy_root.display());
-                let target = format!("/wd/{}", path.display());
                 let argv = Argv::of(["docker", "run", "--rm", "-v", &mount, "busybox", "chown", &owner, &target]);
+                self.exec(&argv, Access::Mutate)?;
+            }
+            // `mode` was accepted and documented but never applied, so a bind
+            // target declared `0750` was created with whatever umask the target had.
+            if let Some(mode) = mode {
+                let argv = Argv::of(["docker", "run", "--rm", "-v", &mount, "busybox", "chmod", &mode, &target]);
                 self.exec(&argv, Access::Mutate)?;
             }
         }
         self.reap_v1_workers()?;
         self.reap_orphans()?;
         Ok(Outcome::Done(None))
+    }
+
+    /// The two things dcd assumes the target has. Named here rather than
+    /// discovered as a confusing failure twenty steps in: without `flock` the
+    /// stage lock silently does not exist, and without `base64` every file dcd
+    /// writes lands empty.
+    fn require_target_tools(&self) -> Result<()> {
+        if !self.opts.remote {
+            return Ok(());
+        }
+        for tool in ["flock", "base64"] {
+            // `command` is a shell builtin, so it has to be asked of a shell —
+            // as a bare argv there is no binary to exec.
+            let probe = format!("command -v {tool} >/dev/null 2>&1");
+            let argv = Argv::of(["sh", "-c", &probe]);
+            if !self.read(&argv)?.success() {
+                return Err(DcdError::PreCutover(format!(
+                    "{tool} is required on the target and was not found on PATH"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn ensure_upstream(&mut self) -> Result<Outcome> {
@@ -763,7 +809,15 @@ impl<'a> Engine<'a> {
         self.persist_state()
     }
 
+    /// `compose up --wait` blocks forever on a service whose healthcheck never goes
+    /// healthy. Spec §7.4 bounds it, so a bad side container fails the deploy
+    /// instead of hanging CI.
+    fn wait_timeout_seconds() -> u64 {
+        120
+    }
+
     fn infra(&mut self) -> Result<Outcome> {
+        let wait_timeout = Engine::wait_timeout_seconds().to_string();
         let services: Vec<String> = self.cfg.services.keys().cloned().collect();
         for name in &services {
             let policy = self.cfg.services[name].clone();
@@ -785,9 +839,11 @@ impl<'a> Engine<'a> {
                 self.drain_workers()?;
             }
             let argv = if needs_recreate {
-                self.docker().compose(&["up", "-d", "--wait", name])
+                self.docker()
+                    .compose(&["up", "-d", "--wait", "--wait-timeout", &wait_timeout, name])
             } else {
-                self.docker().compose(&["up", "-d", "--no-recreate", "--wait", name])
+                self.docker()
+                    .compose(&["up", "-d", "--no-recreate", "--wait", "--wait-timeout", &wait_timeout, name])
             };
             self.exec_env(&argv, Access::Mutate, self.compose_overlay())?;
         }
@@ -876,7 +932,20 @@ impl<'a> Engine<'a> {
 
     fn cutover(&mut self) -> Result<Outcome> {
         let upstream = self.resolve(&self.cfg.cutover.upstream_file);
-        let previous = self.fs.read(&upstream).ok();
+        // Captured before the switch and required: this is what points the router
+        // back at red if validate/reload fails. Silently proceeding without it
+        // would leave the upstream naming a container the rollback just removed —
+        // an outage that fires on the NEXT reload, long after dcd exited 1.
+        let previous = match self.fs.read(&upstream) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(DcdError::PreCutover(format!(
+                    "cannot read {} before the cutover: {e}",
+                    upstream.display()
+                )))
+            }
+        };
         let backend = format!("{}:{}", self.container, self.cfg.cutover.backend_port);
         let rendered = self.cfg.cutover.template.replace("{backend}", &backend);
         self.fs_write(&upstream, rendered.as_bytes(), None, "upstream cutover")?;
@@ -886,7 +955,7 @@ impl<'a> Engine<'a> {
             let argv = self.docker().exec_sh(&container, &validate.cmd);
             let out = self.try_run(&argv, Access::Mutate)?;
             if !out.success() {
-                self.restore_upstream(&upstream, previous);
+                self.restore_upstream(&upstream, &previous);
                 return Err(DcdError::PreCutover(format!(
                     "cutover config validation failed: {}",
                     out.stderr.trim()
@@ -898,7 +967,7 @@ impl<'a> Engine<'a> {
         let reload = self.docker().exec_sh(&router, &self.cfg.cutover.reload.cmd);
         let out = self.try_run(&reload, Access::Mutate)?;
         if !out.success() {
-            self.restore_upstream(&upstream, previous);
+            self.restore_upstream(&upstream, &previous);
             return Err(DcdError::PreCutover(format!(
                 "router reload failed; restored previous upstream: {}",
                 out.stderr.trim()
@@ -926,7 +995,7 @@ impl<'a> Engine<'a> {
     fn drain_red(&mut self) -> Result<Outcome> {
         let prefix = format!("{}-", self.cfg.release.container_prefix(&self.cfg.project));
         let argv = self.docker().ps_names(&prefix, false);
-        let running = self.read(&argv)?.stdout;
+        let running = self.list(&argv)?;
         let drain_cmd = self.cfg.release.drain.clone();
         let targets: Vec<String> = running
             .lines()
@@ -1075,7 +1144,7 @@ impl<'a> Engine<'a> {
     fn run_action(&self, action: &HookAction) -> Result<()> {
         match action {
             HookAction::Run(cmd) => {
-                let full = format!("cd {} && {}", self.deploy_root.display(), cmd);
+                let full = format!("cd {} && {}", crate::ssh::quote(&self.deploy_root.display().to_string()), cmd);
                 self.exec(&Argv::of(["sh", "-c", &full]), Access::Mutate)
             }
             HookAction::ExecIn { exec_in } => {
@@ -1260,7 +1329,7 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         let argv = self.docker().labelled_ps_names(&workers.name_prefix);
-        let listing = self.read(&argv)?.stdout;
+        let listing = self.list(&argv)?;
         let stale: Vec<String> = listing
             .lines()
             .filter_map(|line| line.trim().split_once(' '))
@@ -1279,33 +1348,75 @@ impl<'a> Engine<'a> {
     fn reap_orphans(&mut self) -> Result<()> {
         let prefix = format!("{}-", self.cfg.release.container_prefix(&self.cfg.project));
         let argv = self.docker().ps_names(&prefix, true);
-        let out = self.read(&argv)?;
-        let known: HashSet<String> = self
-            .stage()
-            .map(|s| s.releases.iter().map(|r| r.container.clone()).collect())
-            .unwrap_or_default();
-        let orphans: Vec<String> = out
-            .stdout
+        let listing = self.list(&argv)?;
+        let recorded = self.stage().map(|s| {
+            s.releases
+                .iter()
+                .map(|r| r.container.clone())
+                .collect::<HashSet<String>>()
+        });
+        let found: Vec<String> = listing
             .lines()
             .map(str::trim)
-            .filter(|n| !n.is_empty() && !known.contains(*n))
+            .filter(|name| !name.is_empty())
             .map(String::from)
             .collect();
-        for orphan in orphans {
+
+        // No stage row at all means the state file is missing, not that every
+        // container is an orphan — and this runs at step 2 of 13, five steps
+        // before a black exists. Reaping here would `docker rm -f` the container
+        // currently serving traffic.
+        let Some(known) = recorded else {
+            if !found.is_empty() {
+                return Err(DcdError::PreCutover(format!(
+                    "{} has no recorded releases but {} container(s) match {prefix}: {} —                      refusing to reap what may be serving traffic; check dcd-state.json",
+                    self.cfg.stage,
+                    found.len(),
+                    found.join(", ")
+                )));
+            }
+            return Ok(());
+        };
+
+        for orphan in found.into_iter().filter(|name| !known.contains(name)) {
+            self.reporter
+                .warn(&format!("removing {orphan}, which no release in state accounts for"));
             let rm = self.docker().rm_f(&orphan);
             let _ = self.try_run(&rm, Access::Mutate);
         }
         Ok(())
     }
 
+    /// One `dcd-state.json` holds every stage, but the stage lock only serialises
+    /// runs of the SAME stage — so `dcd deploy prod` and `dcd deploy beta` against
+    /// one deploy_root would each write the whole document and lose the other's
+    /// rows, INV-3's `cutover_pending` record included. Re-reading and replacing
+    /// only this stage's row keeps a concurrent stage's history intact.
     fn persist_state(&self) -> Result<()> {
-        let json = self.state.to_json();
-        self.fs_write(&self.state_path.clone(), json.as_bytes(), Some(0o600), "state")
+        let path = self.state_path.clone();
+        let mut document = self.state.clone();
+        if let Ok(bytes) = self.fs.read(&path) {
+            if let Ok(on_disk) = State::from_json(&bytes) {
+                document = on_disk;
+                if let Some(mine) = self.state.stage(&self.cfg.stage) {
+                    document.stages.insert(self.cfg.stage.clone(), mine.clone());
+                }
+            }
+        }
+        self.fs_write(&path, document.to_json().as_bytes(), Some(0o600), "state")
     }
 
-    fn restore_upstream(&self, upstream: &Path, previous: Option<Vec<u8>>) {
-        if let Some(previous) = previous {
-            let _ = self.fs_write(upstream, &previous, None, "upstream restore");
+    /// §11's guarantee on the failed-cutover path: red serving, on-disk AND
+    /// in-memory. A restore that fails leaves the router pointed at a container
+    /// about to be removed, so it is reported rather than discarded.
+    fn restore_upstream(&self, upstream: &Path, previous: &[u8]) {
+        if !previous.is_empty() {
+            if let Err(e) = self.fs_write(upstream, previous, None, "upstream restore") {
+                self.reporter.warn(&format!(
+                    "could not restore {} — the router still names the failed release: {e}",
+                    upstream.display()
+                ));
+            }
         }
         self.cleanup_black();
     }
@@ -1317,6 +1428,16 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Spec §2.5: the executor checks the interrupt between tasks AND inside retry
+    /// loops. A health gate is 60 attempts 2 s apart, so without this a Ctrl-C is
+    /// noticed up to two minutes later — and reported as a failed deploy, not 130.
+    fn abort_if_interrupted(&self) -> Result<()> {
+        if self.interrupt.triggered() && !self.post_cutover {
+            return Err(DcdError::Interrupted);
+        }
+        Ok(())
+    }
+
     fn poll(&self, argv: &Argv, access: Access, retries: u32, interval: u64, fail: &str) -> Result<()> {
         if self.opts.dry_run {
             if !self.try_run(argv, access)?.success() {
@@ -1325,6 +1446,7 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         for attempt in 1..=retries {
+            self.abort_if_interrupted()?;
             if self.try_run(argv, access)?.success() {
                 return Ok(());
             }
@@ -1344,6 +1466,7 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         for attempt in 1..=retries {
+            self.abort_if_interrupted()?;
             let status = self.read(argv)?.stdout.trim().to_string();
             match status.as_str() {
                 "healthy" => return Ok(()),
@@ -1406,7 +1529,7 @@ impl<'a> Engine<'a> {
             return self
                 .runner
                 .run(argv, access, &RunOpts { check, env, stdin: None })
-                .map_err(|e| self.classify(e.to_string()));
+                .map_err(|e| self.classify_run_error(e));
         }
 
         self.reporter.command(&argv.display());
@@ -1417,7 +1540,14 @@ impl<'a> Engine<'a> {
             Ok(out) => self.reporter.command_output(out.code, ms, &out.stdout, &out.stderr),
             Err(err) => self.reporter.command_error(ms, &err.to_string()),
         }
-        outcome.map_err(|e| self.classify(e.to_string()))
+        outcome.map_err(|e| self.classify_run_error(e))
+    }
+
+    fn classify_run_error(&self, error: crate::effects::RunError) -> DcdError {
+        match error {
+            crate::effects::RunError::Transport { .. } => self.classify_transport(error.to_string()),
+            other => self.classify(other.to_string()),
+        }
     }
 
     fn exec(&self, argv: &Argv, access: Access) -> Result<crate::effects::CmdOutput> {
@@ -1441,6 +1571,34 @@ impl<'a> Engine<'a> {
         self.run_argv(argv, Access::Read, false, None)
     }
 
+    /// A listing whose command FAILED is not an empty listing. Read through
+    /// `read`, a broken `docker ps` yields empty stdout, which every caller then
+    /// treats as "nothing to do" — so drain silently leaves red running, worker
+    /// drain reports success, and `gc --all` sees no in-use images at all.
+    fn list(&self, argv: &Argv) -> Result<String> {
+        let out = self.read(argv)?;
+        if !out.success() {
+            return Err(self.classify(format!(
+                "`{}` failed (exit {}): {}",
+                argv.display(),
+                out.code,
+                out.stderr.trim()
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    /// ssh's own failures keep their identity through the recipe: pre-cutover they
+    /// exit 6 rather than 1, so CI can tell "the network broke" from "the deploy
+    /// was rejected". Post-cutover, §11's rule wins — anything after the point of
+    /// no return is exit 4, whatever caused it.
+    fn classify_transport(&self, message: String) -> DcdError {
+        if self.post_cutover {
+            return DcdError::PostCutover(message);
+        }
+        DcdError::Transport(message)
+    }
+
     fn classify(&self, message: String) -> DcdError {
         if self.post_cutover {
             DcdError::PostCutover(message)
@@ -1452,7 +1610,7 @@ impl<'a> Engine<'a> {
 
 impl HookHost for Engine<'_> {
     fn run_host(&self, cmd: &str) -> std::result::Result<String, String> {
-        let full = format!("cd {} && {}", self.deploy_root.display(), cmd);
+        let full = format!("cd {} && {}", crate::ssh::quote(&self.deploy_root.display().to_string()), cmd);
         self.exec(&Argv::of(["sh", "-c", &full]), Access::Mutate).map(|o| o.stdout).map_err(|e| e.to_string())
     }
 
