@@ -5,6 +5,19 @@
 use crate::config::Config;
 use crate::effects::Argv;
 
+/// `docker ps --filter name=` is an unanchored regex, so a prefix has to be
+/// escaped as well as anchored or a decoy container is swept by `docker rm -f`.
+fn regex_escape(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        if "\\.+*?()|[]{}^$".contains(character) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 pub struct Docker<'a> {
     cfg: &'a Config,
 }
@@ -18,16 +31,25 @@ impl<'a> Docker<'a> {
         Argv::of(["docker", "pull", image])
     }
 
-    pub fn network_inspect(&self) -> Argv {
-        Argv::of(["docker", "network", "inspect", &self.cfg.network])
-    }
-
-    pub fn network_create(&self) -> Argv {
-        Argv::of(["docker", "network", "create", &self.cfg.network])
+    pub fn network_inspect(&self, network: &str) -> Argv {
+        Argv::of(["docker", "network", "inspect", network])
     }
 
     pub fn inspect_image(&self, container: &str) -> Argv {
         Argv::of(["docker", "inspect", container, "--format", "{{.Config.Image}}"])
+    }
+
+    /// The container's own health, as Docker reports it. `{{if .State.Health}}`
+    /// guards the common case of an image with no healthcheck at all, which would
+    /// otherwise blow up the template.
+    pub fn inspect_health(&self, container: &str) -> Argv {
+        Argv::of([
+            "docker",
+            "inspect",
+            container,
+            "--format",
+            "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+        ])
     }
 
     pub fn exec_sh(&self, container: &str, cmd: &str) -> Argv {
@@ -44,10 +66,12 @@ impl<'a> Docker<'a> {
         Argv::of(["docker", "rm", "-f", container])
     }
 
-    pub fn stop(&self, containers: &[String], timeout_secs: u64) -> Argv {
+    pub fn stop(&self, containers: &[String], timeout_secs: u64, signal: &str) -> Argv {
         let mut argv = vec![
             "docker".into(),
             "stop".into(),
+            "--signal".into(),
+            signal.to_string(),
             "--timeout".into(),
             timeout_secs.to_string(),
         ];
@@ -81,20 +105,40 @@ impl<'a> Docker<'a> {
             argv.push("-a".into());
         }
         argv.push("--filter".into());
-        argv.push(format!("name=^{name_prefix}"));
+        argv.push(format!("name=^{}", regex_escape(name_prefix)));
         argv.push("--format".into());
         argv.push("{{.Names}}".into());
         Argv(argv)
     }
 
-    pub fn worker_ps_names(&self, name_filter: &str) -> Argv {
+    /// Containers matching a name prefix, with the compose service each belongs to.
+    /// Used once, to find v1 workers whose per-worker service labels v2's discovery
+    /// filter can never match.
+    pub fn labelled_ps_names(&self, name_prefix: &str) -> Argv {
+        Argv::of([
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label=com.docker.compose.project={}", self.cfg.project),
+            "--filter",
+            &format!("name=^{}", regex_escape(name_prefix)),
+            "--format",
+            "{{.Names}} {{.Label \"com.docker.compose.service\"}}",
+        ])
+    }
+
+    /// INV-14: discovery is by compose SERVICE label, never a name prefix. Under
+    /// ADR-013 the release container carries the project label too, so a prefix
+    /// filter could match it — and the caller `docker stop`s everything returned.
+    pub fn worker_ps_names(&self, worker_service: &str) -> Argv {
         Argv::of([
             "docker",
             "ps",
             "--filter",
             &format!("label=com.docker.compose.project={}", self.cfg.project),
             "--filter",
-            &format!("name={name_filter}"),
+            &format!("label=com.docker.compose.service={worker_service}"),
             "--format",
             "{{.Names}}",
         ])
@@ -109,7 +153,7 @@ impl<'a> Docker<'a> {
     /// — always fully qualified so the project name is never inferred (spec §9). The
     /// `/dev/null` env-file pins compose's implicit `.env` discovery OFF (spec §5.2.4);
     /// env arrives via the process environment instead.
-    pub fn compose(&self, args: &[&str], include_workers: bool) -> Argv {
+    pub fn compose(&self, args: &[&str]) -> Argv {
         let mut argv = vec![
             "docker".to_string(),
             "compose".into(),
@@ -122,77 +166,82 @@ impl<'a> Docker<'a> {
             argv.push("-f".into());
             argv.push(file.display().to_string());
         }
-        if include_workers {
-            if let Some(workers) = &self.cfg.workers {
-                argv.push("-f".into());
-                argv.push(workers.compose_file.display().to_string());
-            }
-        }
+        argv.push("-f".into());
+        argv.push(self.image_override_file());
         argv.extend(args.iter().map(|s| s.to_string()));
         Argv(argv)
     }
 
-    pub fn run_black(&self, container: &str, image: &str, env_keys: &[String]) -> Argv {
-        let run = &self.cfg.release.run;
-        let mut argv = vec![
-            "docker".to_string(),
-            "run".into(),
+    /// Written on every run, local or remote: `compose(...)` passes it
+    /// unconditionally, so a missing file would break every command (spec §7.0).
+    pub fn image_override_file(&self) -> String {
+        format!("dcd-image-override.{}.yml", self.cfg.stage)
+    }
+
+    /// The release container (spec §7.6). `compose run` is a *creation* primitive
+    /// only — everything afterwards addresses the result by name through plain
+    /// `docker` (INV-13). `--use-aliases` carries the service's declared network
+    /// aliases, which is the v1 `network_alias` feature for free.
+    pub fn run_black(&self, container: &str, service: &str, env_keys: &[String]) -> Argv {
+        let mut args = vec![
+            "run".to_string(),
             "-d".into(),
             "--name".into(),
             container.to_string(),
-            "--network".into(),
-            self.cfg.network.clone(),
+            "--use-aliases".into(),
+            "--no-deps".into(),
         ];
-        if let Some(alias) = &run.network_alias {
-            argv.push("--network-alias".into());
-            argv.push(alias.clone());
+        for key in env_keys {
+            args.push("-e".into());
+            args.push(key.clone());
         }
-        argv.push("--restart".into());
-        argv.push(run.restart.clone());
-        self.push_run_env(&mut argv, run, env_keys);
-        for volume in &run.volumes {
-            argv.push("-v".into());
-            argv.push(volume.clone());
-        }
-        argv.push(image.to_string());
-        Argv(argv)
+        args.push(service.to_string());
+        self.compose(&args.iter().map(String::as_str).collect::<Vec<_>>())
     }
 
-    pub fn run_throwaway(&self, name: &str, image: &str, command: &[String], env_keys: &[String]) -> Argv {
-        let mut argv = vec![
-            "docker".to_string(),
-            "run".into(),
-            "--rm".into(),
-            "--network".into(),
-            self.cfg.network.clone(),
+    /// Compose forces `restart=no` on one-off containers, so the policy the
+    /// operator declared has to be re-applied or reboot-restart silently breaks.
+    pub fn update_restart(&self, container: &str, policy: &str) -> Argv {
+        Argv::of(["docker", "update", "--restart", policy, container])
+    }
+
+    /// One container per worker name, from ONE compose service (spec §7.12).
+    /// Trailing words override the service's `command`, keeping its entrypoint.
+    pub fn run_worker(&self, container: &str, service: &str, name: &str, extra_args: &[String], env_keys: &[String]) -> Argv {
+        let mut args = vec![
+            "run".to_string(),
+            "-d".into(),
             "--name".into(),
-            name.to_string(),
+            container.to_string(),
+            "--no-deps".into(),
         ];
-        self.push_run_env(&mut argv, &self.cfg.release.run, env_keys);
-        argv.push(image.to_string());
-        argv.extend(command.iter().cloned());
-        Argv(argv)
+        for key in env_keys {
+            args.push("-e".into());
+            args.push(key.clone());
+        }
+        args.push(service.to_string());
+        args.push(name.to_string());
+        args.extend(extra_args.iter().cloned());
+        self.compose(&args.iter().map(String::as_str).collect::<Vec<_>>())
     }
 
-    /// Appends `--env-file <path>` (resolved against `deploy_root`) then a bare `-e KEY`
-    /// per delivered key — the docker CLI reads each value from its own environment, so
-    /// values never enter the argv (spec §5.2.4). The file comes first so a delivered
-    /// key overrides the same key in it. `env_keys` is the sorted, deduplicated union
-    /// of the filtered chain keys and the explicit `run.env` keys.
-    fn push_run_env(&self, argv: &mut Vec<String>, run: &crate::config::RunSpec, env_keys: &[String]) {
-        if let Some(env_file) = &run.env_file {
-            let path = if env_file.is_absolute() {
-                env_file.clone()
-            } else {
-                self.cfg.deploy_root.join(env_file)
-            };
-            argv.push("--env-file".into());
-            argv.push(path.display().to_string());
+    /// `migrate:before` (spec §7.5). `-T` is mandatory — compose's `run` is
+    /// interactive by default and stdin is already carrying the env document —
+    /// and `--entrypoint` is mandatory because the trailing words would otherwise
+    /// be handed to the service's own entrypoint as arguments.
+    pub fn run_throwaway(&self, service: &str, command: &[String], env_keys: &[String]) -> Argv {
+        let mut args = vec!["run".to_string(), "--rm".into(), "-T".into(), "--no-deps".into()];
+        if let Some((program, _)) = command.split_first() {
+            args.push("--entrypoint".into());
+            args.push(program.clone());
         }
         for key in env_keys {
-            argv.push("-e".into());
-            argv.push(key.clone());
+            args.push("-e".into());
+            args.push(key.clone());
         }
+        args.push(service.to_string());
+        args.extend(command.iter().skip(1).cloned());
+        self.compose(&args.iter().map(String::as_str).collect::<Vec<_>>())
     }
 }
 
@@ -203,31 +252,25 @@ mod tests {
 
     fn config() -> Config {
         let src = r#"
-version: 1
+version: 2
 project: demo
-network: demo_net
-docker:
-  images:
-    app: app-1
-  services:
-    nginx: { container: demo-nginx, recreate: never }
 compose:
   files: [base.yml, extra.yml]
 release:
-  image: app
+  service: app
   container_prefix: demo-app
-  run:
-    network_alias: app-rr
-    env: { TZ: UTC }
-    volumes: ['/host:/ctr']
-  healthcheck: { exec_in: demo-nginx, cmd: 'curl {container}' }
+  healthcheck: { exec_in: nginx, cmd: 'curl {container}' }
 cutover:
+  service: nginx
   backend_port: 8080
-  reload: { exec_in: demo-nginx, cmd: 'nginx -s reload' }
+  reload: { exec_in: nginx, cmd: 'nginx -s reload' }
+services:
+  nginx: { recreate: never }
 workers:
-  compose_file: workers.yml
+  service: worker
   provider: { static: [async] }
-  template: { image: app, entrypoint: [php], command: ['{name}'] }
+stages:
+  prod: {}
 "#;
         crate::config::load(src, None, &[], &HashMap::new()).unwrap()
     }
@@ -236,113 +279,101 @@ workers:
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The override file is appended unconditionally, so it must be written in
+    /// both local and remote mode or every compose call breaks (spec §7.0).
     #[test]
-    fn compose_is_always_fully_qualified_and_pins_implicit_dotenv_off() {
+    fn compose_is_fully_qualified_pins_dotenv_off_and_ends_with_the_override() {
         let cfg = config();
         let d = Docker::new(&cfg);
         assert_eq!(
-            d.compose(&["up", "-d", "nginx"], false).display(),
-            "docker compose -p demo --env-file /dev/null -f base.yml -f extra.yml up -d nginx"
-        );
-        assert_eq!(
-            d.compose(&["up", "-d"], true).display(),
-            "docker compose -p demo --env-file /dev/null -f base.yml -f extra.yml -f workers.yml up -d"
+            d.compose(&["up", "-d", "nginx"]).display(),
+            "docker compose -p demo --env-file /dev/null -f base.yml -f extra.yml -f dcd-image-override.prod.yml up -d nginx"
         );
     }
 
+    /// §7.6: `compose run` is a creation primitive; `--use-aliases` carries the
+    /// service's declared aliases, and values never enter the argv (INV-12).
     #[test]
-    fn run_black_builds_full_argv_with_bare_env_keys() {
+    fn run_black_creates_the_release_from_its_compose_service() {
         let cfg = config();
         let d = Docker::new(&cfg);
         assert_eq!(
-            d.run_black("demo-app-42", "reg/app:app-1", &keys(&["DATABASE_URL", "TZ"])).display(),
-            "docker run -d --name demo-app-42 --network demo_net --network-alias app-rr --restart unless-stopped -e DATABASE_URL -e TZ -v /host:/ctr reg/app:app-1"
+            d.run_black("demo-app-42", "app", &keys(&["DATABASE_URL", "TZ"])).display(),
+            "docker compose -p demo --env-file /dev/null -f base.yml -f extra.yml -f dcd-image-override.prod.yml run -d --name demo-app-42 --use-aliases --no-deps -e DATABASE_URL -e TZ app"
         );
     }
 
+    /// Compose forces `restart=no` on one-off containers; skipping this silently
+    /// breaks reboot-restart.
     #[test]
-    fn throwaway_runs_command_as_argv_no_shell() {
+    fn the_restart_policy_is_reapplied_after_creation() {
         let cfg = config();
-        let d = Docker::new(&cfg);
-        let cmd: Vec<String> = ["php", "bin/console", "app:db:migrate", "before"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
         assert_eq!(
-            d.run_throwaway("demo-migrate-42", "reg/app:app-1", &cmd, &keys(&["TZ"])).display(),
-            "docker run --rm --network demo_net --name demo-migrate-42 -e TZ reg/app:app-1 php bin/console app:db:migrate before"
+            Docker::new(&cfg).update_restart("demo-app-42", "unless-stopped").display(),
+            "docker update --restart unless-stopped demo-app-42"
         );
     }
 
+    /// §7.5: `-T` because stdin already carries the env document, `--entrypoint`
+    /// because the trailing words would otherwise be arguments to the service's
+    /// own entrypoint.
     #[test]
-    fn env_file_is_passed_to_run_and_throwaway_resolved_against_deploy_root() {
-        let src = r#"
-version: 1
-project: demo
-network: demo_net
-deploy_root: /srv/demo
-docker:
-  images: { app: app-1 }
-  services:
-    nginx: { container: demo-nginx, recreate: never }
-compose:
-  files: [base.yml]
-release:
-  image: app
-  container_prefix: demo-app
-  run:
-    env_file: app.env
-    env: { TZ: UTC }
-  healthcheck: { exec_in: demo-nginx, cmd: 'curl {container}' }
-cutover:
-  backend_port: 8080
-  reload: { exec_in: demo-nginx, cmd: 'nginx -s reload' }
-"#;
-        let cfg = crate::config::load(src, None, &[], &HashMap::new()).unwrap();
-        let d = Docker::new(&cfg);
+    fn migrate_before_overrides_the_entrypoint_and_disables_tty() {
+        let cfg = config();
+        let command = keys(&["php", "bin/console", "app:db:migrate", "before"]);
         assert_eq!(
-            d.run_black("demo-app-7", "reg/app:app-1", &keys(&["TZ"])).display(),
-            "docker run -d --name demo-app-7 --network demo_net --restart unless-stopped --env-file /srv/demo/app.env -e TZ reg/app:app-1"
-        );
-        let cmd: Vec<String> = ["php", "bin/console", "doctrine:migrations:migrate"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(
-            d.run_throwaway("demo-migrate-7", "reg/app:app-1", &cmd, &keys(&["TZ"])).display(),
-            "docker run --rm --network demo_net --name demo-migrate-7 --env-file /srv/demo/app.env -e TZ reg/app:app-1 php bin/console doctrine:migrations:migrate"
+            Docker::new(&cfg).run_throwaway("app", &command, &keys(&["TZ"])).display(),
+            "docker compose -p demo --env-file /dev/null -f base.yml -f extra.yml -f dcd-image-override.prod.yml run --rm -T --no-deps --entrypoint php -e TZ app bin/console app:db:migrate before"
         );
     }
 
+    /// §7.12: N containers from ONE service; trailing words override the
+    /// service's `command` while keeping its entrypoint.
     #[test]
-    fn worker_discovery_uses_project_label_and_name_filter() {
+    fn each_worker_is_one_container_from_the_same_service() {
         let cfg = config();
         let d = Docker::new(&cfg);
         assert_eq!(
-            d.worker_ps_names("worker-").display(),
-            "docker ps --filter label=com.docker.compose.project=demo --filter name=worker- --format {{.Names}}"
+            d.run_worker("worker-async", "worker", "async", &keys(&["--limit=100"]), &keys(&["TZ"])).display(),
+            "docker compose -p demo --env-file /dev/null -f base.yml -f extra.yml -f dcd-image-override.prod.yml run -d --name worker-async --no-deps -e TZ worker async --limit=100"
         );
     }
 
+    /// INV-14: discovery is by compose SERVICE label. A name-prefix filter would
+    /// match the release container, which the caller then `docker stop`s.
     #[test]
-    fn gc_queries_are_repository_scoped_and_include_stopped_containers() {
+    fn worker_discovery_filters_on_the_service_label_never_a_name() {
         let cfg = config();
-        let d = Docker::new(&cfg);
-        assert_eq!(
-            d.images_in("reg.example.com/demo").display(),
-            "docker images reg.example.com/demo --format {{.Repository}}:{{.Tag}}"
-        );
-        assert_eq!(d.container_images().display(), "docker ps -a --format {{.Image}}");
+        let rendered = Docker::new(&cfg).worker_ps_names("worker").display();
+        assert!(rendered.contains("label=com.docker.compose.service=worker"), "got: {rendered}");
+        assert!(rendered.contains("label=com.docker.compose.project=demo"));
+        assert!(!rendered.contains("name="), "a name filter would sweep the release container: {rendered}");
     }
 
     #[test]
-    fn stop_and_inspect_shapes() {
+    fn stopping_workers_carries_the_configured_signal_and_timeout() {
         let cfg = config();
-        let d = Docker::new(&cfg);
         assert_eq!(
-            d.stop(&["worker-a".into(), "worker-b".into()], 120).display(),
-            "docker stop --timeout 120 worker-a worker-b"
+            Docker::new(&cfg).stop(&keys(&["worker-async"]), 120, "SIGTERM").display(),
+            "docker stop --signal SIGTERM --timeout 120 worker-async"
         );
-        assert_eq!(
-            d.inspect_image("demo-postgres").display(),
-            "docker inspect demo-postgres --format {{.Config.Image}}"
-        );
+    }
+
+    /// `--filter name=` is an unanchored regex, so a decoy container would be
+    /// swept by the orphan reaper without the anchor and the escaping.
+    #[test]
+    fn name_filters_are_anchored_and_regex_escaped() {
+        let cfg = config();
+        let rendered = Docker::new(&cfg).ps_names("demo-app.v2", true).display();
+        assert!(rendered.contains(r"name=^demo-app\.v2"), "got: {rendered}");
+    }
+
+    /// An image with no healthcheck must report `none`, not blow up the template.
+    #[test]
+    fn health_inspection_tolerates_an_image_without_a_healthcheck() {
+        let cfg = config();
+        let rendered = Docker::new(&cfg).inspect_health("demo-app-42").display();
+        assert!(rendered.contains("{{if .State.Health}}"), "got: {rendered}");
+        assert!(rendered.contains("{{else}}none{{end}}"));
     }
 }
