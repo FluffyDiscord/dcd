@@ -211,10 +211,8 @@ impl SshRunner {
         // severed link as an application failure, and the best-effort call sites
         // would swallow it and keep issuing commands (spec §2.7).
         if out.code == 255 && out.stdout.is_empty() {
-            return Err(RunError::NonZero {
+            return Err(RunError::Transport {
                 argv: argv.display(),
-                code: 255,
-                stdout: out.stdout,
                 stderr: format!(
                     "connection to {} lost or refused: {}",
                     self.target.target(),

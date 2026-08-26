@@ -92,6 +92,12 @@ pub enum RunError {
         source: std::io::Error,
     },
 
+    /// ssh itself failed — auth, DNS, a dropped link — rather than the command it
+    /// carried. Kept apart so a severed network is not classified as the deploy
+    /// being rejected (spec §8.1 exit 6).
+    #[error("{stderr}")]
+    Transport { argv: String, stderr: String },
+
     #[error("command failed ({code}): `{argv}`\n{stderr}")]
     NonZero {
         argv: String,

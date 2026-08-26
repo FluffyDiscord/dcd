@@ -20,6 +20,12 @@ pub enum DcdError {
         actual: String,
     },
 
+    /// ssh's own failure — auth, DNS, a dropped link — as opposed to a command
+    /// that ran on the target and failed. Kept distinct so a severed network is
+    /// not reported as an application error (spec §8.1, §11).
+    #[error("transport: {0}")]
+    Transport(String),
+
     #[error("lua: {0}")]
     Lua(String),
 
@@ -35,6 +41,7 @@ impl DcdError {
             DcdError::LockHeld { .. } => 3,
             DcdError::PostCutover(_) => 4,
             DcdError::HostMismatch { .. } => 5,
+            DcdError::Transport(_) => 6,
             DcdError::Lua(_) => 10,
             DcdError::Interrupted => 130,
         }
