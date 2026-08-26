@@ -1,3 +1,70 @@
+UPGRADE FROM 0.5.x to v2 (SSH transport + compose-owned containers)
+==================================================================
+
+**v2 does not read a v1 `dcd.yaml`.** Every removed key produces a targeted error naming its
+replacement, so `dcd check` is the migration checklist. There is no automatic conversion.
+
+What changed, and why
+---------------------
+
+1. **dcd runs on the deploying machine.** It reaches the target over SSH instead of being
+   copied there and executed. CI drops the `scp dcd dcd.yaml … && ssh server "cd … &&
+   ./dcd deploy"` wrapper and runs `dcd deploy prod` from the checkout.
+2. **Your compose file declares the containers.** dcd stopped re-spelling image, env,
+   volumes, restart policy, network alias, entrypoint and command in a private dialect. The
+   release container is created with `docker compose run` against your own service.
+
+Key by key
+----------
+
+| v1 | v2 |
+|----|----|
+| *(nothing)* | `ssh: deploy@host` — omit to keep driving a local Docker socket |
+| `docker.images.<name>: <tag>` | delete. Images come from the compose file; pin one per run with `--image <service>=<ref>` |
+| `docker.services.<name>.image` / `.container` | delete. Identity comes from the compose service |
+| `docker.services.<name>.recreate` / `.on_recreate_drain_workers` / `.wait` | move to top-level `services.<name>` (policy only) |
+| `network: x` | delete. Networks are declared in compose; dcd no longer creates them |
+| `release.image: app` | `release.service: app` (a compose service) |
+| `release.run.*` | delete — declare it on the compose service. Kept as `release.run` **only** for a project with no compose service for the app, where it is mutually exclusive with `service:` |
+| `release.healthcheck` | optional now: the compose service's own `healthcheck:` is the default gate. Keep it as the escape hatch when the image cannot self-probe. `exec_in` is now a **service** name |
+| `cutover.reload.exec_in: my-nginx` | a **service** name, and `cutover.service:` is now required |
+| `workers.template.*` | delete — declare a worker compose service instead |
+| `workers.compose_file` | delete. dcd renders no workers file; N containers come from ONE service |
+| `workers.name_filter` | `workers.name_prefix` — naming only. Discovery is by compose service label |
+| *(nothing)* | `workers.service` — required, and must **not** equal `release.service` |
+| `retention.keep_images` keyed by image logical | keyed by **compose service name** |
+| `plugins:` relative to `deploy_root` | relative to the **config file's directory**; they run locally and are never uploaded |
+
+Before the first v2 deploy
+--------------------------
+
+- **Give every managed service a health gate.** The release service and every service under
+  `services:` must declare a compose `healthcheck:` or a `wait:` probe. This is now an
+  error: `compose up --wait` returns as soon as a container is *running* when it declares no
+  healthcheck, so a missing gate would let dcd cut over to a database that is not ready.
+- **Add `profiles: ["dcd-release"]`** to the app and worker services. Not required, but
+  without it a hand-run `docker compose up` starts a second app container beside the release.
+- **Mount the upstream file into the router.** dcd writes
+  `{deploy_root}/{cutover.upstream_file}`; only your compose file can put it inside the
+  container.
+- **Check what your compose file references by relative path.** dcd uploads the compose
+  documents and nothing they point at — bind-mount sources, `env_file:` targets and build
+  contexts must already exist on the target. `dcd check` warns, naming each one.
+- The deploying machine needs `docker` with the compose plugin (the model is resolved
+  locally) and `ssh`; the target needs `docker`, `sshd`, a POSIX shell and `flock`.
+
+v1 workers are reaped once, automatically
+-----------------------------------------
+
+v1 generated one compose *service per worker* (`worker-async`, `worker-sched`), so those
+containers carry `com.docker.compose.service=worker-async` — which v2's discovery filter
+(`service=<workers.service>`) can never match. Left alone they would never be drained, and
+the first v2 deploy would collide on the container name after cutover. So while a stage has
+no v2 release recorded, `preflight` removes any container under `workers.name_prefix` whose
+compose service label is not `workers.service`, naming each one. It runs once; a stage that
+already has a recorded release never sweeps its live workers.
+
+
 UPGRADE FROM 0.5.1 to 0.5.3
 ===========================
 

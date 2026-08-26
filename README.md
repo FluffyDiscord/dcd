@@ -1,19 +1,25 @@
 # dcd
 
-Zero-downtime **red-black** Docker deploys from a YAML file targeting Nginx as proxy. One static binary, runs on
-the server, talks to the local Docker socket.
+Zero-downtime **red-black** Docker deploys from a YAML file. One static binary that runs on
+**your** machine — a CI runner or a laptop — and drives the target over SSH. Nothing is
+installed on the server.
 
-It builds the new ("black") container next to the live ("red") one, health-checks it,
-flips nginx to it, and drains the old one — without dropping a request.
+It creates the new ("black") container from your compose service next to the live ("red")
+one, waits for its health gate, flips the router to it, and drains the old one — without
+dropping a request.
+
+**Your compose file declares the containers; `dcd.yaml` declares the orchestration.**
+Images, env, volumes, restart policies and network aliases stay where you already write
+them.
 
 ## Quickstart
 
 ```bash
-dcd init                 # writes a starter dcd.yaml
-$EDITOR dcd.yaml         # fill in your images / services / healthcheck
-dcd check prod           # validate it
-dcd deploy prod --dry-run   # see every action, run nothing
-dcd deploy prod          # do it
+dcd init --from-compose docker-compose.prod.yml   # derive a dcd.yaml from what you have
+$EDITOR dcd.yaml                                  # name the app + router services
+dcd check prod                                    # validate it (no ssh, touches nothing)
+dcd deploy prod --dry-run                         # see every action, run nothing
+dcd deploy prod                                   # do it
 ```
 
 ## Commands
@@ -30,16 +36,19 @@ dcd deploy prod          # do it
 | `dcd gc [stage]` | reclaim disk: remove image versions past the retention counts (`--all` also offers host tags dcd never recorded, after asking) |
 | `dcd check [stage]` | validate the config |
 | `dcd init` | scaffold a `dcd.yaml` (`--with-plugin` adds a Lua stub) |
+| `dcd init --from-compose <file>` | derive a `dcd.yaml` from an existing compose file |
+| `dcd schema` | print a JSON Schema for `dcd.yaml`, for editor completion |
 | `dcd deploy -v [stage]` | trace every command: argv, exit code, elapsed, output |
 | `dcd --version` | the built version (`-V`) |
 
-Global flags: `--config <path>` · `--env-dir <path>` · `--env-file <path>` · `--env-stdin` ·
-`--json` · `--image app=<tag>` (repeatable) · `--set path=value` (repeatable) · `--yes` ·
-`--reason <text>` · `-v/--verbose` · `-V/--version`.
+Global flags: `--config <path>` · `--ssh <target>` · `--env-dir <path>` · `--env-file <path>` ·
+`--env-stdin` · `--json` · `--image <service>=<ref>` (repeatable) · `--set path=value`
+(repeatable) · `--yes` · `--reason <text>` · `-v/--verbose` · `-V/--version`.
 
 Env comes from a Symfony-style dotenv chain next to `dcd.yaml` (`.env` → `.env.local` →
 `.env.<stage>` → `.env.<stage>.local`, real env wins); every chain-defined key reaches the
-containers via process-env passthrough — dcd writes no env file on the server.
+containers as a bare `-e KEY`, with the values riding a document on ssh **stdin** — so no
+value ever appears in an argv on either machine, and dcd writes no env file anywhere.
 `--env-file .env.deploy` rebases the whole chain onto another base name
 (`.env.deploy` → `.env.deploy.local` → `.env.deploy.<stage>` → `.env.deploy.<stage>.local`),
 so dcd's chain can live beside the app's own `.env` files without colliding.
@@ -66,9 +75,10 @@ the lock.
 
 ## dcd.yaml
 
-Drives the whole deploy — images, managed services, the app's healthcheck, migrations,
-workers, cutover, retention, and simple `hooks`. The **common case needs no Lua**.
-See the fully-worked [RoadRunner example](docs/examples/roadrunner_app/dcd.yaml).
+Drives the orchestration — which service is cut over to, how traffic switches, migrations,
+drain, worker discovery, recreate policy, retention, and simple `hooks`. Containers
+themselves are declared in your compose file. The **common case needs no Lua**.
+See the fully-worked [example](docs/examples/roadrunner_app/) — config *and* its compose file.
 
 ## Lua plugins
 
@@ -87,7 +97,7 @@ registers tasks/hooks at the top level; each hook gets a `ctx`.
 | `cfg` / `state` | the live config / deploy state — **mutable**, same tables as `ctx.cfg`/`ctx.state` |
 
 Hook steps you can target with `before_`/`after_`:
-`preflight` · `ensure_upstream` · `pull` · `infra` · `migrate:before` · `start:black` ·
+`sync` · `preflight` · `ensure_upstream` · `pull` · `infra` · `migrate:before` · `start:black` ·
 `healthcheck` · `cutover` · `drain:red` · `migrate:after` · `workers` · `finalize`
 (plus the special `configure`).
 
@@ -97,7 +107,7 @@ Routed through the engine, so they're **dry-run-safe** (and observable in `--dry
 
 | Call | Returns | Does |
 |------|---------|------|
-| `ctx.run(cmd)` | stdout | shell command on the server (in `deploy_root`) |
+| `ctx.run(cmd)` | stdout | shell command on the target (in `deploy_root`) |
 | `ctx.in_release(cmd)` | stdout | run **inside the new app container** |
 | `ctx.exec_in(svc, cmd)` | stdout | run inside a managed service (e.g. `'nginx'`) |
 | `ctx.docker({args})` | stdout | raw `docker …` |
@@ -166,7 +176,7 @@ after('cutover', function(ctx) ctx.dump() end)
 
 Every release publishes the binary as `linux/amd64` + `linux/arm64` images on GHCR, in a
 Debian-slim and an Alpine flavour. The binary is statically linked, so either flavour can be
-copied into any base image:
+copied into the **CI image that runs the deploy** (dcd runs there, not on the server):
 
 ```dockerfile
 COPY --from=ghcr.io/fluffydiscord/dcd:0.5.3 /usr/local/bin/dcd /usr/local/bin/dcd
@@ -192,6 +202,7 @@ git tag v0.5.3 && git push origin v0.5.3
 ```bash
 cargo test                                                  # unit + integration, no Docker
 DCD_E2E=1 cargo test --test e2e -- --test-threads=1         # real-Docker integration
+DCD_E2E=1 cargo test --test e2e_ssh -- --test-threads=1     # a full deploy over ssh
 cargo build --release --target x86_64-unknown-linux-musl    # static binary
 ```
 
