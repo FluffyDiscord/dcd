@@ -44,8 +44,14 @@ pub struct Release {
 }
 
 impl Release {
+    /// The release service's image. `images` is keyed by COMPOSE SERVICE name and
+    /// built from `gc_services()`, whose first entry is always the release service
+    /// — so the first entry is the release image whatever the service is called.
+    /// Keying on the literal `"app"` (the v1 logical name) made `rollback_target`
+    /// compare `None != None` for every candidate, so rollback was impossible for
+    /// any project whose release service is named anything else.
     pub fn app_image(&self) -> Option<&str> {
-        self.images.get("app").map(String::as_str)
+        self.images.first().map(|(_, image)| image.as_str())
     }
 }
 
@@ -795,5 +801,65 @@ mod tests {
         let json = state.to_json();
         let back = State::from_json(json.as_bytes()).unwrap();
         assert_eq!(back.stage("prod").unwrap().releases.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod release_image_tests {
+    use super::*;
+
+    /// The regression: `app_image` read the literal key `"app"`, but `images` is
+    /// keyed by compose service name. For any project whose release service is
+    /// called something else — which `dcd init --from-compose` readily generates —
+    /// every candidate compared `None != None`, so `rollback_target` returned None
+    /// and rollback was permanently impossible.
+    #[test]
+    fn the_release_image_is_found_whatever_the_release_service_is_called() {
+        for service in ["app", "web", "api", "php", "backend", "demo-release"] {
+            let mut images = IndexMap::new();
+            images.insert(service.to_string(), "reg/app:v2".to_string());
+            images.insert("postgres".to_string(), "postgres:16".to_string());
+            let release = Release {
+                id: 1,
+                container: format!("demo-{service}-1"),
+                images,
+                created_at: 1,
+                status: ReleaseStatus::Active,
+                ran_migrations: false,
+                reason: None,
+                env_keys: Vec::new(),
+                reaped: false,
+            };
+            assert_eq!(release.app_image(), Some("reg/app:v2"), "release service {service}");
+        }
+    }
+
+    /// The whole point of the key: rollback has to see two DIFFERENT images to
+    /// offer a target, and a same-tag redeploy must not count as one.
+    #[test]
+    fn rollback_finds_the_previous_release_for_a_non_app_service() {
+        let release = |id: u64, image: &str, status: ReleaseStatus| {
+            let mut images = IndexMap::new();
+            images.insert("web".to_string(), image.to_string());
+            Release {
+                id,
+                container: format!("demo-web-{id}"),
+                images,
+                created_at: id,
+                status,
+                ran_migrations: false,
+                reason: None,
+                env_keys: Vec::new(),
+                reaped: false,
+            }
+        };
+        let mut stage = StageState::default();
+        stage.releases.push(release(100, "reg/app:v1", ReleaseStatus::Superseded));
+        stage.releases.push(release(200, "reg/app:v2", ReleaseStatus::Active));
+        stage.current = Some("demo-web-200".to_string());
+
+        let target = stage.rollback_target().expect("a rollback target");
+        assert_eq!(target.container, "demo-web-100");
+        assert_eq!(target.app_image(), Some("reg/app:v1"));
     }
 }
