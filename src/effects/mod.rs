@@ -5,7 +5,7 @@
 mod real;
 mod record;
 
-pub use real::{SystemClock, SystemFs, SystemRunner};
+pub use real::{SshFs, SshRunner, SystemClock, SystemFs, SystemRunner};
 pub use record::{DryRunRunner, FixedClock, MemoryFs, RecordingRunner};
 
 use std::path::Path;
@@ -45,17 +45,21 @@ pub struct RunOpts {
     /// Per-command env overlay applied on top of the runner's own env — the
     /// delivery path for the explicit config env maps (spec §5.2.4).
     pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// Bytes piped to the command's stdin. Over SSH this is how env values reach
+    /// the target at all, since a local process env does not cross the wire — and
+    /// it is why they never appear in an argv on either machine (INV-12).
+    pub stdin: Option<Vec<u8>>,
 }
 
 impl Default for RunOpts {
     fn default() -> Self {
-        RunOpts { check: true, env: None }
+        RunOpts { check: true, env: None, stdin: None }
     }
 }
 
 impl RunOpts {
     pub fn unchecked() -> Self {
-        RunOpts { check: false, env: None }
+        RunOpts { check: false, env: None, stdin: None }
     }
 }
 
@@ -88,6 +92,12 @@ pub enum RunError {
         source: std::io::Error,
     },
 
+    /// ssh itself failed — auth, DNS, a dropped link — rather than the command it
+    /// carried. Kept apart so a severed network is not classified as the deploy
+    /// being rejected (spec §8.1 exit 6).
+    #[error("{stderr}")]
+    Transport { argv: String, stderr: String },
+
     #[error("command failed ({code}): `{argv}`\n{stderr}")]
     NonZero {
         argv: String,
@@ -106,7 +116,10 @@ pub trait CommandRunner {
 pub trait FileSystem {
     fn write(&self, path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()>;
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
-    fn exists(&self, path: &Path) -> bool;
+    /// Fallible on purpose: over ssh, "I could not ask" is not "the file is not
+    /// there". Collapsing the two let a single failed probe read as a fresh stage
+    /// and overwrite a live upstream file.
+    fn exists(&self, path: &Path) -> std::io::Result<bool>;
     fn remove(&self, path: &Path) -> std::io::Result<()>;
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
 }

@@ -26,9 +26,10 @@ the flip is atomic and the old container drains gracefully.
 
 ```
 dcd.yaml                  the deploy config (prod + beta stages)
-docker-compose.prod.yml   side containers: router, mariadb, meilisearch, scheduler
+docker-compose.prod.yml   EVERY container, the red-black app included: app, router, mariadb,
+                            meilisearch, scheduler
 docker-compose.beta.yml   beta-only overlay: adds mailpit + a loopback DB port
-router/                   the dcd cutover-target nginx (built on the server): Dockerfile, router.conf, maintenance.html
+router/                   the dcd cutover-target nginx (CI-built, pushed to the registry): Dockerfile, router.conf, maintenance.html
 host-nginx.example.conf   reference vhost for the SYSTEM nginx (TLS terminator → router :8080/:8081)
 .env.deploy.app.example   template for app secrets   → copy to .env.deploy.app   (0600)
 .env.deploy.infra.example template for infra secrets → copy to .env.deploy.infra (0600)
@@ -40,8 +41,12 @@ app-image/                REFERENCE (lives in the app repo, baked into the image
   scheduler.sh              the scheduler loop, gated by SCHEDULER_ENABLED
 ```
 
-The `dcd.yaml` + compose + router + `.env.*` files live at `$DEPLOY_ROOT` on the server (CI rsyncs
-them there). `app-image/` is shown only so the release side of the picture is complete.
+`dcd.yaml` and the compose files live in the **repo**; dcd uploads them to `$DEPLOY_ROOT` at
+the start of every deploy, so nothing is rsynced by hand. The `.env.deploy.*` files are the
+exception — compose reads them by relative path, and dcd uploads the compose *documents* and
+nothing they reference, so those stay operator-managed on the server (`dcd check` warns,
+naming each such path). `app-image/` is shown only so the release side of the picture is
+complete.
 
 ## Why FPM changes almost nothing
 
@@ -71,11 +76,13 @@ stays global so every stage consumes.
 `project` is pinned (not derived from the `deploy_root` folder name) so the two stages coexist on one
 host regardless of their paths — and a folder name with a dot in it (which Compose v2 rejects as a
 project name) can never leak in. Every container name, the network, and `COMPOSE_PROJECT_NAME` come
-from `{project}` — see how `dcd.yaml` uses `'{project}-router'`, `'{project}-app'`, etc.
+from `{project}` — see how `dcd.yaml` uses `'{project}-app'` for the container prefix, and how
+the compose file uses `${COMPOSE_PROJECT_NAME}` for each `container_name`.
 
 ## One-time bootstrap (per stage)
 
 ```sh
+# On the SERVER (dcd itself now runs on the CI runner, not here):
 cd "$DEPLOY_ROOT"
 
 # 1. Registry auth is EPHEMERAL. The CI deploy job logs the server in with job-scoped creds
@@ -94,12 +101,15 @@ chown -R 1000:1000 data/uploads data/private data/log
 # 4. Wire the system nginx: adapt host-nginx.example.conf (set X-Forwarded-Proto $scheme!), enable, reload.
 ```
 
-dcd creates the `<project>_default` network and generates `nginx-upstream.conf` itself — do not
-hand-edit it. (No `compose.env` file exists anymore; compose gets its variables via the process
-environment. Alternative to step 2's at-rest files: keep app secrets in a `.env.prod.local` next
-to `dcd.yaml` — or stream them with `--env-stdin` — and dcd delivers them to the app/migrate
-containers with nothing written to the server; the infra side containers here still use their
-compose `env_file:`.)
+dcd generates `nginx-upstream.conf` itself — do not hand-edit it. The network is declared in the
+compose file and created by `compose up`; dcd only inspects it, to fail early with a clear error.
+Compose gets its variables via the process environment, from the resolved dotenv chain.
+
+Alternative to step 2's at-rest files: keep app secrets in a `.env.prod.local` next to
+`dcd.yaml` — or stream them with `--env-stdin` — and dcd delivers them to the app, migrate and
+worker containers as bare `-e KEY` with the values riding ssh stdin, writing nothing to the
+server. The infra side containers here still use their compose `env_file:`, which is why those
+two files remain operator-managed on the target.
 
 ## Operating it
 

@@ -1,0 +1,20 @@
+-- Plugins (loaded at startup) register tasks and hooks.
+--
+-- Adjust the config before the deploy, based on runtime truths. cfg is mutable: just
+-- assign to it — the change flows back into the deploy (no helper function):
+-- configure(function(ctx)
+--   if ctx.env('CANARY') == '1' then ctx.cfg.retention.keep_releases = 5 end
+-- end)
+--
+-- ctx available inside hooks:
+--   effects: run, in_release, exec_in, docker, compose, cp_from_release, cp_to_release
+--   files:   read_file, write_file, file_exists, env
+--   data:    cfg (config) and state (current + history) are LIVE — assign to them and the
+--            engine reads it back; vars is scratch shared across hooks
+--   utils:   json_decode/encode, yaml_decode/encode, log, warn, dump, inspect
+--
+-- task('myapp:warmup', function(ctx)
+--   ctx.log('warming up ' .. ctx.container)
+--   ctx.in_release('php bin/console cache:warmup')
+-- end)
+-- after('healthcheck', 'myapp:warmup')

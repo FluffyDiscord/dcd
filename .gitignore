@@ -4,3 +4,6 @@
 Cargo.lock.orig
 .DS_Store
 .idea/
+
+# staged into the fixture build context by tests/ssh_*.rs
+tests/fixtures/*/authorized_key

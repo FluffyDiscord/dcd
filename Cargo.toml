@@ -21,6 +21,7 @@ signal-hook = "0.3"
 gethostname = "0.5"
 mlua = { version = "0.10", features = ["lua54", "vendored", "serialize"] }
 regex-lite = "0.1.9"
+schemars = { version = "1.2.2", features = ["indexmap2"] }
 
 [dev-dependencies]
 assert_cmd = "2"

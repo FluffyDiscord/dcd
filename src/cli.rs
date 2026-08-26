@@ -7,13 +7,16 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{self, Config};
+use crate::compose::{self, ComposeModel};
+use crate::config::{self as config, Config};
 use crate::effects::{
-    Access, Argv, CommandRunner, DryRunRunner, FileSystem, RunOpts, SystemClock, SystemFs, SystemRunner,
+    Access, Argv, CommandRunner, DryRunRunner, FileSystem, RunOpts, SshFs, SshRunner, SystemClock, SystemFs,
+    SystemRunner,
 };
+use crate::ssh::SshTarget;
 use crate::engine::{Engine, Options, DEPLOY_STEPS};
 use crate::error::{DcdError, Result};
-use crate::lock::StageLock;
+use crate::lock::{LeasedLock, StageLock};
 use crate::lua::{HookHost, LuaHost};
 use crate::signal::Interrupt;
 use crate::state::State;
@@ -52,6 +55,9 @@ pub struct Cli {
     /// Path to the config file
     #[arg(short, long, global = true, default_value = "dcd.yaml")]
     config: std::path::PathBuf,
+    /// SSH target to deploy to, overriding `ssh:` (user@host, or an ~/.ssh/config Host alias)
+    #[arg(long, global = true, value_name = "TARGET")]
+    ssh: Option<String>,
     /// Emit machine-readable JSON events instead of human output
     #[arg(long, global = true)]
     json: bool,
@@ -64,8 +70,8 @@ pub struct Cli {
     /// Override a config value by dotted path, e.g. retention.keep_releases=5 (repeatable)
     #[arg(long = "set", global = true, value_name = "PATH=VALUE")]
     sets: Vec<String>,
-    /// Override an image tag — sets docker.images.<logical> (repeatable)
-    #[arg(long = "image", global = true, value_name = "LOGICAL=TAG")]
+    /// Pin a compose service's image for this run (repeatable)
+    #[arg(long = "image", global = true, value_name = "SERVICE=REF")]
     images: Vec<String>,
     /// Directory of the dotenv chain (.env, .env.local, .env.<stage>[.local]);
     /// defaults to the config file's directory
@@ -151,11 +157,37 @@ enum Command {
         /// Also write plugins/app.lua (a commented hook stub)
         #[arg(long)]
         with_plugin: bool,
+        /// Derive the config from an existing compose file instead of the generic scaffold
+        #[arg(long = "from-compose", value_name = "FILE")]
+        from_compose: Option<PathBuf>,
     },
+    /// Print a JSON Schema for dcd.yaml, for editor completion and inline validation.
+    Schema,
 }
 
 pub fn run() -> Result<()> {
     dispatch(Cli::parse())
+}
+
+/// `--image` is global for convenience, but it only chooses an image on the
+/// commands that deploy or validate one. On `gc` a pin would change which tags
+/// count as in-use and could make the live image prunable; on `rollback` the
+/// recorded ref wins and the flag would be silently ignored. Refusing beats both.
+fn reject_pins_where_they_do_nothing(cli: &Cli) -> Result<()> {
+    if cli.images.is_empty() {
+        return Ok(());
+    }
+    let applies = matches!(cli.command, Command::Deploy { .. } | Command::Check { .. });
+    if applies {
+        return Ok(());
+    }
+    let reason = match cli.command {
+        Command::Rollback { .. } => " — rollback replays the image it recorded",
+        _ => "",
+    };
+    Err(DcdError::Config(format!(
+        "--image applies to `deploy` and `check` only{reason}"
+    )))
 }
 
 fn stage_of(command: &Command) -> Option<&str> {
@@ -167,26 +199,29 @@ fn stage_of(command: &Command) -> Option<&str> {
         | Command::Tasks { stage }
         | Command::Gc { stage, .. }
         | Command::Check { stage } => stage.as_deref(),
-        Command::Init { .. } => None,
+        Command::Init { .. } | Command::Schema => None,
     }
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
-    if let Command::Init { force, with_plugin } = &cli.command {
-        return init(&cli.config, *force, *with_plugin);
+    // Before the early returns, or `dcd schema --image bogus` succeeds while
+    // `dcd check --image bogus` errors.
+    image_pins(&cli.images)?;
+    reject_pins_where_they_do_nothing(&cli)?;
+
+    if let Command::Init { force, with_plugin, from_compose } = &cli.command {
+        return init(&cli.config, *force, *with_plugin, from_compose.as_deref());
+    }
+    if matches!(cli.command, Command::Schema) {
+        return schema();
     }
 
     let process_env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    let mut sets = cli.sets.clone();
-    for image in &cli.images {
-        let (logical, tag) = image
-            .split_once('=')
-            .ok_or_else(|| DcdError::Config(format!("--image `{image}` must be logical=tag")))?;
-        sets.push(format!("docker.images.{logical}={tag}"));
-    }
+    let sets = cli.sets.clone();
 
     let source = std::fs::read_to_string(&cli.config)
         .map_err(|e| DcdError::Config(format!("cannot read {}: {e}", cli.config.display())))?;
+    let config_dir = cli.config.parent().unwrap_or(Path::new(".")).to_path_buf();
     let stage_name = config::peek_stage(&source, stage_of(&cli.command))?;
     let stdin_document = read_env_stdin(&cli)?;
     let chain_base = chain_base(&cli);
@@ -199,8 +234,39 @@ fn dispatch(cli: Cli) -> Result<()> {
         &process_env,
     )?;
     let mut cfg = config::load(&source, stage_of(&cli.command), &sets, &resolved.interpolation_env)?;
+    materialise_release_run(&mut cfg, &config_dir)?;
     let reporter = Reporter::auto(cli.json, cli.verbose);
 
+    // Spec §2.7: over ~107 bytes ssh FAILS rather than degrading to an
+    // unmultiplexed connection, so the length is checked before any connection is
+    // attempted.
+    if let Some(target) = ssh_target(&cfg, &cli) {
+        require_control_path_fits(&target)?;
+    }
+    dispatch_command(&cfg, &cli, &reporter, &resolved, chain_base.as_deref(), config_dir)
+}
+
+fn require_control_path_fits(target: &SshTarget) -> Result<()> {
+    prepare_control_directory()?;
+    if target.control_path_fits() {
+        return Ok(());
+    }
+    Err(DcdError::Config(format!(
+        "the ssh ControlPath expands to {} bytes, over the {} the socket allows — set XDG_RUNTIME_DIR to a shorter directory",
+        target.expanded_control_path_bytes(),
+        SshTarget::max_control_path_bytes()
+    )))
+}
+
+fn dispatch_command(
+    cfg: &Config,
+    cli: &Cli,
+    reporter: &Reporter,
+    resolved: &crate::dotenv::ResolvedEnv,
+    chain_base: Option<&Path>,
+    config_dir: PathBuf,
+) -> Result<()> {
+    let mut cfg = cfg.clone();
     match &cli.command {
         Command::Deploy { .. } | Command::Rollback { .. } => {
             let run = if matches!(cli.command, Command::Rollback { .. }) {
@@ -208,7 +274,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 Run::Deploy
             };
-            let plugins = load_plugins(&cfg)?;
+            let plugins = load_plugins(&cfg, &config_dir)?;
             let lua_host = if plugins.is_empty() {
                 None
             } else {
@@ -216,13 +282,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             if let Some(host) = &lua_host {
                 if host.has_hook("configure") {
-                    let state = load_state(&cfg.deploy_root)?;
+                    let state = load_state(engine_fs(&cfg, cli, resolved).as_ref(), &cfg.deploy_root)?;
                     let stage = state.stage(&cfg.stage).cloned().unwrap_or_default();
                     host.refresh(&cfg, &stage).map_err(DcdError::Lua)?;
                     let before = host.read_cfg().map_err(DcdError::Lua)?;
                     let configure_host = ConfigureHost {
-                        reporter: &reporter,
-                        runner: SystemRunner::with_context(resolved.container_env.clone(), cfg.deploy_root.clone()),
+                        reporter,
+                        runner: engine_runner(&cfg, cli, resolved),
+                        fs: engine_fs(&cfg, cli, resolved),
                         interpolation_env: resolved.interpolation_env.clone(),
                         deploy_root: cfg.deploy_root.clone(),
                         stage: cfg.stage.clone(),
@@ -234,14 +301,28 @@ fn dispatch(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            execute(&cfg, &cli, &reporter, run, lua_host.as_ref(), &resolved)
+            execute(&cfg, cli, reporter, run, lua_host.as_ref(), resolved)
         }
-        Command::Unlock { .. } => unlock(&cfg, &cli, &reporter, &resolved),
-        Command::Status { .. } => status(&cfg, &reporter),
-        Command::Gc { all, .. } => gc(&cfg, &cli, &reporter, *all, &resolved),
-        Command::Tasks { .. } => tasks(&cfg, &reporter),
-        Command::Check { .. } => check_report(&cfg, &reporter, &resolved, chain_base.as_deref()),
-        Command::Init { .. } => unreachable!("handled above"),
+        Command::Unlock { .. } => unlock(&cfg, cli, reporter, resolved),
+        Command::Status { .. } => status(&cfg, cli, resolved, reporter),
+        Command::Gc { all, .. } => gc(&cfg, cli, reporter, *all, resolved),
+        Command::Tasks { .. } => tasks(&cfg, reporter),
+        Command::Check { .. } => {
+            check_report(&cfg, reporter, resolved, chain_base)?;
+            // Every failure `check` exists to catch, before a deploy touches
+            // anything: plugin sources load, the model resolves, every service
+            // reference exists, every health gate is declared.
+            let plugins = load_plugins(&cfg, &config_dir)?;
+            if !plugins.is_empty() {
+                LuaHost::load(&cfg, &plugins).map_err(DcdError::Lua)?;
+                reporter.log(&format!("plugins: {} loaded", plugins.len()));
+            }
+            let model = resolve_compose_model(&cfg, cli, resolved)?;
+            reporter.log("compose: every referenced service exists and declares a health gate");
+            warn_compose_shape(&cfg, &model, reporter);
+            Ok(())
+        }
+        Command::Init { .. } | Command::Schema => unreachable!("handled above"),
     }
 }
 
@@ -266,25 +347,30 @@ fn check_report(
         ));
     }
 
-    let run = &cfg.release.run;
+    let empty = indexmap::IndexMap::new();
+    let (include, exclude, explicit) = match &cfg.release.run {
+        Some(run) => (run.env_include.clone(), run.env_exclude.clone(), run.env.clone()),
+        None => (Vec::new(), Vec::new(), empty),
+    };
     let release_keys =
-        crate::dotenv::delivered_keys(&resolved.container_env, &run.env_include, &run.env_exclude, run.env.keys())?;
-    reporter.log(&format!("env: release/migrate containers receive: [{}]", release_keys.join(", ")));
-    if let Some(workers) = &cfg.workers {
-        let template = &workers.template;
-        let worker_keys = crate::dotenv::delivered_keys(
-            &resolved.container_env,
-            &template.env_include,
-            &template.env_exclude,
-            template.env.keys(),
-        )?;
-        reporter.log(&format!("env: worker containers receive: [{}]", worker_keys.join(", ")));
-    }
+        crate::dotenv::delivered_keys(&resolved.container_env, &include, &exclude, explicit.keys())?;
+    reporter.log(&format!(
+        "env: release/migrate/worker containers receive: [{}]",
+        release_keys.join(", ")
+    ));
 
+    // The v1 allow-list became a blanket pass, so the key names have to stay
+    // visible: a typo'd ${...} in any compose file now interpolates a real value.
+    let compose_keys: Vec<&str> = resolved.container_env.keys().map(String::as_str).collect();
+    reporter.log(&format!("env: compose receives: [{}]", compose_keys.join(", ")));
+
+    // Local only. `deploy_root` is on the TARGET under ssh, and probing it would
+    // both address the wrong machine and make `check` — documented as opening no
+    // connection — pay a ConnectTimeout in a CI lint job with no ssh access.
     let stray = cfg.deploy_root.join(".env");
     let base_real = chain_base.and_then(|base| base.canonicalize().ok());
     let is_same_file = base_real.is_some() && stray.canonicalize().ok() == base_real;
-    if stray.exists() && !is_same_file {
+    if cfg.ssh.is_none() && stray.exists() && !is_same_file {
         reporter.warn(&format!(
             "{} exists but is not part of dcd's chain — compose never reads it (dcd pins compose's --env-file to /dev/null)",
             stray.display()
@@ -345,19 +431,20 @@ fn execute(
     lua: Option<&LuaHost>,
     resolved: &crate::dotenv::ResolvedEnv,
 ) -> Result<()> {
-    host_guard(cfg)?;
+    host_guard(cfg, cli)?;
 
     let clock = SystemClock;
-    let holder = format!("pid {} since {}", std::process::id(), hhmmss(now_epoch()));
-    let _lock = StageLock::acquire(&cfg.deploy_root, &cfg.stage, &holder)?;
+    let holder = format!("{} pid {} since {}", hostname(), std::process::id(), hhmmss(now_epoch()));
+    let _lock = acquire_lock(cfg, cli, resolved, &holder, reporter)?;
 
-    let state = load_state(&cfg.deploy_root)?;
+    let state = load_state(engine_fs(cfg, cli, resolved).as_ref(), &cfg.deploy_root)?;
     let interrupt = Interrupt::install();
-    let opts = engine_options(cli, resolved);
+    let opts = engine_options(cfg, cli, resolved);
     let runner = engine_runner(cfg, cli, resolved);
-    let fs = SystemFs;
+    let fs = engine_fs(cfg, cli, resolved);
 
-    let mut engine = Engine::new(cfg.clone(), runner.as_ref(), &fs, &clock, reporter, &interrupt, state, opts);
+    let model = resolve_compose_model(cfg, cli, resolved)?;
+    let mut engine = Engine::new(cfg.clone(), runner.as_ref(), fs.as_ref(), &clock, reporter, &interrupt, state, opts, model);
     if let Some(host) = lua {
         engine = engine.with_plugins(host);
     }
@@ -383,25 +470,26 @@ fn gc(
     sweep_all: bool,
     resolved: &crate::dotenv::ResolvedEnv,
 ) -> Result<()> {
-    host_guard(cfg)?;
+    host_guard(cfg, cli)?;
 
     let clock = SystemClock;
-    let holder = format!("pid {} since {}", std::process::id(), hhmmss(now_epoch()));
-    let _lock = StageLock::acquire(&cfg.deploy_root, &cfg.stage, &holder)?;
+    let holder = format!("{} pid {} since {}", hostname(), std::process::id(), hhmmss(now_epoch()));
+    let _lock = acquire_lock(cfg, cli, resolved, &holder, reporter)?;
 
-    let state = load_state(&cfg.deploy_root)?;
+    let state = load_state(engine_fs(cfg, cli, resolved).as_ref(), &cfg.deploy_root)?;
     let interrupt = Interrupt::install();
-    let fs = SystemFs;
+    let fs = engine_fs(cfg, cli, resolved);
     let runner = engine_runner(cfg, cli, resolved);
     let mut engine = Engine::new(
         cfg.clone(),
         runner.as_ref(),
-        &fs,
+        fs.as_ref(),
         &clock,
         reporter,
         &interrupt,
         state,
-        engine_options(cli, resolved),
+        engine_options(cfg, cli, resolved),
+        resolve_compose_model(cfg, cli, resolved)?,
     );
 
     let plan = engine.gc_plan(sweep_all)?;
@@ -432,22 +520,160 @@ fn gc(
     Ok(())
 }
 
-fn engine_options(cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Options {
+fn engine_options(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Options {
     Options {
         dry_run: cli.dry_run,
         sleep_enabled: true,
         reason: cli.reason.clone(),
         container_env: resolved.container_env.clone(),
         interpolation_env: resolved.interpolation_env.clone(),
+        remote: ssh_target(cfg, cli).is_some(),
     }
 }
 
+/// The transport is a runner swap: with `ssh:` set every command is wrapped for
+/// the target, without it nothing changes from v1 (ADR-014).
 fn engine_runner(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Box<dyn CommandRunner> {
-    let system_runner = SystemRunner::with_context(resolved.container_env.clone(), cfg.deploy_root.clone());
-    if cli.dry_run {
-        Box::new(DryRunRunner::new(system_runner))
-    } else {
-        Box::new(system_runner)
+    match ssh_target(cfg, cli) {
+        Some(target) => {
+            let runner = SshRunner::new(target, resolved.container_env.clone(), cfg.deploy_root.clone());
+            if cli.dry_run {
+                Box::new(DryRunRunner::new(runner))
+            } else {
+                Box::new(runner)
+            }
+        }
+        None => {
+            let runner = SystemRunner::with_context(resolved.container_env.clone(), cfg.deploy_root.clone());
+            if cli.dry_run {
+                Box::new(DryRunRunner::new(runner))
+            } else {
+                Box::new(runner)
+            }
+        }
+    }
+}
+
+/// The filesystem follows the same swap: with `ssh:` the five operations dcd owns
+/// run on the target, so `deploy_root` means the same thing to both.
+fn engine_fs(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Box<dyn FileSystem> {
+    match ssh_target(cfg, cli) {
+        Some(target) => Box::new(SshFs::new(SshRunner::new(
+            target,
+            resolved.container_env.clone(),
+            cfg.deploy_root.clone(),
+        ))),
+        None => Box::new(SystemFs),
+    }
+}
+
+/// `--ssh` wins over `ssh:`; neither means everything runs locally, exactly as v1
+/// did — which is what the unit suite and `tests/e2e.rs` drive.
+fn ssh_target(cfg: &Config, cli: &Cli) -> Option<SshTarget> {
+    let target = cli.ssh.clone().or_else(|| cfg.ssh.clone())?;
+    Some(SshTarget::new(target, control_path()))
+}
+
+/// dcd picks the multiplexing socket itself, and keeps it short: over ~107 bytes
+/// ssh fails outright rather than degrading to an unmultiplexed connection.
+/// The multiplexing socket's home (spec §2.7). `$XDG_RUNTIME_DIR` is already
+/// per-user and `0700`; its usual absence in CI must not land in a shared `/tmp`,
+/// where the filename is derivable from the target and the directory may already
+/// belong to someone else. `prepare_control_directory` is what enforces that.
+fn control_path() -> PathBuf {
+    control_directory().join("cm-%C")
+}
+
+fn control_directory() -> PathBuf {
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("dcd");
+    }
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(".dcd/cm"),
+        Err(_) => std::env::temp_dir().join("dcd"),
+    }
+}
+
+/// Created and locked to `0700` before any connection: a mux socket in a
+/// directory someone else can write is a socket dcd may be talked into using.
+fn prepare_control_directory() -> Result<()> {
+    let dir = control_directory();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| DcdError::Config(format!("cannot create {}: {e}", dir.display())))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| DcdError::Config(format!("cannot make {} private: {e}", dir.display())))
+}
+
+/// The §5.1/§7.0 shape warnings: everything dcd can see in the resolved model that
+/// will not fail until the deploy is already running. dcd uploads the compose
+/// DOCUMENTS and nothing they reference, and Docker answers a missing bind source
+/// by silently creating an empty directory — so a router whose config never
+/// arrived starts cleanly and serves nothing.
+fn warn_compose_shape(cfg: &Config, model: &ComposeModel, reporter: &Reporter) {
+    let release = cfg.release.service_name(&cfg.project);
+
+    // `compose config` absolutizes a relative bind source against the compose
+    // file's own directory — so what identifies one is that it resolves INSIDE the
+    // checkout. Those paths do not exist on the target, and Docker answers a
+    // missing bind source by silently creating an empty directory.
+    let checkout = std::env::current_dir().ok();
+    if cfg.ssh.is_some() {
+        if let Some(checkout) = &checkout {
+            for (name, service) in &model.services {
+                for source in service.bind_sources() {
+                    if !Path::new(&source).starts_with(checkout) {
+                        continue;
+                    }
+                    let relative = Path::new(&source).strip_prefix(checkout).unwrap_or(Path::new(&source));
+                    // dcd writes the upstream file itself, and `directories:` is
+                    // exactly the knob for "pre-create this on the target" — so
+                    // neither is a path the operator has been left to place.
+                    if relative == cfg.cutover.upstream_file {
+                        continue;
+                    }
+                    if cfg.directories.iter().any(|directory| relative.starts_with(&directory.path)) {
+                        continue;
+                    }
+                    reporter.warn(&format!(
+                        "{name} bind-mounts {}, which dcd does not upload — it must already exist under {} on the target, or Docker will silently mount an empty directory",
+                        relative.display(),
+                        cfg.deploy_root.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(service) = model.service(&release) {
+        if !service.ports.is_empty() {
+            reporter.warn(&format!(
+                "{release} declares ports: — the release is reached through {}, and a published port would collide between red and black",
+                cfg.cutover.service
+            ));
+        }
+        if !service.profiles.iter().any(|profile| cfg.compose.profiles.contains(profile)) {
+            reporter.warn(&format!(
+                "{release} declares no profile in {:?} — a hand-run `docker compose up` would start a second copy beside the release dcd deploys",
+                cfg.compose.profiles
+            ));
+        }
+    }
+
+    let upstream = cfg.deploy_root.join(&cfg.cutover.upstream_file);
+    let router = model.service(&cfg.cutover.service);
+    let mounts_upstream = router.is_some_and(|service| {
+        service
+            .bind_sources()
+            .iter()
+            .any(|source| upstream.ends_with(source.trim_start_matches("./")) || source.ends_with(&cfg.cutover.upstream_file.display().to_string()))
+    });
+    if !mounts_upstream {
+        reporter.warn(&format!(
+            "{} does not bind-mount {} — dcd writes the upstream file on the target, but only your compose file can put it inside the router",
+            cfg.cutover.service,
+            cfg.cutover.upstream_file.display()
+        ));
     }
 }
 
@@ -455,17 +681,25 @@ fn engine_runner(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv)
 /// deliberately overriding a live flock, since the whole point is to unstick a deploy that
 /// will never release it. State and lock files only; loads no plugins, runs no Docker.
 fn unlock(cfg: &Config, cli: &Cli, reporter: &Reporter, resolved: &crate::dotenv::ResolvedEnv) -> Result<()> {
-    host_guard(cfg)?;
+    host_guard(cfg, cli)?;
 
     let stage = cfg.stage.clone();
-    let state = load_state(&cfg.deploy_root)?;
+    let state = load_state(engine_fs(cfg, cli, resolved).as_ref(), &cfg.deploy_root)?;
     let pending = state
         .stage(&stage)
         .and_then(|s| s.newest_cutover_pending())
         .map(|release| release.container.clone());
 
-    if StageLock::is_held(&cfg.deploy_root, &stage) {
-        let holder = StageLock::holder(&cfg.deploy_root, &stage).unwrap_or_else(|| "unknown holder".to_string());
+    // The lock lives wherever the deploy runs. Probing the local filesystem for a
+    // remote stage sees nothing, reports success, and can delete a same-named path
+    // on the workstation.
+    let held = match ssh_target(cfg, cli) {
+        Some(target) => LeasedLock::is_held(&target, &cfg.deploy_root, &stage)
+            .then(|| LeasedLock::holder(&target, &cfg.deploy_root, &stage)),
+        None => StageLock::is_held(&cfg.deploy_root, &stage)
+            .then(|| StageLock::holder(&cfg.deploy_root, &stage).unwrap_or_else(|| "unknown holder".to_string())),
+    };
+    if let Some(holder) = held {
         reporter.warn(&format!(
             "{stage} is locked by a RUNNING dcd ({holder}) — clearing it lets a second deploy start alongside that one, and its next state write would overwrite this unlock"
         ));
@@ -480,18 +714,24 @@ fn unlock(cfg: &Config, cli: &Cli, reporter: &Reporter, resolved: &crate::dotenv
     }
 
     let clock = SystemClock;
-    let fs = SystemFs;
+    let fs = engine_fs(cfg, cli, resolved);
     let interrupt = Interrupt::install();
     let runner = engine_runner(cfg, cli, resolved);
     let mut engine = Engine::new(
         cfg.clone(),
         runner.as_ref(),
-        &fs,
+        fs.as_ref(),
         &clock,
         reporter,
         &interrupt,
         state,
-        engine_options(cli, resolved),
+        engine_options(cfg, cli, resolved),
+        // Deliberately empty: spec §4.4 makes `unlock` a pure state repair that
+        // runs no Docker command, and `Engine::unlock` reads no container fact.
+        // Resolving the model here would run `docker compose config` and full
+        // model validation — locking the operator out of the escape hatch for
+        // exactly the compose drift that stranded the deploy.
+        ComposeModel::default(),
     );
     match engine.unlock()? {
         Some(container) => reporter.log(&format!("{stage}: {container} is now active and current")),
@@ -508,7 +748,10 @@ fn clear_lock(cfg: &Config, cli: &Cli, reporter: &Reporter, stage: &str) -> Resu
         }
         return Ok(());
     }
-    let removed = StageLock::force_release(&cfg.deploy_root, stage)?;
+    let removed = match ssh_target(cfg, cli) {
+        Some(target) => LeasedLock::force_release(&target, &cfg.deploy_root, stage)?,
+        None => StageLock::force_release(&cfg.deploy_root, stage)?,
+    };
     if removed.is_empty() {
         reporter.log(&format!("{stage}: no lock file was present"));
     } else {
@@ -517,8 +760,8 @@ fn clear_lock(cfg: &Config, cli: &Cli, reporter: &Reporter, stage: &str) -> Resu
     Ok(())
 }
 
-fn status(cfg: &Config, reporter: &Reporter) -> Result<()> {
-    let state = load_state(&cfg.deploy_root)?;
+fn status(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv, reporter: &Reporter) -> Result<()> {
+    let state = load_state(engine_fs(cfg, cli, resolved).as_ref(), &cfg.deploy_root)?;
     let stage = &cfg.stage;
     match state.stage(stage) {
         None => reporter.log(&format!("{stage}: no deploys recorded")),
@@ -573,14 +816,75 @@ fn describe_hook(hook: &config::HookAction) -> String {
     }
 }
 
-fn host_guard(cfg: &config::Config) -> Result<()> {
-    let actual = gethostname::gethostname().to_string_lossy().to_string();
+/// INV-8, evaluated where the deploy will actually land. SSH makes this guard
+/// worth more, not less: an ssh alias can be repointed and a stage copy-pasted.
+/// `deploy_root` must exist before the lock: the lock's `flock` cannot create its
+/// file in a missing directory, and the ENOENT would otherwise be reported as
+/// "another deploy holds this stage" on a virgin host (spec §2.5).
+/// `--dry-run` must touch nothing: spec §2.4 and IT-013 say it takes no lock and
+/// leaves `deploy_root` empty, and both README and AGENTS.md tell operators to run
+/// it against production as a validation step. It reports a held lock instead, so
+/// the plan is still labelled when it may be stale.
+fn acquire_lock(
+    cfg: &Config,
+    cli: &Cli,
+    resolved: &crate::dotenv::ResolvedEnv,
+    holder: &str,
+    reporter: &Reporter,
+) -> Result<Option<StageLock>> {
+    if cli.dry_run {
+        let held = match ssh_target(cfg, cli) {
+            Some(target) => LeasedLock::is_held(&target, &cfg.deploy_root, &cfg.stage),
+            None => StageLock::is_held(&cfg.deploy_root, &cfg.stage),
+        };
+        if held {
+            reporter.warn(&format!("a deploy holds {}; this plan may be stale", cfg.stage));
+        }
+        return Ok(None);
+    }
+
+    let fs = engine_fs(cfg, cli, resolved);
+    fs.create_dir_all(&cfg.deploy_root).map_err(|e| {
+        DcdError::Config(format!("deploy_root {} is not usable: {e}", cfg.deploy_root.display()))
+    })?;
+    let lock = match ssh_target(cfg, cli) {
+        Some(target) => crate::lock::LeasedLock::acquire(&target, &cfg.deploy_root, &cfg.stage, holder)?,
+        None => StageLock::acquire(&cfg.deploy_root, &cfg.stage, holder)?,
+    };
+    Ok(Some(lock))
+}
+
+fn hostname() -> String {
+    gethostname::gethostname().to_string_lossy().to_string()
+}
+
+fn host_guard(cfg: &config::Config, cli: &Cli) -> Result<()> {
+    if cfg.host.is_none() {
+        return Ok(());
+    }
+    let actual = match ssh_target(cfg, cli) {
+        Some(target) => remote_hostname(&target)?,
+        None => gethostname::gethostname().to_string_lossy().to_string(),
+    };
     host_check(cfg.host.as_deref(), &actual, &cfg.stage)
+}
+
+/// `hostname -f` where it exists, `hostname` where it does not — most Linux hosts
+/// report a short name, while every example config names an FQDN.
+fn remote_hostname(target: &SshTarget) -> Result<String> {
+    let runner = SshRunner::new(target.clone(), Default::default(), PathBuf::from("/"));
+    let argv = Argv::of(["sh", "-c", "hostname -f 2>/dev/null || hostname"]);
+    let out = runner
+        .run(&argv, Access::Read, &RunOpts::default())
+        .map_err(|e| DcdError::Transport(format!("cannot reach {}: {e}", target.target())))?;
+    Ok(out.stdout.trim().to_string())
 }
 
 fn host_check(expected: Option<&str>, actual: &str, stage: &str) -> Result<()> {
     match expected {
-        Some(host) if host != actual => Err(DcdError::HostMismatch {
+        // A target reporting a short name still satisfies the FQDN every example
+        // config names; anything else would fail on correctly-configured boxes.
+        Some(host) if host != actual && !host.starts_with(&format!("{actual}.")) => Err(DcdError::HostMismatch {
             stage: stage.to_string(),
             expected: host.to_string(),
             actual: actual.to_string(),
@@ -589,12 +893,93 @@ fn host_check(expected: Option<&str>, actual: &str, stage: &str) -> Result<()> {
     }
 }
 
-fn load_state(deploy_root: &Path) -> Result<State> {
-    let path = deploy_root.join("dcd-state.json");
-    match std::fs::read(&path) {
-        Ok(bytes) => State::from_json(&bytes).map_err(|e| DcdError::Config(format!("corrupt state {}: {e}", path.display()))),
-        Err(_) => Ok(State::default()),
+/// Reads the deploy state through the effects seam so a remote `deploy_root` is
+/// read from the target, not from the deploying machine. A **missing** file is a
+/// fresh stage; an **unreadable** one is an error — mapping both to a default
+/// would silently discard the release history and let the next finalize
+/// overwrite it (spec §2.3).
+/// Resolves the compose model on the DEPLOYING machine, against the checkout.
+/// Resolving it on the target would make `check` validate nothing on a fresh
+/// host and make `--dry-run` plan from stale remote files (spec §7 preamble).
+///
+/// Its stdout is parsed and never traced: `compose config` inlines resolved env
+/// values, so printing it would dump the whole secret set (spec §8.2).
+/// `release.run` is the fallback for a project with no compose service for its app
+/// (spec §5.3). Rendering it into a real compose document and appending it to
+/// `compose.files` is what keeps ONE creation path: from here on the run-based
+/// release is indistinguishable from a declared service — it resolves in the
+/// model, uploads with `sync`, pulls, and is created by `compose run`.
+fn materialise_release_run(cfg: &mut Config, config_dir: &Path) -> Result<()> {
+    let Some(run) = cfg.release.run.clone() else {
+        return Ok(());
+    };
+    let service = cfg.release.service_name(&cfg.project);
+    let document = compose::render_run_document(&service, &run);
+    let path = config_dir.join(format!("dcd-release-run.{}.yml", cfg.stage));
+    std::fs::write(&path, document)
+        .map_err(|e| DcdError::Config(format!("cannot write {}: {e}", path.display())))?;
+    cfg.compose.files.push(path);
+    Ok(())
+}
+
+fn resolve_compose_model(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Result<ComposeModel> {
+    let argv = compose::config_argv(&cfg.project, &cfg.compose.files, &cfg.compose.profiles);
+    // The chain has to reach compose, or every `image: ${REGISTRY}:${APP_TAG}`
+    // resolves to `:` — and that empty ref is then written into the override file,
+    // which is passed LAST and therefore wins over the operator's own compose file.
+    let runner = SystemRunner::with_env(resolved.container_env.clone());
+    let opts = RunOpts {
+        env: Some(cfg.compose.env.clone().into_iter().collect()),
+        ..RunOpts::default()
+    };
+    let out = runner
+        .run(&argv, Access::Read, &opts)
+        .map_err(|e| DcdError::Config(format!("cannot resolve the compose model: {e}")))?;
+    let mut model = ComposeModel::from_json(out.stdout.as_bytes())?;
+    apply_image_pins(&mut model, &cli.images)?;
+    config::validate_with_model(cfg, &model)?;
+    Ok(model)
+}
+
+/// Parses `--image` and pins each service on the resolved model. Split out from
+/// `resolve_compose_model` so the wiring is covered without a daemon — the flag
+/// broke once already, and the only tests that saw it needed real Docker.
+fn apply_image_pins(model: &mut ComposeModel, specs: &[String]) -> Result<()> {
+    for (service, image) in image_pins(specs)? {
+        model.pin_image(&service, &image)?;
     }
+    Ok(())
+}
+
+/// Parses `--image <service>=<ref>` before anything reaches Docker, so a typo
+/// fails on the spot rather than after the compose model resolves.
+fn image_pins(specs: &[String]) -> Result<Vec<(String, String)>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let split = spec.split_once('=');
+            let (service, image) = split
+                .ok_or_else(|| DcdError::Config(format!("--image `{spec}` must be service=reference")))?;
+            if service.is_empty() || image.is_empty() {
+                return Err(DcdError::Config(format!("--image `{spec}` must be service=reference")));
+            }
+            Ok((service.to_string(), image.to_string()))
+        })
+        .collect()
+}
+
+fn load_state(fs: &dyn FileSystem, deploy_root: &Path) -> Result<State> {
+    let path = deploy_root.join("dcd-state.json");
+    let present = fs
+        .exists(&path)
+        .map_err(|e| DcdError::Config(format!("cannot read state {}: {e}", path.display())))?;
+    if !present {
+        return Ok(State::default());
+    }
+    let bytes = fs
+        .read(&path)
+        .map_err(|e| DcdError::Config(format!("cannot read state {}: {e}", path.display())))?;
+    State::from_json(&bytes).map_err(|e| DcdError::Config(format!("corrupt state {}: {e}", path.display())))
 }
 
 fn confirm(prompt: &str, yes: bool) -> Result<bool> {
@@ -611,11 +996,31 @@ fn confirm(prompt: &str, yes: bool) -> Result<bool> {
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-fn init(path: &Path, force: bool, with_plugin: bool) -> Result<()> {
+/// Derived from the typed `Config`, so it cannot drift from the loader the way a
+/// hand-written schema would (spec §8.4).
+fn schema() -> Result<()> {
+    let json = serde_json::to_string_pretty(&config::authoring_schema()?)
+        .map_err(|e| DcdError::Config(format!("cannot render the schema: {e}")))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn init(path: &Path, force: bool, with_plugin: bool, from_compose: Option<&Path>) -> Result<()> {
     if path.exists() && !force {
         return Err(DcdError::Config(format!("{} already exists (use --force)", path.display())));
     }
-    std::fs::write(path, SCAFFOLD).map_err(|e| DcdError::Config(format!("cannot write {}: {e}", path.display())))?;
+    let document = match from_compose {
+        Some(compose) => {
+            let scaffold = crate::scaffold::Scaffold::from_compose(compose, path)?;
+            let rendered = scaffold.render();
+            for note in scaffold.notes() {
+                println!("{note}");
+            }
+            rendered
+        }
+        None => SCAFFOLD.to_string(),
+    };
+    std::fs::write(path, &document).map_err(|e| DcdError::Config(format!("cannot write {}: {e}", path.display())))?;
     println!("created {}", path.display());
     if with_plugin {
         let dir = path.parent().unwrap_or(Path::new(".")).join("plugins");
@@ -639,13 +1044,16 @@ fn hhmmss(epoch: u64) -> String {
     format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
 }
 
-fn load_plugins(cfg: &config::Config) -> Result<Vec<(String, String)>> {
+/// Plugin sources are read on the deploying machine and executed in dcd's own
+/// process — nothing on a target ever reads a `.lua` file — so relative paths
+/// resolve against the **config file's** directory, never `deploy_root` (spec §2.1).
+fn load_plugins(cfg: &config::Config, config_dir: &Path) -> Result<Vec<(String, String)>> {
     let mut plugins = Vec::new();
     for path in &cfg.plugins {
         let resolved = if path.is_absolute() {
             path.clone()
         } else {
-            cfg.deploy_root.join(path)
+            config_dir.join(path)
         };
         let content = std::fs::read_to_string(&resolved)
             .map_err(|e| DcdError::Config(format!("cannot read plugin {}: {e}", resolved.display())))?;
@@ -659,7 +1067,11 @@ fn load_plugins(cfg: &config::Config) -> Result<Vec<(String, String)>> {
 /// commands run under the same runner env and cwd as the engine's (spec §6.5).
 struct ConfigureHost<'a> {
     reporter: &'a Reporter,
-    runner: SystemRunner,
+    /// The SAME runner and filesystem the deploy will use. Hard-coding the local
+    /// ones made `configure` address the deploying machine while every later hook
+    /// addressed the target — spec §6.5 says the two see one environment.
+    runner: Box<dyn CommandRunner + 'a>,
+    fs: Box<dyn FileSystem + 'a>,
     interpolation_env: std::collections::HashMap<String, String>,
     deploy_root: PathBuf,
     stage: String,
@@ -696,7 +1108,7 @@ impl ConfigureHost<'_> {
 
 impl HookHost for ConfigureHost<'_> {
     fn run_host(&self, cmd: &str) -> std::result::Result<String, String> {
-        let full = format!("cd {} && {}", self.deploy_root.display(), cmd);
+        let full = format!("cd {} && {}", crate::ssh::quote(&self.deploy_root.display().to_string()), cmd);
         self.run_traced(Argv::of(["sh", "-c", &full]))
     }
 
@@ -721,16 +1133,16 @@ impl HookHost for ConfigureHost<'_> {
         Err(self.no_container("cp_to_release"))
     }
     fn read_file(&self, path: &str) -> std::result::Result<String, String> {
-        SystemFs
+        self.fs
             .read(&self.resolve(path))
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .map_err(|e| e.to_string())
     }
     fn write_file(&self, path: &str, content: &str) -> std::result::Result<(), String> {
-        SystemFs.write(&self.resolve(path), content.as_bytes(), None).map_err(|e| e.to_string())
+        self.fs.write(&self.resolve(path), content.as_bytes(), None).map_err(|e| e.to_string())
     }
     fn file_exists(&self, path: &str) -> bool {
-        SystemFs.exists(&self.resolve(path))
+        self.fs.exists(&self.resolve(path)).unwrap_or(false)
     }
     fn env(&self, name: &str) -> Option<String> {
         self.interpolation_env.get(name).cloned()
@@ -749,50 +1161,48 @@ impl HookHost for ConfigureHost<'_> {
     }
 }
 
-const SCAFFOLD: &str = r#"version: 1
+const SCAFFOLD: &str = r#"version: 2
 project: myapp
-network: myapp_net
-# registry + deploy_root default from $REGISTRY / $CI_REGISTRY_IMAGE and $DEPLOY_ROOT.
-# ${VAR} resolves from the process env layered over the dotenv chain next to this file
-# (.env, .env.local, .env.<stage>, .env.<stage>.local); every chain-defined key is also
-# delivered to the app/worker containers — dcd writes no env file on the server.
 
-# Images dcd pulls/runs, plus long-lived side containers. Block style for ${VAR} values.
-docker:
-  images:
-    app: ${APP_TAG}
-  services:
-    nginx:
-      image: ~          # pinned in compose; dcd never recreates it
-      container: myapp-nginx
-      recreate: never
-      wait: { exec_in: myapp-nginx, cmd: 'test -f /var/run/nginx.pid', retries: 30 }
+# dcd runs HERE (your laptop or CI runner) and reaches the server over SSH.
+# Omit `ssh:` to drive a local Docker socket instead.
+ssh: ${DEPLOY_SSH}
+deploy_root: ${DEPLOY_ROOT}     # where dcd works ON THE SERVER
 
+# Your compose file declares the containers; dcd declares the orchestration.
+# It is uploaded to deploy_root at the start of every deploy.
 compose:
   files: [docker-compose.prod.yml]
-  env:
-    REGISTRY: ${REGISTRY}
-    APP_TAG: ${APP_TAG}
 
-# The app — built, health-checked, then cut over to.
+# The app: a compose service, started alongside the live one and cut over to.
+# Mark it `profiles: ["dcd-release"]` in the compose file so a hand-run
+# `docker compose up` does not start a second copy beside the release.
 release:
-  image: app
-  container_prefix: myapp-app
-  run:
-    network_alias: app
-    env: { TZ: UTC }
-  healthcheck:
-    exec_in: myapp-nginx
-    cmd: 'curl -sf http://{container}:8080/health'   # {container}, never the alias
-  # migrate: { before: '...', after: '...' }   # optional, expand-contract
+  service: app
+  # The gate is the service's own `healthcheck:` in the compose file. Use this
+  # escape hatch instead when the image cannot probe itself:
+  # healthcheck: { exec_in: nginx, cmd: 'curl -sf http://{container}:8080/health' }
+  # migrate: { before: 'app migrate --phase before', after: 'app migrate --phase after' }
+  # drain: 'app graceful-stop'
 
+# Point the router at the new container, then reload it.
 cutover:
+  service: nginx
   backend_port: 8080
-  reload: { exec_in: myapp-nginx, cmd: 'nginx -s reload' }
+  reload: { exec_in: nginx, cmd: 'nginx -s reload' }
+
+# Policy only — names, images and readiness come from the compose file.
+# services:
+#   postgres: { on_recreate_drain_workers: true }
+#   valkey: { recreate: never }
+
+# workers:
+#   service: worker
+#   provider: { static: [default] }
 
 stages:
   prod:
-    host: prod.example.internal   # dcd refuses to run on the wrong host
+    host: prod.example.internal   # dcd refuses to run if the TARGET reports another name
 "#;
 
 const PLUGIN_STUB: &str = r#"-- Plugins (loaded at startup) register tasks and hooks.
@@ -819,6 +1229,25 @@ const PLUGIN_STUB: &str = r#"-- Plugins (loaded at startup) register tasks and h
 
 #[cfg(test)]
 mod tests {
+
+    /// The v1 bug this guards: `load_state` mapped ANY read error to
+    /// `State::default()`, so a `deploy_root` dcd could not read looked like a
+    /// brand-new stage — losing the release history, and letting the next
+    /// finalize overwrite it. Missing and unreadable must not be the same thing.
+    #[test]
+    fn a_missing_state_file_is_fresh_but_an_unreadable_one_is_an_error() {
+        use crate::effects::MemoryFs;
+
+        let fs = MemoryFs::new();
+        let root = Path::new("/srv/acme");
+
+        let fresh = load_state(&fs, root).expect("a missing state file is a fresh stage");
+        assert!(fresh.stage("prod").is_none());
+
+        fs.write(&root.join("dcd-state.json"), b"{ not json", None).unwrap();
+        let err = load_state(&fs, root).expect_err("unreadable state must not silently default");
+        assert!(err.to_string().contains("corrupt state"), "got: {err}");
+    }
     use super::*;
 
     #[test]
@@ -914,31 +1343,85 @@ mod tests {
     }
 
     const SCAFFOLD_TEST_CONFIG: &str = r#"
-version: 1
+version: 2
 project: demo
-network: demo_net
-docker:
-  images: { app: app-1 }
-  services:
-    nginx: { container: demo-nginx, recreate: never }
 compose:
   files: [base.yml]
 release:
-  image: app
-  container_prefix: demo-app
-  healthcheck: { exec_in: demo-nginx, cmd: 'curl {container}' }
+  service: app
+  healthcheck: { exec_in: nginx, cmd: 'curl {container}' }
 cutover:
+  service: nginx
   backend_port: 8080
-  reload: { exec_in: demo-nginx, cmd: 'nginx -s reload' }
+  reload: { exec_in: nginx, cmd: 'nginx -s reload' }
+services:
+  nginx: { recreate: never }
 stages:
   prod: {}
 "#;
 
     #[test]
     fn scaffold_parses_and_validates() {
-        let env: std::collections::HashMap<String, String> =
-            [("REGISTRY", "reg"), ("APP_TAG", "t")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let env: std::collections::HashMap<String, String> = [
+            ("DEPLOY_SSH", "deploy@prod.example.internal"),
+            ("DEPLOY_ROOT", "/srv/myapp"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
         let cfg = config::load(SCAFFOLD, Some("prod"), &[], &env).unwrap();
         assert_eq!(cfg.project, "myapp");
+        assert_eq!(cfg.release.service.as_deref(), Some("app"));
+        assert_eq!(cfg.cutover.service, "nginx");
+        assert_eq!(cfg.ssh.as_deref(), Some("deploy@prod.example.internal"));
+    }
+
+    /// `--image` names a COMPOSE SERVICE and a full image reference; a reference
+    /// containing '=' (a digest pin does not, but a tag with one would) must keep
+    /// everything after the first separator.
+    /// The wiring, not just the parser: this is the path that broke, and until now
+    /// only a Docker-gated test covered it.
+    #[test]
+    fn the_cli_flag_pins_the_resolved_model() {
+        let mut model = crate::compose::ComposeModel::from_json(
+            br#"{"services":{"app":{"image":"reg:app-1"},"worker":{"image":"reg:app-1"}}}"#,
+        )
+        .unwrap();
+
+        apply_image_pins(&mut model, &["app=reg:pinned".to_string()]).unwrap();
+
+        assert_eq!(model.service("app").unwrap().image.as_deref(), Some("reg:pinned"));
+        assert_eq!(
+            model.service("worker").unwrap().image.as_deref(),
+            Some("reg:app-1"),
+            "a pin is per-service"
+        );
+    }
+
+    #[test]
+    fn the_cli_flag_refuses_a_service_the_compose_files_do_not_declare() {
+        let mut model = crate::compose::ComposeModel::from_json(br#"{"services":{"app":{"image":"reg:app-1"}}}"#).unwrap();
+        let error = apply_image_pins(&mut model, &["ap=reg:pinned".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--image 'ap' is not a service"), "{error}");
+        assert_eq!(model.service("app").unwrap().image.as_deref(), Some("reg:app-1"));
+    }
+
+    #[test]
+    fn an_image_pin_splits_on_the_first_separator_only() {
+        let pins = image_pins(&["app=registry.example.com/team/app:v1".to_string()]).unwrap();
+        assert_eq!(pins, vec![("app".to_string(), "registry.example.com/team/app:v1".to_string())]);
+
+        let digest = image_pins(&["app=reg/app@sha256:abc=def".to_string()]).unwrap();
+        assert_eq!(digest[0].1, "reg/app@sha256:abc=def");
+    }
+
+    #[test]
+    fn an_image_pin_without_both_halves_is_rejected() {
+        for spec in ["app", "app=", "=reg:tag", ""] {
+            let error = image_pins(&[spec.to_string()]).unwrap_err().to_string();
+            assert!(error.contains("must be service=reference"), "{spec}: {error}");
+        }
     }
 }

@@ -31,43 +31,47 @@ impl Fixture {
         std::fs::create_dir_all(&dir).unwrap();
 
         let dcd_yaml = format!(
-            r#"version: 1
+            r#"version: 2
 project: {project}
-network: {project}_net
-docker:
-  images:
-    app: nginx:alpine
-  services:
-    nginx:
-      container: {project}-nginx
-      recreate: never
-      wait: {{ exec_in: {project}-nginx, cmd: 'wget -qO- -T 2 http://localhost/ >/dev/null 2>&1 || true', retries: 10, interval: 1s }}
+deploy_root: .
 compose:
   files: [compose.prod.yml]
 release:
-  image: app
+  service: app
   container_prefix: {project}-app
-  run: {{ network_alias: app }}
   drain: 'true'
-  healthcheck: {{ exec_in: {project}-nginx, cmd: 'wget -qO- -T 2 http://{{container}}/', retries: 15, interval: 1s }}
+  healthcheck: {{ exec_in: nginx, cmd: 'wget -qO- -T 2 http://{{container}}/', retries: 15, interval: 1s }}
 cutover:
+  service: nginx
   upstream_file: upstream.conf
   backend_port: 80
-  reload: {{ exec_in: {project}-nginx, cmd: 'true' }}
+  reload: {{ exec_in: nginx, cmd: 'true' }}
+services:
+  nginx:
+    recreate: never
+    wait: {{ exec_in: nginx, cmd: 'wget -qO- -T 2 http://localhost/ >/dev/null 2>&1 || true', retries: 10, interval: 1s }}
 stages: {{ it: {{}} }}
 "#
         );
         std::fs::write(dir.join("dcd.yaml"), dcd_yaml).unwrap();
 
+        // Under v2 the compose file is the single source of container definition
+        // (ADR-013): the release service lives here too, behind the `dcd-release`
+        // profile so a hand-run `compose up` never starts a second copy.
         let compose = format!(
             r#"services:
+  app:
+    image: nginx:alpine
+    profiles: ["dcd-release"]
+    networks:
+      default:
+        aliases: [app]
   nginx:
     image: nginx:alpine
     container_name: {project}-nginx
 networks:
   default:
     name: {project}_net
-    external: true
 "#
         );
         std::fs::write(dir.join("compose.prod.yml"), compose).unwrap();
@@ -282,4 +286,95 @@ fn it_005_concurrent_lock_refuses_second() {
     assert_eq!(out.status.code(), Some(3), "expected lock-held exit 3, stderr: {}", String::from_utf8_lossy(&out.stderr));
 
     fs2::FileExt::unlock(&held).unwrap();
+}
+
+/// IT-017: `--image <service>=<ref>` pins that service for the run. The v2
+/// migration left the flag translating to `--set docker.images.<name>` — a config
+/// path v2 removed — so every CI deploy carrying it died in config load before
+/// Docker was touched. Real Docker is what proves the pin reaches the container.
+#[test]
+fn it_017_an_image_pin_is_the_image_the_release_container_runs() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new("imagepin");
+    let pinned = "nginx:1.27-alpine";
+
+    let out = fx.dcd(&["deploy", "it", "--image", &format!("app={pinned}")]);
+    assert!(out.status.success(), "pinned deploy failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let app = fx.running("app");
+    assert_eq!(app.len(), 1, "expected one app container, got {app:?}");
+    let inspect = docker(&["inspect", &app[0], "--format", "{{.Config.Image}}"]);
+    assert_eq!(String::from_utf8_lossy(&inspect.stdout).trim(), pinned);
+
+    // The pin is per-service and must not have leaked to the managed nginx.
+    let nginx = docker(&["inspect", &format!("{}-nginx", fx.project), "--format", "{{.Config.Image}}"]);
+    assert_eq!(String::from_utf8_lossy(&nginx.stdout).trim(), "nginx:alpine");
+
+    // It is also what a rollback would replay, so it has to be in the record.
+    let state = std::fs::read_to_string(fx.dir.join("dcd-state.json")).unwrap();
+    assert!(state.contains(pinned), "the release record must carry the pinned image: {state}");
+}
+
+/// A pin naming a service the compose files do not declare must stop the deploy,
+/// naming the services that do exist — not deploy the unpinned image.
+#[test]
+fn it_018_an_image_pin_for_an_unknown_service_refuses_to_deploy() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new("imagetypo");
+
+    let out = fx.dcd(&["deploy", "it", "--image", "ap=nginx:1.27-alpine"]);
+    assert!(!out.status.success(), "a typo must not deploy");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("--image 'ap' is not a service"), "{stderr}");
+    assert!(fx.running("app").is_empty(), "nothing may start");
+}
+
+/// IT-013: `--dry-run` touches nothing. It shipped taking the stage lock and
+/// creating `deploy_root` — on the real target over ssh, where it also wrote the
+/// lease and held a live flock against a concurrent deploy. README and AGENTS.md
+/// both prescribe running it against production, so this is the one command whose
+/// side effects must be zero.
+#[test]
+fn it_013_a_dry_run_takes_no_lock_and_writes_nothing() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new("dryrun");
+    let lock = fx.dir.join(".dcd.it.lock");
+    let state = fx.dir.join("dcd-state.json");
+
+    let out = fx.dcd(&["deploy", "it", "--dry-run"]);
+    assert!(out.status.success(), "dry run failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let plan = String::from_utf8_lossy(&out.stdout);
+    assert!(plan.contains("start:black"), "the plan must still be printed: {plan}");
+    assert!(!lock.exists(), "--dry-run took the stage lock");
+    assert!(!fx.dir.join(".dcd.it.lock.meta").exists(), "--dry-run wrote the lock sidecar");
+    assert!(!state.exists(), "--dry-run wrote state");
+    assert!(fx.running("app").is_empty(), "--dry-run started a container");
+
+    // And it stays a no-op while a real lock is held: the plan is still produced,
+    // labelled stale, rather than refused with exit 3.
+    std::fs::write(&lock, b"").unwrap();
+    use fs2::FileExt;
+    let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    held.try_lock_exclusive().unwrap();
+
+    let while_held = fx.dcd(&["deploy", "it", "--dry-run"]);
+    fs2::FileExt::unlock(&held).unwrap();
+    assert!(
+        while_held.status.success(),
+        "a dry run must not be refused by a held lock: {}",
+        String::from_utf8_lossy(&while_held.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&while_held.stdout),
+        String::from_utf8_lossy(&while_held.stderr)
+    );
+    assert!(combined.contains("may be stale"), "a held lock must be reported: {combined}");
 }

@@ -128,8 +128,8 @@ impl FileSystem for MemoryFs {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, path.display().to_string()))
     }
 
-    fn exists(&self, path: &Path) -> bool {
-        self.files.borrow().contains_key(path) || self.dirs.borrow().contains(path)
+    fn exists(&self, path: &Path) -> std::io::Result<bool> {
+        Ok(self.files.borrow().contains_key(path) || self.dirs.borrow().contains(path))
     }
 
     fn remove(&self, path: &Path) -> std::io::Result<()> {
@@ -202,11 +202,11 @@ mod tests {
     fn memory_fs_roundtrip() {
         let fs = MemoryFs::new();
         let p = Path::new("/x/y.txt");
-        assert!(!fs.exists(p));
+        assert!(!fs.exists(p).unwrap());
         fs.write(p, b"hi", Some(0o600)).unwrap();
-        assert!(fs.exists(p));
+        assert!(fs.exists(p).unwrap());
         assert_eq!(fs.read(p).unwrap(), b"hi");
         fs.remove(p).unwrap();
-        assert!(!fs.exists(p));
+        assert!(!fs.exists(p).unwrap());
     }
 }

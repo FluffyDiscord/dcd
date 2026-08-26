@@ -405,18 +405,15 @@ mod tests {
 
     fn config() -> Config {
         let src = r#"
-version: 1
+version: 2
 project: demo
-network: net
-docker:
-  images: { app: a }
-  services: { x: { container: x, recreate: never } }
 compose: { files: [c.yml] }
 release:
-  image: app
+  service: app
   container_prefix: demo-app
   healthcheck: { exec_in: x, cmd: 'curl {container}' }
-cutover: { backend_port: 80, reload: { exec_in: x, cmd: 'r' } }
+cutover: { service: x, backend_port: 80, reload: { exec_in: x, cmd: 'r' } }
+services: { x: { recreate: never } }
 stages: { prod: {} }
 "#;
         crate::config::load(src, Some("prod"), &[], &Map::new()).unwrap()

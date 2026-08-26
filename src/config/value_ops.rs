@@ -174,17 +174,17 @@ fn parse_scalar(raw: &str) -> Value {
 }
 
 /// Derive identity so a lean, multi-stage config can omit it: `project` defaults to the
-/// `deploy_root` folder name, `network` to `<project>_default`, `compose.env.COMPOSE_PROJECT_NAME`
-/// to the project; then the `{project}` token is expanded everywhere. Because `deploy_root` differs
-/// per stage, every container/network namespaces per stage with no repetition (e.g. prod vs beta on
-/// one host). An explicit value always wins — this only fills what is absent.
+/// `deploy_root` folder name and `compose.env.COMPOSE_PROJECT_NAME` to the project; then the
+/// `{project}` token is expanded everywhere. Because `deploy_root` differs per stage, every
+/// container namespaces per stage with no repetition (e.g. prod vs beta on one host). An
+/// explicit value always wins — this only fills what is absent.
+///
+/// Networks are NOT derived: under ADR-013 they are declared in the compose file, and a
+/// `<project>_default` guess would inspect a network nothing uses.
 pub fn default_identity(base: &mut Value) {
     let project = resolve_project(base);
     if let Value::Mapping(map) = base {
         map.insert(Value::String("project".into()), Value::String(project.clone()));
-        if !map.contains_key(Value::String("network".into())) {
-            map.insert(Value::String("network".into()), Value::String(format!("{project}_default")));
-        }
     }
     inject_compose_project_name(base, &project);
     expand_token(base, "{project}", &project);
@@ -263,7 +263,6 @@ mod tests {
         );
         default_identity(&mut v);
         assert_eq!(v.get("project").and_then(Value::as_str), Some("beta-app"));
-        assert_eq!(v.get("network").and_then(Value::as_str), Some("beta-app_default"));
         assert_eq!(
             v.get("release").and_then(|r| r.get("container_prefix")).and_then(Value::as_str),
             Some("beta-app-app")
@@ -280,10 +279,9 @@ mod tests {
 
     #[test]
     fn default_identity_never_overrides_explicit_values() {
-        let mut v = yaml("project: custom\nnetwork: custom_net\ndeploy_root: /var/www/app\ncompose:\n  env:\n    COMPOSE_PROJECT_NAME: keep");
+        let mut v = yaml("project: custom\ndeploy_root: /var/www/app\ncompose:\n  env:\n    COMPOSE_PROJECT_NAME: keep");
         default_identity(&mut v);
         assert_eq!(v.get("project").and_then(Value::as_str), Some("custom"));
-        assert_eq!(v.get("network").and_then(Value::as_str), Some("custom_net"));
         assert_eq!(
             v.get("compose").and_then(|c| c.get("env")).and_then(|e| e.get("COMPOSE_PROJECT_NAME")).and_then(Value::as_str),
             Some("keep")

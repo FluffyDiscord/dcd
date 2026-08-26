@@ -1,0 +1,69 @@
+services:
+  app:
+    image: ${REGISTRY}:${APP_TAG}
+    profiles: ["dcd-release"]
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+    networks:
+      default:
+        aliases: [app-rr]
+    volumes:
+      - ${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log
+
+  worker:
+    image: ${REGISTRY}:${APP_TAG}
+    profiles: ["dcd-release"]
+    restart: unless-stopped
+    entrypoint: ['php', 'bin/console', 'messenger:consume']
+    environment:
+      TZ: UTC
+    volumes:
+      - ${DEPLOY_ROOT}/.docker/logs/symfony:/usr/src/myapp/var/log
+
+  nginx:
+    image: ${REGISTRY}:${NGINX_TAG}
+    container_name: acme-nginx
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-f", "/var/run/nginx.pid"]
+      interval: 1s
+      retries: 30
+    ports:
+      - "80:80"
+    volumes:
+      - ${DEPLOY_ROOT}/nginx-upstream.conf:/etc/nginx/conf.d/upstream.conf:ro
+
+  postgres:
+    image: ${REGISTRY}:${DB_TAG}
+    container_name: acme-postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app", "-h", "127.0.0.1"]
+      interval: 1s
+      retries: 60
+    volumes:
+      - ${DEPLOY_ROOT}/.docker/postgres:/var/lib/postgresql/data
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: acme-valkey
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 1s
+      retries: 30
+    volumes:
+      - ${DEPLOY_ROOT}/.docker/valkey/data:/data
+
+  centrifugo:
+    image: centrifugo/centrifugo:v5
+    container_name: acme-centrifugo
+    restart: unless-stopped
+    command: ['centrifugo', '-c', '/etc/centrifugo/config.json']
+    volumes:
+      - ${DEPLOY_ROOT}/.docker/centrifugo:/etc/centrifugo:ro
+
+networks:
+  default:
+    name: acme_default

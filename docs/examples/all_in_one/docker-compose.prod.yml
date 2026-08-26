@@ -1,0 +1,62 @@
+# The companion to dcd.yaml in this directory: not a production compose file, but
+# the smallest one that declares every service dcd.yaml refers to, so `dcd check`
+# can validate the reference config with no environment set.
+#
+# It also shows the two rules dcd enforces on the compose side:
+#   - the release service carries `profiles: ["dcd-release"]`, so a hand-run
+#     `docker compose up` cannot start a second copy beside the release;
+#   - every service dcd manages declares a `healthcheck:` — the gate is mandatory.
+
+services:
+  app:
+    image: registry.example.com/allinone:latest
+    profiles: ["dcd-release"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      retries: 30
+    networks:
+      default:
+        aliases:
+          - allinone-app
+
+  worker:
+    image: registry.example.com/allinone:latest
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      retries: 30
+
+  web:
+    image: nginx:alpine
+    container_name: allinone-web
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      retries: 30
+    volumes:
+      # dcd writes this on the target; only this mount puts it inside the router.
+      - ./nginx-upstream.conf:/etc/nginx/upstream/nginx-upstream.conf:ro
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: allinone-postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 1s
+      retries: 60
+
+  # No healthcheck here on purpose: `services.cache.wait` in dcd.yaml is the
+  # readiness override for exactly this case.
+  cache:
+    image: redis:7-alpine
+    container_name: allinone-cache
+    restart: unless-stopped
+
+networks:
+  default:
+    name: allinone_default
