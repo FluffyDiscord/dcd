@@ -38,6 +38,10 @@ pub struct LeasedLock {
     /// thread woke from its sleep — trading a 51 ms release for a 10 s stall.
     channel: std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>>,
     beating: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Kept so `Drop` can clear the sidecars it created. The local lock removes its
+    /// `.meta` on drop; without this the remote one left `.meta` and `.lease.sh`
+    /// behind after every clean deploy, naming a holder that exited hours ago.
+    cleanup: Option<(SshTarget, PathBuf, String)>,
 }
 
 impl std::fmt::Debug for LeasedLock {
@@ -56,6 +60,17 @@ impl Drop for LeasedLock {
         }
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();
+        }
+        // Best-effort, and after the channel closed so the flock is already gone:
+        // these are only the human-readable sidecars, never the mutex.
+        if let Some((target, deploy_root, stage)) = self.cleanup.take() {
+            let paths = [meta_path(&deploy_root, &stage), lease_path(&deploy_root, &stage)];
+            let quoted: Vec<String> = paths
+                .iter()
+                .map(|path| crate::ssh::quote(&path.display().to_string()))
+                .collect();
+            let script = format!("exec rm -f {}\n", quoted.join(" "));
+            let _ = LeasedLock::send_script(&target, &script);
         }
     }
 }
@@ -176,6 +191,7 @@ impl LeasedLock {
             child: Some(child),
             channel,
             beating,
+            cleanup: Some((target.clone(), deploy_root.to_path_buf(), stage.to_string())),
         }))
     }
 
@@ -426,13 +442,17 @@ mod lease_tests {
     #[test]
     fn the_lease_announces_the_lock_then_bounds_its_own_lifetime() {
         let script = LeasedLock::lease_script();
+        // Built from ACQUIRED rather than repeating the literal: `acquire` reads
+        // exactly `ACQUIRED.len() + 1` bytes to decide it holds the lock, so the
+        // token and the script must move together or the read blocks forever.
         assert_eq!(
             script,
-            format!("echo dcd-lock-acquired\nwhile read -t {} _; do :; done\n", LeasedLock::lease_seconds())
+            format!("echo {ACQUIRED}\nwhile read -t {} _; do :; done\n", LeasedLock::lease_seconds())
         );
-        assert!(
-            script.starts_with(&format!("echo {ACQUIRED}")),
-            "the token must be the FIRST thing the holder prints, or acquire cannot tell it apart from a busy lock"
+        assert_eq!(
+            script.lines().next(),
+            Some(format!("echo {ACQUIRED}").as_str()),
+            "the token must be the FIRST line, or acquire cannot tell it from a busy lock"
         );
     }
 
