@@ -326,31 +326,47 @@ fn symfony_env_value_wins_over_file_definition_in_expansion() {
     assert_eq!(parse_with("Foo=${Foo}", &process), pairs(&[("Foo", "Bar")]));
 }
 
+/// Symfony parity in everything except the value bytes, which dcd masks (see
+/// `mask_values`): the message, the line number, the `...`-framed window, the
+/// escaped newlines, the caret COLUMN and the offset all match upstream
+/// byte-for-byte — only value characters read `*`. Key names survive, because
+/// naming the variable is the whole use of the message.
 #[test]
 fn symfony_format_errors() {
     let cases: Vec<(&str, String)> = vec![
-        ("FOO=BAR BAZ", "A value containing spaces must be surrounded by quotes in \".env\" at line 1.\n...FOO=BAR BAZ...\n             ^ line 1 offset 11".to_string()),
-        ("FOO BAR=BAR", "Whitespace characters are not supported after the variable name in \".env\" at line 1.\n...FOO BAR=BAR...\n     ^ line 1 offset 3".to_string()),
+        ("FOO=BAR BAZ", "A value containing spaces must be surrounded by quotes in \".env\" at line 1.\n...FOO=*******...\n             ^ line 1 offset 11".to_string()),
+        ("FOO BAR=BAR", "Whitespace characters are not supported after the variable name in \".env\" at line 1.\n...FOO BAR=***...\n     ^ line 1 offset 3".to_string()),
         ("FOO", "Missing = in the environment variable declaration in \".env\" at line 1.\n...FOO...\n     ^ line 1 offset 3".to_string()),
-        ("FOO=\"foo", "Missing quote to end the value in \".env\" at line 1.\n...FOO=\"foo...\n          ^ line 1 offset 8".to_string()),
-        ("FOO='foo", "Missing quote to end the value in \".env\" at line 1.\n...FOO='foo...\n          ^ line 1 offset 8".to_string()),
-        ("FOO=\"foo\nBAR=\"bar\"", "Missing quote to end the value in \".env\" at line 1.\n...FOO=\"foo\\nBAR=\"bar\"...\n                     ^ line 1 offset 18".to_string()),
-        ("FOO='foo\n", "Missing quote to end the value in \".env\" at line 1.\n...FOO='foo\\n...\n            ^ line 1 offset 9".to_string()),
+        ("FOO=\"foo", "Missing quote to end the value in \".env\" at line 1.\n...FOO=****...\n          ^ line 1 offset 8".to_string()),
+        ("FOO='foo", "Missing quote to end the value in \".env\" at line 1.\n...FOO=****...\n          ^ line 1 offset 8".to_string()),
+        ("FOO=\"foo\nBAR=\"bar\"", "Missing quote to end the value in \".env\" at line 1.\n...FOO=****\\nBAR=*****...\n                     ^ line 1 offset 18".to_string()),
+        ("FOO='foo\n", "Missing quote to end the value in \".env\" at line 1.\n...FOO=****\\n...\n            ^ line 1 offset 9".to_string()),
         ("export FOO", "Unable to unset an environment variable in \".env\" at line 1.\n...export FOO...\n            ^ line 1 offset 10".to_string()),
-        ("FOO=${FOO", "Unclosed braces on variable expansion in \".env\" at line 1.\n...FOO=${FOO...\n           ^ line 1 offset 9".to_string()),
-        ("FOO= BAR", "Whitespace are not supported before the value in \".env\" at line 1.\n...FOO= BAR...\n      ^ line 1 offset 4".to_string()),
+        ("FOO=${FOO", "Unclosed braces on variable expansion in \".env\" at line 1.\n...FOO=*****...\n           ^ line 1 offset 9".to_string()),
+        ("FOO= BAR", "Whitespace are not supported before the value in \".env\" at line 1.\n...FOO=****...\n      ^ line 1 offset 4".to_string()),
         ("Стасян", "Invalid character in variable name in \".env\" at line 1.\n...Стасян...\n  ^ line 1 offset 0".to_string()),
         ("FOO!", "Missing = in the environment variable declaration in \".env\" at line 1.\n...FOO!...\n     ^ line 1 offset 3".to_string()),
-        ("FOO=$(echo foo", "Missing closing parenthesis. in \".env\" at line 1.\n...FOO=$(echo foo...\n                ^ line 1 offset 14".to_string()),
-        ("FOO=$(echo foo\n", "Missing closing parenthesis. in \".env\" at line 1.\n...FOO=$(echo foo\\n...\n                ^ line 1 offset 14".to_string()),
-        ("FOO=\nBAR=${FOO:-\\'a{a}a}", "Unsupported character \"'\" found in the default value of variable \"$FOO\". in \".env\" at line 2.\n...\\nBAR=${FOO:-\\'a{a}a}...\n                       ^ line 2 offset 24".to_string()),
-        ("FOO=\nBAR=${FOO:-a$a}", "Unsupported character \"$\" found in the default value of variable \"$FOO\". in \".env\" at line 2.\n...FOO=\\nBAR=${FOO:-a$a}...\n                       ^ line 2 offset 20".to_string()),
-        ("FOO=\nBAR=${FOO:-a\"a}", "Missing quote to end the value in \".env\" at line 2.\n...FOO=\\nBAR=${FOO:-a\"a}...\n                       ^ line 2 offset 20".to_string()),
-        ("_=FOO", "Invalid character in variable name in \".env\" at line 1.\n..._=FOO...\n  ^ line 1 offset 0".to_string()),
+        ("FOO=$(echo foo", "Missing closing parenthesis. in \".env\" at line 1.\n...FOO=**********...\n                ^ line 1 offset 14".to_string()),
+        ("FOO=$(echo foo\n", "Missing closing parenthesis. in \".env\" at line 1.\n...FOO=**********\\n...\n                ^ line 1 offset 14".to_string()),
+        ("FOO=\nBAR=${FOO:-\\'a{a}a}", "Unsupported character \"'\" found in the default value of variable \"$FOO\". in \".env\" at line 2.\n...\\nBAR=***************...\n                       ^ line 2 offset 24".to_string()),
+        ("FOO=\nBAR=${FOO:-a$a}", "Unsupported character \"$\" found in the default value of variable \"$FOO\". in \".env\" at line 2.\n...FOO=\\nBAR=***********...\n                       ^ line 2 offset 20".to_string()),
+        ("FOO=\nBAR=${FOO:-a\"a}", "Missing quote to end the value in \".env\" at line 2.\n...FOO=\\nBAR=***********...\n                       ^ line 2 offset 20".to_string()),
+        ("_=FOO", "Invalid character in variable name in \".env\" at line 1.\n..._=***...\n  ^ line 1 offset 0".to_string()),
     ];
     for (data, expected) in cases {
         assert_eq!(parse_err(data), expected, "input: {data:?}");
     }
+}
+
+/// The leak this masking exists to stop: a syntax error in ONE variable printed
+/// the NEXT variable's value, and an apostrophe in a password is enough to trigger
+/// it. `dcd check` is the CI lint job, so that landed in job logs.
+#[test]
+fn a_parse_error_never_prints_a_neighbouring_value() {
+    let rendered = parse_err("BROKEN=va'lue\nSTRIPE_KEY=sk_live_51HxxSECRET\n");
+    assert!(!rendered.contains("sk_live"), "a neighbouring secret leaked: {rendered}");
+    assert!(!rendered.contains("SECRET"), "a neighbouring secret leaked: {rendered}");
+    assert!(rendered.contains("Missing quote to end the value"), "{rendered}");
 }
 
 #[test]
@@ -400,10 +416,21 @@ fn truncated_command_expression_errors_instead_of_looping() {
 
 #[test]
 fn deep_paren_nesting_errors_instead_of_overflowing_the_stack() {
-    let depth = 100_000;
-    let data = format!("FOO=$({}{}", "(".repeat(depth), ")".repeat(depth + 1));
-    let message = parse_err(&data);
-    assert!(message.starts_with("Missing closing parenthesis."), "got: {message}");
+    let balanced = |depth: usize| format!("FOO=$({}{}", "(".repeat(depth), ")".repeat(depth + 1));
+
+    // A BALANCED expression well inside the cap parses far enough to be refused as
+    // command expansion — so it is the DEPTH, not a missing bracket, that stops the
+    // deep case. Without this control the test passes with the cap set to 1, which
+    // is what it exists to detect.
+    let shallow = parse_err(&balanced(8));
+    assert!(
+        shallow.starts_with("command expansion is not supported"),
+        "a shallow balanced expression must reach the refusal: {shallow}"
+    );
+
+    let deep = parse_err(&balanced(100_000));
+    assert!(deep.starts_with("Missing closing parenthesis."), "got: {deep}");
+    assert_ne!(shallow, deep, "the depth cap must be what stops the deep case");
 }
 
 #[test]
@@ -510,8 +537,20 @@ fn chain_file_discovery_layers_and_local_stage_skip() {
     assert_eq!(resolved.container_env["ONLY_BASE"], "1");
     assert_eq!(resolved.layers.len(), 4);
 
+    // Stage "local" must NOT load `.env.local` as a stage file (that would be the
+    // same file twice) — Symfony skips it by name. Asserting only `FOO == "local"`
+    // cannot see that: `.env.local` is already the second layer, so the value is
+    // "local" either way. The LAYER COUNT is what distinguishes skip from no-skip.
+    std::fs::write(dir.join(".env.local.local"), "FOO=nested").unwrap();
     let resolved = resolve(Some(&base), "local", false, None, &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "local");
+    assert_eq!(resolved.layers.len(), 2, "stage `local` loads .env and .env.local, nothing more");
+    assert!(
+        !resolved.layers.iter().any(|layer| layer.label.contains(".env.local.local")),
+        "the nested stage file must not be loaded: {:?}",
+        resolved.layers.iter().map(|l| &l.label).collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_file(dir.join(".env.local.local"));
 
     let resolved = resolve(Some(&base), "", false, None, &HashMap::new()).unwrap();
     assert_eq!(resolved.container_env["FOO"], "local");

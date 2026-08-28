@@ -1,7 +1,9 @@
-//! Real-Docker integration tests (spec §10.2). Gated on `DCD_E2E=1` so the normal
-//! `cargo test` run stays daemon-free; CI sets it with a Docker service.
+//! Real-Docker integration tests (spec §10.2). `#[ignore]`d so the normal `cargo
+//! test` run stays daemon-free AND reports them as *ignored* — an env-var gate that
+//! returned early instead reported a green tick while asserting nothing, which is
+//! how this whole suite stayed broken through the v2 migration unnoticed.
 //!
-//!   DCD_E2E=1 cargo test --test e2e -- --test-threads=1
+//!   cargo test --test e2e -- --test-threads=1 --include-ignored
 //!
 //! Each test provisions a scratch network + an `nginx:alpine` managed service, drives
 //! the real `dcd` binary, and cleans everything up via the `Fixture` drop guard.
@@ -11,12 +13,49 @@ use std::process::Command;
 
 use assert_cmd::cargo::CommandCargoExt;
 
-fn enabled() -> bool {
-    std::env::var("DCD_E2E").is_ok()
+/// Every `docker` call here is an ASSERTION SUBSTRATE, so a failed one must not
+/// read as "nothing found": a broken `docker ps` returning empty stdout satisfies
+/// `assert!(running(...).is_empty())` for entirely the wrong reason.
+fn docker(args: &[&str]) -> std::process::Output {
+    let out = Command::new("docker").args(args).output().expect("docker available");
+    assert!(
+        out.status.success(),
+        "docker {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
 }
 
-fn docker(args: &[&str]) -> std::process::Output {
-    Command::new("docker").args(args).output().expect("docker available")
+/// For `Drop` only: a panic here would land during unwind from a failing assertion
+/// and abort the process, destroying the failure report.
+fn docker_quietly(args: &[&str]) -> Option<std::process::Output> {
+    Command::new("docker").args(args).output().ok()
+}
+
+/// Every file under `root`, recursively — `sync` writes into subdirectories, so a
+/// flat `read_dir` scan misses exactly the places an upload could land. Returns the
+/// number of files actually read alongside the hits, because a scan that read
+/// nothing and a scan that found nothing are otherwise the same answer.
+fn scan_for(root: &std::path::Path, needle: &str) -> (usize, Vec<String>) {
+    let mut scanned = 0;
+    let mut hits = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            scanned += 1;
+            if String::from_utf8_lossy(&bytes).contains(needle) {
+                hits.push(path.display().to_string());
+            }
+        }
+    }
+    (scanned, hits)
 }
 
 struct Fixture {
@@ -28,6 +67,10 @@ impl Fixture {
     fn new(tag: &str) -> Fixture {
         let project = format!("dcdit{}{}", std::process::id(), tag);
         let dir = std::env::temp_dir().join(&project);
+        // Cleared first, like the sibling fixtures: a panicked earlier run with the
+        // same pid leaves state a later one would inherit — and `it_013`'s subject
+        // is the ABSENCE of files at fixed paths.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let dcd_yaml = format!(
@@ -63,6 +106,7 @@ stages: {{ it: {{}} }}
   app:
     image: nginx:alpine
     profiles: ["dcd-release"]
+    restart: unless-stopped
     networks:
       default:
         aliases: [app]
@@ -106,20 +150,19 @@ networks:
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let containers = docker(&["ps", "-aq", "--filter", &format!("name=^{}", self.project)]);
-        for id in String::from_utf8_lossy(&containers.stdout).split_whitespace() {
-            docker(&["rm", "-f", id]);
+        if let Some(containers) = docker_quietly(&["ps", "-aq", "--filter", &format!("name=^{}", self.project)]) {
+            for id in String::from_utf8_lossy(&containers.stdout).split_whitespace() {
+                docker_quietly(&["rm", "-f", id]);
+            }
         }
-        docker(&["network", "rm", &format!("{}_net", self.project)]);
+        docker_quietly(&["network", "rm", &format!("{}_net", self.project)]);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 #[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
 fn it_001_happy_deploy_and_006_no_recreate() {
-    if !enabled() {
-        return;
-    }
     let fx = Fixture::new("happy");
 
     let out = fx.deploy();
@@ -143,12 +186,19 @@ fn it_001_happy_deploy_and_006_no_recreate() {
 }
 
 #[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
 fn it_002_failed_healthcheck_keeps_red_and_removes_black() {
-    if !enabled() {
-        return;
-    }
     let fx = Fixture::new("badhealth");
-    // point the healthcheck at a port nothing listens on -> never passes
+
+    // A RED has to exist first, or "keeps red" is not exercised at all: against a
+    // fresh fixture the assertions below are equally satisfied by a black that was
+    // never started, and the exit code is every pre-cutover failure, not this one.
+    assert!(fx.deploy().status.success(), "the first deploy must establish a red");
+    let red = fx.running("app");
+    assert_eq!(red.len(), 1, "expected one red, got {red:?}");
+    let red = red[0].clone();
+
+    // Point the healthcheck at a port nothing listens on -> it never passes.
     let yaml = std::fs::read_to_string(fx.dir.join("dcd.yaml"))
         .unwrap()
         .replace("http://{container}/", "http://{container}:9/");
@@ -157,16 +207,22 @@ fn it_002_failed_healthcheck_keeps_red_and_removes_black() {
 
     let out = fx.deploy();
     assert_eq!(out.status.code(), Some(1), "expected pre-cutover exit 1");
-    // black was removed; no app container left; state never advanced
-    assert!(fx.running("app").is_empty());
-    assert!(!fx.dir.join("dcd-state.json").exists() || !std::fs::read_to_string(fx.dir.join("dcd-state.json")).unwrap().contains("active"));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("healthcheck"),
+        "the failure must be the health gate, not some earlier step: {stderr}"
+    );
+
+    // INV-1: red is still serving, and it is still what state calls current.
+    let survivors = fx.running("app");
+    assert_eq!(survivors, vec![red.clone()], "red must survive and the black must be gone");
+    let state = std::fs::read_to_string(fx.dir.join("dcd-state.json")).expect("state exists from the first deploy");
+    assert!(state.contains(&format!("\"current\": \"{red}\"")), "current must still name red: {state}");
 }
 
 #[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
 fn it_007_env_baked_at_create_survives_restart_and_never_rests_in_deploy_root() {
-    if !enabled() {
-        return;
-    }
     let fx = Fixture::new("envchain");
 
     // Chain lives OUTSIDE deploy_root (spec IT-007) and carries a secret value.
@@ -187,32 +243,35 @@ fn it_007_env_baked_at_create_survives_restart_and_never_rests_in_deploy_root() 
     assert!(env_line.contains("APP_SECRET=e2e-hunter2"), "env not baked: {env_line}");
     assert!(env_line.contains("CHAIN_MARKER=stage"), "later layer must win: {env_line}");
 
-    // survives a restart with no env present anywhere
+    // survives a restart with no env present anywhere. `docker()` now asserts the
+    // restart actually happened, so "survives a restart" cannot pass on one that
+    // never occurred.
     docker(&["restart", &app[0]]);
     let inspect = docker(&["exec", &app[0], "printenv", "APP_SECRET"]);
     assert_eq!(String::from_utf8_lossy(&inspect.stdout).trim(), "e2e-hunter2");
 
-    // no file under deploy_root contains the secret value
-    for entry in std::fs::read_dir(&fx.dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_file() {
-            let bytes = std::fs::read(&path).unwrap();
-            assert!(
-                !String::from_utf8_lossy(&bytes).contains("e2e-hunter2"),
-                "secret at rest in {}",
-                path.display()
-            );
-        }
-    }
+    // No file ANYWHERE under deploy_root contains the value — recursively, because
+    // `sync` writes into subdirectories, and with a planted control so that "found
+    // nothing" is distinguishable from "scanned nothing".
+    std::fs::create_dir_all(fx.dir.join("nested")).unwrap();
+    std::fs::write(fx.dir.join("nested/planted-control"), "e2e-hunter2\n").unwrap();
+    let (scanned, hits) = scan_for(&fx.dir, "e2e-hunter2");
+    assert!(
+        hits.iter().any(|path| path.ends_with("planted-control")),
+        "the scan cannot find a secret that IS there — it proves nothing: scanned {scanned} file(s)"
+    );
+    std::fs::remove_file(fx.dir.join("nested/planted-control")).unwrap();
+
+    let (scanned, hits) = scan_for(&fx.dir, "e2e-hunter2");
+    assert!(scanned > 1, "expected to scan the files dcd wrote, scanned {scanned}");
+    assert!(hits.is_empty(), "secret at rest in {hits:?}");
 
     let _ = std::fs::remove_dir_all(&env_dir);
 }
 
 #[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
 fn it_008_unlock_accepts_a_stuck_release_clears_the_lock_and_leaves_the_stage_deployable() {
-    if !enabled() {
-        return;
-    }
     let fx = Fixture::new("unlock");
     let config = fx.dir.join("dcd.yaml");
     let healthy_yaml = std::fs::read_to_string(&config).unwrap();
@@ -270,10 +329,8 @@ fn it_008_unlock_accepts_a_stuck_release_clears_the_lock_and_leaves_the_stage_de
 }
 
 #[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
 fn it_005_concurrent_lock_refuses_second() {
-    if !enabled() {
-        return;
-    }
     let fx = Fixture::new("lock");
     // hold the lock by hand (flock on the same path the deploy uses)
     let lock_path = fx.dir.join(".dcd.it.lock");
@@ -293,10 +350,8 @@ fn it_005_concurrent_lock_refuses_second() {
 /// path v2 removed — so every CI deploy carrying it died in config load before
 /// Docker was touched. Real Docker is what proves the pin reaches the container.
 #[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
 fn it_017_an_image_pin_is_the_image_the_release_container_runs() {
-    if !enabled() {
-        return;
-    }
     let fx = Fixture::new("imagepin");
     let pinned = "nginx:1.27-alpine";
 
@@ -320,10 +375,8 @@ fn it_017_an_image_pin_is_the_image_the_release_container_runs() {
 /// A pin naming a service the compose files do not declare must stop the deploy,
 /// naming the services that do exist — not deploy the unpinned image.
 #[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
 fn it_018_an_image_pin_for_an_unknown_service_refuses_to_deploy() {
-    if !enabled() {
-        return;
-    }
     let fx = Fixture::new("imagetypo");
 
     let out = fx.dcd(&["deploy", "it", "--image", "ap=nginx:1.27-alpine"]);
@@ -339,10 +392,8 @@ fn it_018_an_image_pin_for_an_unknown_service_refuses_to_deploy() {
 /// both prescribe running it against production, so this is the one command whose
 /// side effects must be zero.
 #[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
 fn it_013_a_dry_run_takes_no_lock_and_writes_nothing() {
-    if !enabled() {
-        return;
-    }
     let fx = Fixture::new("dryrun");
     let lock = fx.dir.join(".dcd.it.lock");
     let state = fx.dir.join("dcd-state.json");
@@ -377,4 +428,24 @@ fn it_013_a_dry_run_takes_no_lock_and_writes_nothing() {
         String::from_utf8_lossy(&while_held.stderr)
     );
     assert!(combined.contains("may be stale"), "a held lock must be reported: {combined}");
+}
+
+/// IT-015 (§7.6): `compose run` forces `restart=no` on a one-off container, so dcd
+/// re-applies the policy the operator declared with `docker update`. Without it the
+/// release simply does not come back after a host reboot — silent until the reboot.
+#[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
+fn it_015_the_declared_restart_policy_is_applied_to_the_release() {
+    let fx = Fixture::new("restart");
+    assert!(fx.deploy().status.success());
+
+    let app = fx.running("app");
+    assert_eq!(app.len(), 1, "expected one app container, got {app:?}");
+
+    let policy = docker(&["inspect", &app[0], "--format", "{{.HostConfig.RestartPolicy.Name}}"]);
+    assert_eq!(
+        String::from_utf8_lossy(&policy.stdout).trim(),
+        "unless-stopped",
+        "compose run creates with restart=no; dcd must re-apply the compose service's policy"
+    );
 }

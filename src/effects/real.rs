@@ -92,21 +92,42 @@ fn run_with_stdin(
     })
 }
 
+/// The sibling a staged write renames from. Carries the pid so two writers on one
+/// shared `deploy_root` cannot collide on a fixed `.tmp` name.
+fn staging_path(path: &Path) -> std::path::PathBuf {
+    let mut staged = path.as_os_str().to_os_string();
+    staged.push(format!(".tmp.{}", std::process::id()));
+    std::path::PathBuf::from(staged)
+}
+
 pub struct SystemFs;
 
 impl FileSystem for SystemFs {
+    /// Staged and renamed, like the ssh backend: `dcd-state.json` is the INV-3 write,
+    /// and a torn one fails every later command on the stage, `unlock` included.
+    /// Writing in place made that possible locally while the remote path was safe —
+    /// two backends of one trait with different durability is a trap, not a detail.
     fn write(&self, path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-        match mode {
-            // OpenOptions applies the mode only when CREATING; the chmod covers a
-            // pre-existing file whose mode differs. New files never see the umask default.
-            Some(mode) => {
-                use std::io::Write;
-                let mut file = open_with_mode(path, mode)?;
-                file.write_all(bytes)?;
-                set_mode(path, mode)
+        use std::io::Write;
+        let staged = staging_path(path);
+        let outcome = (|| {
+            match mode {
+                // OpenOptions applies the mode only when CREATING, so the staged
+                // file never exists at the umask default even briefly.
+                Some(mode) => {
+                    let mut file = open_with_mode(&staged, mode)?;
+                    file.write_all(bytes)?;
+                    file.sync_all()?;
+                    set_mode(&staged, mode)?;
+                }
+                None => fs::write(&staged, bytes)?,
             }
-            None => fs::write(path, bytes),
+            fs::rename(&staged, path)
+        })();
+        if outcome.is_err() {
+            let _ = fs::remove_file(&staged);
         }
+        outcome
     }
 
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
@@ -176,6 +197,12 @@ impl SshRunner {
         &self.target
     }
 
+    /// Exactly what `send` spawns. Exposed so INV-12 can be asserted against the
+    /// argv that really reaches the process table, rather than against an object
+    /// the env map was never given.
+    pub fn spawn_argv(&self) -> Argv {
+        self.target.invocation()
+    }
 }
 
 impl CommandRunner for SshRunner {
@@ -210,7 +237,18 @@ impl SshRunner {
         // Reporting that as an ordinary non-zero would let the engine classify a
         // severed link as an application failure, and the best-effort call sites
         // would swallow it and keep issuing commands (spec §2.7).
-        if out.code == 255 && out.stdout.is_empty() {
+        // A link severed AFTER the remote command wrote some stdout is still a
+        // transport failure, so an empty stdout cannot be the only signal — ssh
+        // announces its own failures on stderr, and those are what identify it.
+        let ssh_spoke = out.stderr.contains("ssh:")
+            || out.stderr.contains("Connection closed")
+            || out.stderr.contains("Connection reset")
+            || out.stderr.contains("Connection refused")
+            || out.stderr.contains("Permission denied")
+            || out.stderr.contains("Host key verification failed")
+            || out.stderr.contains("Timeout, server")
+            || out.stderr.contains("Broken pipe");
+        if out.code == 255 && (out.stdout.is_empty() || ssh_spoke) {
             return Err(RunError::Transport {
                 argv: argv.display(),
                 stderr: format!(
@@ -270,7 +308,12 @@ impl FileSystem for SshFs {
     /// file, and `load_state` treats a live stage as a fresh one.
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         let quoted = crate::ssh::quote(&path.display().to_string());
-        let out = self.run(format!("if [ -e {quoted} ]; then exec cat {quoted}; else exit {MISSING}; fi\n"))?;
+        // base64 both ways: stdout is captured as a lossy String, so a raw `cat`
+        // turned every non-UTF-8 byte into U+FFFD — silent corruption on a path the
+        // write side already base64s precisely to avoid.
+        let out = self.run(format!(
+            "if [ -e {quoted} ]; then exec base64 {quoted}; else exit {MISSING}; fi\n"
+        ))?;
         if out.code == MISSING {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -285,7 +328,9 @@ impl FileSystem for SshFs {
                 out.stderr.trim()
             )));
         }
-        Ok(out.stdout.into_bytes())
+        crate::ssh::base64_decode(&out.stdout).ok_or_else(|| {
+            std::io::Error::other(format!("cannot decode {} from the target", path.display()))
+        })
     }
 
     fn exists(&self, path: &Path) -> std::io::Result<bool> {

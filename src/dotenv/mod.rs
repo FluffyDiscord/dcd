@@ -405,11 +405,51 @@ impl Parser {
     }
 }
 
+/// Masks every VALUE byte in the error window, keeping key names, `=` and newlines.
+///
+/// The window is 20 raw bytes either side of the cursor, so a syntax error in one
+/// variable — an apostrophe in a password is enough — printed the neighbouring
+/// variable's value verbatim, into `dcd check`'s output and from there into CI
+/// logs. This is a deliberate divergence from Symfony's byte-exact snippet: dcd's
+/// standing promise is that env values are never printed, and a parser message is
+/// not worth breaking it for. Masking is 1 byte to 1 byte, so the caret arithmetic
+/// below is unaffected.
+fn mask_values(window: &[u8], starts_at_line_start: bool) -> Vec<u8> {
+    let mut masked = Vec::with_capacity(window.len());
+    // Whether the cursor is still in a KEY. It has to carry across the whole
+    // window: the two halves are one continuous line, so restarting the state at
+    // the cursor would mask a key whose `=` had not been reached yet.
+    let mut in_key = starts_at_line_start;
+    for byte in window {
+        match byte {
+            b'\n' => {
+                in_key = true;
+                masked.push(*byte);
+            }
+            b'=' if in_key => {
+                in_key = false;
+                masked.push(*byte);
+            }
+            _ if in_key => masked.push(*byte),
+            _ => masked.push(b'*'),
+        }
+    }
+    masked
+}
+
 fn render_error_context(data: &[u8], end: usize, path: &str, lineno: usize, cursor: usize) -> String {
     let before_start = cursor.saturating_sub(20);
     let before_window = &data[before_start..cursor.min(end)];
-    let before = escape_newlines(before_window);
-    let after = escape_newlines(&data[cursor.min(end)..(cursor + 20).min(end)]);
+    let after_window = &data[cursor.min(end)..(cursor + 20).min(end)];
+    let at_line_start = before_start == 0 || data.get(before_start - 1) == Some(&b'\n');
+
+    // Masked as ONE window so key/value state carries across the cursor, then split
+    // back — the cursor falls mid-line far more often than not.
+    let mut whole = before_window.to_vec();
+    whole.extend_from_slice(after_window);
+    let masked = mask_values(&whole, at_line_start);
+    let before = escape_newlines(&masked[..before_window.len()]);
+    let after = escape_newlines(&masked[before_window.len()..]);
     // PHP pads by strlen of the escaped BYTE window; a lossy replacement char
     // would inflate the char-based length, so count bytes like PHP does.
     let escaped_newlines = before_window.iter().filter(|b| **b == b'\n').count();

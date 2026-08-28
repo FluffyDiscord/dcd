@@ -131,10 +131,16 @@ impl<'a> Docker<'a> {
     /// INV-14: discovery is by compose SERVICE label, never a name prefix. Under
     /// ADR-013 the release container carries the project label too, so a prefix
     /// filter could match it — and the caller `docker stop`s everything returned.
+    /// `-a`: a worker that exited (crash, OOM, a reboot before the restart policy
+    /// applied) still holds its name, and `compose run --name` fails against it.
+    /// Without the stopped ones the drain cannot see what it must remove, and the
+    /// `workers` step then collides on those names post-cutover — an exit 4 that
+    /// `--resume` repeats forever.
     pub fn worker_ps_names(&self, worker_service: &str) -> Argv {
         Argv::of([
             "docker",
             "ps",
+            "-a",
             "--filter",
             &format!("label=com.docker.compose.project={}", self.cfg.project),
             "--filter",
@@ -144,8 +150,11 @@ impl<'a> Docker<'a> {
         ])
     }
 
+    /// Escaped like every other `--filter name=`: the filter is a REGEX, so a
+    /// container name carrying `.` or `+` would otherwise match more than itself —
+    /// and this one decides whether the serving release is still alive.
     pub fn is_running(&self, container: &str) -> Argv {
-        let filter = format!("name=^{container}$");
+        let filter = format!("name=^{}$", regex_escape(container));
         Argv::of(["docker", "ps", "-q", "--filter", &filter])
     }
 
@@ -348,6 +357,9 @@ stages:
         assert!(rendered.contains("label=com.docker.compose.service=worker"), "got: {rendered}");
         assert!(rendered.contains("label=com.docker.compose.project=demo"));
         assert!(!rendered.contains("name="), "a name filter would sweep the release container: {rendered}");
+        // A stopped worker still holds its name, and `compose run --name` fails
+        // against it — so drain has to see the exited ones too.
+        assert!(rendered.starts_with("docker ps -a "), "got: {rendered}");
     }
 
     #[test]
@@ -366,6 +378,12 @@ stages:
         let cfg = config();
         let rendered = Docker::new(&cfg).ps_names("demo-app.v2", true).display();
         assert!(rendered.contains(r"name=^demo-app\.v2"), "got: {rendered}");
+
+        // EVERY name filter, not just the one the test happened to name. `is_running`
+        // was the one that skipped escaping — and it is what decides whether the
+        // serving release is still alive.
+        let running = Docker::new(&cfg).is_running("demo-app.v2").display();
+        assert!(running.contains(r"name=^demo-app\.v2$"), "got: {running}");
     }
 
     /// An image with no healthcheck must report `none`, not blow up the template.

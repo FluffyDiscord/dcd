@@ -29,12 +29,16 @@ use crate::ui::Reporter;
     disable_version_flag = true,
     propagate_version = true,
     about = "Zero-downtime red-black Docker deploys from a YAML config",
-    long_about = "dcd runs a zero-downtime red-black Docker deploy on the server from a \
-dcd.yaml: it builds the new container next to the live one, health-checks it, flips the \
-nginx upstream over to it, then drains the old one.\n\n\
+    long_about = "dcd runs a zero-downtime red-black Docker deploy from a dcd.yaml: it \
+creates the new container next to the live one, health-checks it, flips the router's \
+upstream over to it, then drains the old one.\n\n\
+It runs HERE — on a CI runner or your workstation — and drives the target over ssh; \
+nothing is installed there. Your compose file declares the containers, dcd.yaml the \
+orchestration. Omit `ssh:` to drive a local Docker socket instead.\n\n\
 Env comes from a Symfony-style dotenv chain next to the config (.env, .env.local, \
-.env.<stage>, .env.<stage>.local — later wins, real env wins over all): chain keys are \
-delivered to containers via process-env passthrough, and dcd writes no env file. \
+.env.<stage>, .env.<stage>.local — later wins, real env wins over all): chain keys reach \
+containers as bare `-e KEY`, with the values riding a document on ssh stdin, so no value \
+ever enters an argv on either machine and dcd writes no env file. \
 --env-file <path> rebases the whole chain onto another base name (e.g. .env.deploy, \
 .env.deploy.local, .env.deploy.<stage>, .env.deploy.<stage>.local), so dcd's chain can \
 live beside an application's own .env files without colliding.\n\n\
@@ -234,7 +238,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         &process_env,
     )?;
     let mut cfg = config::load(&source, stage_of(&cli.command), &sets, &resolved.interpolation_env)?;
-    materialise_release_run(&mut cfg, &config_dir)?;
+    materialise_release_run(&mut cfg)?;
+    resolve_compose_sources(&mut cfg, &config_dir);
     let reporter = Reporter::auto(cli.json, cli.verbose);
 
     // Spec §2.7: over ~107 bytes ssh FAILS rather than degrading to an
@@ -402,16 +407,32 @@ fn config_dir(config_path: &Path) -> PathBuf {
 
 /// `--env-stdin` guards run eagerly at dispatch, before the lock (spec §5.2.1):
 /// a TTY on stdin or a prompting command without `--yes` refuses immediately.
+/// The `--env-stdin` policy, as a pure function of the flags and whether stdin is
+/// a terminal. Split out from the read so it is testable: asserting it through
+/// `read_env_stdin` meant reading PROCESS-GLOBAL stdin, which made `cargo test`
+/// fail from a terminal and hang behind an IDE runner that holds stdin open — and
+/// when it did pass, the terminal branch short-circuited so the `-y` guard below
+/// was never actually exercised.
+fn env_stdin_refusal(cli: &Cli, stdin_is_terminal: bool) -> Option<DcdError> {
+    if !cli.env_stdin {
+        return None;
+    }
+    if stdin_is_terminal {
+        return Some(DcdError::Config("--env-stdin requires piped input".to_string()));
+    }
+    let can_prompt = matches!(cli.command, Command::Rollback { .. } | Command::Unlock { .. });
+    if can_prompt && !cli.yes {
+        return Some(DcdError::Config("--env-stdin consumes stdin; pass -y/--yes".to_string()));
+    }
+    None
+}
+
 fn read_env_stdin(cli: &Cli) -> Result<Option<String>> {
     if !cli.env_stdin {
         return Ok(None);
     }
-    if std::io::stdin().is_terminal() {
-        return Err(DcdError::Config("--env-stdin requires piped input".to_string()));
-    }
-    let can_prompt = matches!(cli.command, Command::Rollback { .. } | Command::Unlock { .. });
-    if can_prompt && !cli.yes {
-        return Err(DcdError::Config("--env-stdin consumes stdin; pass -y/--yes".to_string()));
+    if let Some(refusal) = env_stdin_refusal(cli, std::io::stdin().is_terminal()) {
+        return Err(refusal);
     }
     let document = std::io::read_to_string(std::io::stdin())
         .map_err(|e| DcdError::Config(format!("cannot read --env-stdin document: {e}")))?;
@@ -909,21 +930,64 @@ fn host_check(expected: Option<&str>, actual: &str, stage: &str) -> Result<()> {
 /// `compose.files` is what keeps ONE creation path: from here on the run-based
 /// release is indistinguishable from a declared service — it resolves in the
 /// model, uploads with `sync`, pulls, and is created by `compose run`.
-fn materialise_release_run(cfg: &mut Config, config_dir: &Path) -> Result<()> {
+///
+/// It lands in the system temp dir, not the checkout. `docker compose config` must
+/// be able to read it, so it has to exist before `check` and `--dry-run` resolve
+/// the model — but those two are documented as having no side effects, and writing
+/// a generated, untracked file into the operator's repository is one.
+fn materialise_release_run(cfg: &mut Config) -> Result<()> {
     let Some(run) = cfg.release.run.clone() else {
         return Ok(());
     };
     let service = cfg.release.service_name(&cfg.project);
     let document = compose::render_run_document(&service, &run);
-    let path = config_dir.join(format!("dcd-release-run.{}.yml", cfg.stage));
+    let name = format!("dcd-release-run.{}.yml", cfg.stage);
+    let path = std::env::temp_dir().join(format!("{}-{name}", cfg.project));
     std::fs::write(&path, document)
         .map_err(|e| DcdError::Config(format!("cannot write {}: {e}", path.display())))?;
-    cfg.compose.files.push(path);
+
+    // Read from temp, addressed under `deploy_root` by its plain name.
+    cfg.compose.files.push(PathBuf::from(name));
+    cfg.compose.generated_source = Some(path);
     Ok(())
 }
 
+/// Splits each `compose.files` entry into the path dcd READS (against the config's
+/// own directory, on this machine) and the path `-f` ADDRESSES (against
+/// `deploy_root`, where every command runs). They are the same string in the common
+/// layout and differ the moment `-c` points elsewhere or `deploy_root` is not dcd's
+/// cwd — where, before this, the model resolved from one directory and the deploy
+/// ran in another, and an absolute entry was uploaded outside `deploy_root`.
+fn resolve_compose_sources(cfg: &mut Config, config_dir: &Path) {
+    let generated = cfg.compose.generated_source.clone();
+    let last = cfg.compose.files.len().saturating_sub(1);
+    let mut sources = Vec::with_capacity(cfg.compose.files.len());
+    let mut addressed = Vec::with_capacity(cfg.compose.files.len());
+    for (index, file) in cfg.compose.files.iter().enumerate() {
+        let generated_here = generated.as_ref().filter(|_| index == last);
+        match (generated_here, file.is_absolute()) {
+            (Some(path), _) => {
+                sources.push(path.clone());
+                addressed.push(file.clone());
+            }
+            (None, true) => {
+                sources.push(file.clone());
+                addressed.push(file.file_name().map(PathBuf::from).unwrap_or_else(|| file.clone()));
+            }
+            (None, false) => {
+                sources.push(config_dir.join(file));
+                addressed.push(file.clone());
+            }
+        }
+    }
+    cfg.compose.sources = sources;
+    cfg.compose.files = addressed;
+}
+
 fn resolve_compose_model(cfg: &Config, cli: &Cli, resolved: &crate::dotenv::ResolvedEnv) -> Result<ComposeModel> {
-    let argv = compose::config_argv(&cfg.project, &cfg.compose.files, &cfg.compose.profiles);
+    // Resolved from the SOURCE paths: this runs on the deploying machine, in dcd's
+    // own cwd, against the checkout.
+    let argv = compose::config_argv(&cfg.project, &cfg.compose.sources, &cfg.compose.profiles);
     // The chain has to reach compose, or every `image: ${REGISTRY}:${APP_TAG}`
     // resolves to `:` — and that empty ref is then written into the override file,
     // which is passed LAST and therefore wins over the operator's own compose file.
@@ -1142,7 +1206,14 @@ impl HookHost for ConfigureHost<'_> {
         self.fs.write(&self.resolve(path), content.as_bytes(), None).map_err(|e| e.to_string())
     }
     fn file_exists(&self, path: &str) -> bool {
-        self.fs.exists(&self.resolve(path)).unwrap_or(false)
+        match self.fs.exists(&self.resolve(path)) {
+            Ok(present) => present,
+            Err(e) => {
+                self.reporter
+                    .warn(&format!("ctx.file_exists({path}) could not be answered, reporting false: {e}"));
+                false
+            }
+        }
     }
     fn env(&self, name: &str) -> Option<String> {
         self.interpolation_env.get(name).cloned()
@@ -1260,23 +1331,38 @@ mod tests {
     }
 
     #[test]
+    /// TC-040. Asserted against the pure policy with the TTY state passed IN:
+    /// going through `read_env_stdin` read process-global stdin, so the result
+    /// depended on how the suite was launched — it failed from a terminal, and when
+    /// it passed, the terminal branch short-circuited before reaching this guard.
     fn env_stdin_on_a_prompting_command_without_yes_refuses_eagerly() {
-        // TC-040: cargo's test stdin is piped (not a TTY), so this exercises the
-        // prompting-command guard specifically.
         let cli = Cli::parse_from(["dcd", "rollback", "prod", "--env-stdin"]);
-        let err = read_env_stdin(&cli).unwrap_err();
+        let err = env_stdin_refusal(&cli, false).expect("a prompting command must refuse");
         assert!(err.to_string().contains("pass -y/--yes"), "got: {err}");
         assert_eq!(err.exit_code(), 2);
     }
 
     #[test]
+    fn env_stdin_from_a_terminal_is_refused_whatever_the_command() {
+        for command in [["dcd", "deploy", "prod", "--env-stdin"], ["dcd", "check", "prod", "--env-stdin"]] {
+            let cli = Cli::parse_from(command);
+            let err = env_stdin_refusal(&cli, true).expect("a TTY carries no document");
+            assert!(err.to_string().contains("requires piped input"), "got: {err}");
+        }
+    }
+
+    #[test]
     fn unlock_prompts_so_env_stdin_needs_yes_there_too() {
         let cli = Cli::parse_from(["dcd", "unlock", "prod", "--env-stdin"]);
-        let err = read_env_stdin(&cli).unwrap_err();
+        let err = env_stdin_refusal(&cli, false).expect("unlock prompts, so it must refuse");
         assert!(err.to_string().contains("pass -y/--yes"), "got: {err}");
 
         let confirmed = Cli::parse_from(["dcd", "unlock", "prod", "--env-stdin", "-y"]);
-        assert!(read_env_stdin(&confirmed).is_ok());
+        assert!(env_stdin_refusal(&confirmed, false).is_none());
+
+        // A non-prompting command needs no -y.
+        let deploy = Cli::parse_from(["dcd", "deploy", "prod", "--env-stdin"]);
+        assert!(env_stdin_refusal(&deploy, false).is_none());
     }
 
     #[test]

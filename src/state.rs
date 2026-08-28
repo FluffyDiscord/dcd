@@ -254,6 +254,15 @@ impl StageState {
         self.releases.push(release);
     }
 
+    /// Undo an in-memory `record_cutover` whose state write never reached disk, so
+    /// the engine's view matches the router it just reloaded back. Only the row
+    /// this run appended is dropped; releases it demoted stay demoted, because the
+    /// document on disk is the one that was never written.
+    pub fn drop_cutover(&mut self, container: &str) {
+        self.releases
+            .retain(|release| !(release.container == container && release.status == ReleaseStatus::CutoverPending));
+    }
+
     /// Apply the §4.3 finalize transition. `serving_before` is the container that
     /// was serving at run start (None on a first-ever deploy).
     pub fn finalize(&mut self, new_container: &str, kind: FinalizeKind, serving_before: Option<&str>) {
@@ -393,8 +402,12 @@ impl StageState {
             if !containers.contains(&release.container) {
                 continue;
             }
-            let settled = match release.images.get("app") {
-                Some(image) => !proposed.contains(image) || removed.contains(image),
+            // `app_image()`, not the literal key `"app"`: v2 keys `images` by
+            // compose service name, so a hardcoded lookup returns None for any
+            // release service named otherwise — and `None => true` then settles
+            // every such release even when its image removal was refused.
+            let settled = match release.app_image() {
+                Some(image) => !proposed.iter().any(|tag| tag == image) || removed.iter().any(|tag| tag == image),
                 None => true,
             };
             if settled {
@@ -482,9 +495,13 @@ impl StageState {
 mod tests {
     use super::*;
 
+    /// Keyed `web`, deliberately NOT `app`. `images` is keyed by compose service
+    /// name, and every test here using the literal `app` is what hid a hardcoded
+    /// `images.get("app")` lookup that made rollback impossible for every other
+    /// project. A non-conventional name keeps the whole file honest.
     fn release(id: u64, container: &str, app: &str, status: ReleaseStatus) -> Release {
         let mut images = IndexMap::new();
-        images.insert("app".to_string(), app.to_string());
+        images.insert("web".to_string(), app.to_string());
         Release {
             id,
             container: container.to_string(),
@@ -690,13 +707,23 @@ mod tests {
     fn mark_reaped_leaves_a_release_whose_image_docker_refused() {
         let mut s = StageState::default();
         s.releases.push(release(1, "OLD", "appA", ReleaseStatus::Superseded));
+        // The positive control, settled in the SAME call: without it this test
+        // asserts a field that started `false` is still `false`, which a `mark_reaped`
+        // that did nothing at all would satisfy.
+        s.releases.push(release(2, "DONE", "appB", ReleaseStatus::Superseded));
         s.current = Some("CUR".into());
 
-        // proposed, but Docker refused it: the image is still on the host and this row is
-        // the evidence dcd put it there (INV-11), so it must stay proposable
-        s.mark_reaped(&["OLD".to_string()], &["appA".to_string()], &[]);
+        // appA was proposed and Docker refused it: the image is still on the host and
+        // this row is the evidence dcd put it there (INV-11), so it stays proposable.
+        // appB was proposed AND confirmed gone, so its row is finished business.
+        s.mark_reaped(
+            &["OLD".to_string(), "DONE".to_string()],
+            &["appA".to_string(), "appB".to_string()],
+            &["appB".to_string()],
+        );
 
-        assert!(!s.find("OLD").unwrap().reaped);
+        assert!(!s.find("OLD").unwrap().reaped, "a refused removal must stay proposable");
+        assert!(s.find("DONE").unwrap().reaped, "a confirmed removal settles the row");
     }
 
     #[test]
@@ -717,12 +744,17 @@ mod tests {
     fn mark_reaped_ignores_a_container_docker_did_not_confirm_gone() {
         let mut s = StageState::default();
         s.releases.push(release(1, "STUCK", "appA", ReleaseStatus::Superseded));
+        s.releases.push(release(2, "TORN", "appA", ReleaseStatus::Superseded));
         s.current = Some("CUR".into());
 
-        // the removal failed, so "STUCK" is absent from the confirmed list
-        s.mark_reaped(&[], &["appA".to_string()], &["appA".to_string()]);
+        // Only TORN's container was confirmed torn down; STUCK's removal failed, so
+        // it is absent from the container list. Both share an image, so the image
+        // arithmetic is identical and the container list is the only difference —
+        // which is exactly what this test is about.
+        s.mark_reaped(&["TORN".to_string()], &["appA".to_string()], &["appA".to_string()]);
 
-        assert!(!s.find("STUCK").unwrap().reaped);
+        assert!(!s.find("STUCK").unwrap().reaped, "an unconfirmed teardown stays unreaped");
+        assert!(s.find("TORN").unwrap().reaped, "a confirmed teardown settles");
     }
 
     #[test]

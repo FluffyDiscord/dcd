@@ -505,9 +505,12 @@ stages: { prod: {} }
 
     #[test]
     fn dump_logs_formatted_state_and_cfg() {
+        // Both halves the name promises: `ctx.state` AND `ctx.cfg`. Only state was
+        // ever dumped, so the cfg half was untested.
         let plugin = r#"
             after('cutover', function(ctx)
               ctx.dump(ctx.state)
+              ctx.dump(ctx.cfg)
             end)
         "#;
         let host = LuaHost::load(&config(), &[("p".into(), plugin.into())]).unwrap();
@@ -516,19 +519,43 @@ stages: { prod: {} }
         host.fire(&fake, "after_cutover").unwrap();
         let logged = fake.logs.borrow().join("\n");
         assert!(logged.contains("[dump]"));
-        assert!(logged.contains("current: black-0"));
+        assert!(logged.contains("current: black-0"), "the state dump: {logged}");
+        assert!(logged.contains("project:"), "the cfg dump: {logged}");
     }
 
     #[test]
     fn unknown_task_reference_errors() {
-        let host = LuaHost::load(&config(), &[("p".into(), "after('cutover', 'ghost')".into())]).unwrap();
+        // A distinctive name, not a word that could appear in an unrelated message:
+        // `ghost` is five letters and could match by accident, which would let this
+        // pass on the wrong error entirely.
+        let missing = "no-such-task-zqx";
+        let plugin = format!("after('cutover', '{missing}')");
+        let host = LuaHost::load(&config(), &[("p".into(), plugin)]).unwrap();
         let err = host.fire(&FakeHost::default(), "after_cutover").unwrap_err();
-        assert!(err.contains("ghost"));
+        assert!(err.contains(missing), "the error must name the task: {err}");
+        assert!(
+            err.contains("task") || err.contains("unknown"),
+            "and say what was wrong with it: {err}"
+        );
     }
 
+    /// `LuaHost::load` EXECUTES the chunk, so the payload must be harmless if the
+    /// sandbox ever regresses — a destructive one would run for real on the machine
+    /// running the tests. And `is_err()` alone is the weakest possible check: a
+    /// syntax error satisfies it just as well as a removed `os.execute`, so the
+    /// reason is asserted too.
     #[test]
     fn sandbox_removes_process_escapes() {
-        assert!(LuaHost::load(&config(), &[("p".into(), "os.execute('rm -rf /')".into())]).is_err());
-        assert!(LuaHost::load(&config(), &[("p".into(), "io.popen('ls')".into())]).is_err());
+        for escape in ["os.execute('true')", "io.popen('true')"] {
+            let outcome = LuaHost::load(&config(), &[("p".into(), escape.into())]);
+            let Err(error) = outcome else {
+                panic!("{escape} must not be reachable");
+            };
+            let error = error.to_string();
+            assert!(
+                error.contains("nil value") || error.contains("attempt to index"),
+                "{escape} failed for the wrong reason: {error}"
+            );
+        }
     }
 }

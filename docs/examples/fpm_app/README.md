@@ -125,9 +125,14 @@ dcd deploy prod --resume       # finish a deploy that died after cutover
 CI runs the deploy; manually it is:
 
 ```sh
-cd "$DEPLOY_ROOT"
-REGISTRY=<registry-image> DEPLOY_ROOT="$DEPLOY_ROOT" dcd deploy prod --image app=<tag>
+cd path/to/this/checkout          # where dcd.yaml and the compose files live
+REGISTRY=<registry-image> DEPLOY_ROOT=/srv/app DEPLOY_SSH=deploy@host \
+  dcd deploy prod --image app=<tag>
 ```
+
+Run it from the **checkout**, not from `$DEPLOY_ROOT`: under v2 dcd runs on the
+deploying machine and reaches the target over ssh, so `dcd.yaml` and the compose
+files are read here and `DEPLOY_ROOT` names a path over there.
 
 `REGISTRY` and `DEPLOY_ROOT` are read from the environment (CI sets them per job), so they aren't
 repeated in `dcd.yaml`. `--image app=<tag>` threads in the tag the build stage produced.

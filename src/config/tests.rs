@@ -534,3 +534,32 @@ stages: { prod: {} }
         .to_string();
     assert!(error.contains("cutover.backend_port is unset"), "{error}");
 }
+
+/// `check` claims "every referenced service exists", and it now means it. These
+/// three classes used to pass validation and fail at the step that ran them — for
+/// an `after_cutover` hook, past the point of no return, as exit 4.
+#[test]
+fn every_service_reference_is_validated_not_just_the_cutover_path() {
+    let base = sample();
+
+    let bad_wait = base.replace(
+        "    wait: { cmd: 'pg_isready', retries: 30, interval: 1s }",
+        "    wait: { exec_in: no-such-service, cmd: 'pg_isready' }",
+    );
+    let c = load(&bad_wait, Some("prod"), &[], &env()).unwrap();
+    let err = validate_with_model(&c, &model_json(true, true)).unwrap_err().to_string();
+    assert!(err.contains("services.postgres.wait.exec_in 'no-such-service'"), "got: {err}");
+
+    let bad_hook = format!("{base}\nhooks:\n  after_cutover:\n    - exec_in: {{ service: ghost, cmd: 'true' }}\n");
+    let c = load(&bad_hook, Some("prod"), &[], &env()).unwrap();
+    let err = validate_with_model(&c, &model_json(true, true)).unwrap_err().to_string();
+    assert!(err.contains("hooks.after_cutover.exec_in 'ghost'"), "got: {err}");
+
+    let bad_keep = base.replace(
+        "retention: { keep_releases: 3 }",
+        "retention: { keep_releases: 3, keep_images: { ghost-image: 2 } }",
+    );
+    let c = load(&bad_keep, Some("prod"), &[], &env()).unwrap();
+    let err = validate_with_model(&c, &model_json(true, true)).unwrap_err().to_string();
+    assert!(err.contains("retention.keep_images 'ghost-image'"), "got: {err}");
+}

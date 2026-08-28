@@ -57,7 +57,22 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Compose {
+    /// As the operator wrote them, and as `-f` addresses them ON THE TARGET —
+    /// resolved against `deploy_root`, where every command runs.
     pub files: Vec<PathBuf>,
+    /// Where each of `files` is READ FROM on the deploying machine: the same entry
+    /// resolved against the config file's directory. Filled at load, never authored
+    /// — `-c /elsewhere/dcd.yaml` and a `deploy_root` that is not dcd's cwd both
+    /// need the two to differ.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sources: Vec<PathBuf>,
+    /// Where the generated `release.run` document was written (the system temp
+    /// dir, never the checkout). It is the last entry of `files`, and this is the
+    /// path that entry is READ from.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub generated_source: Option<PathBuf>,
     #[serde(default, deserialize_with = "de_lenient_map")]
     pub env: IndexMap<String, String>,
     /// Enabled when RESOLVING the model, never passed to `up` — a service carrying
@@ -597,6 +612,8 @@ const REMOVED_KEYS: &[(&[&str], &str)] = &[
     (&["workers", "template"], "worker containers are declared as ONE compose service; set `workers.service:`"),
     (&["workers", "compose_file"], "dcd no longer renders a workers compose file"),
     (&["workers", "name_filter"], "renamed to `workers.name_prefix` (naming only — discovery is by service label)"),
+    (&["workers", "provider", "exclude"], "moved up one level to `workers.exclude`"),
+    (&["workers", "template", "stop_signal"], "moved up one level to `workers.stop_signal`"),
 ];
 
 /// A removed key counts whether it sits in the base document or in any stage.
@@ -698,15 +715,37 @@ pub fn validate_with_model(config: &Config, model: &crate::compose::ComposeModel
 
     validate_health_gates(config, model)?;
 
-    let mut targets = vec![(&config.cutover.reload.exec_in, "cutover.reload")];
+    // EVERY service reference, not just the three on the cutover path. A typo in a
+    // hook's `exec_in` used to surface at the step that runs it — for an
+    // `after_cutover` hook that is past the point of no return, exit 4.
+    let mut targets = vec![(config.cutover.reload.exec_in.clone(), "cutover.reload".to_string())];
     if let Some(validate) = &config.cutover.validate {
-        targets.push((&validate.exec_in, "cutover.validate"));
+        targets.push((validate.exec_in.clone(), "cutover.validate".to_string()));
     }
     if let Some(probe) = &config.release.healthcheck {
-        targets.push((&probe.exec_in, "release.healthcheck"));
+        targets.push((probe.exec_in.clone(), "release.healthcheck".to_string()));
+    }
+    for (name, policy) in &config.services {
+        if let Some(wait) = &policy.wait {
+            let probe = wait.exec_in.clone().unwrap_or_else(|| name.clone());
+            targets.push((probe, format!("services.{name}.wait.exec_in")));
+        }
+    }
+    for (slot, actions) in &config.hooks {
+        for action in actions {
+            if let HookAction::ExecIn { exec_in } = action {
+                targets.push((exec_in.service.clone(), format!("hooks.{slot}.exec_in")));
+            }
+        }
     }
     for (service, owner) in targets {
-        model.require_service(service, owner)?;
+        model.require_service(&service, &owner)?;
+    }
+
+    // `keep_images` keys name compose services too, and a typo silently retains
+    // nothing rather than the count the operator asked for.
+    for name in config.retention.keep_images.keys() {
+        model.require_service(name, "retention.keep_images")?;
     }
     Ok(())
 }
