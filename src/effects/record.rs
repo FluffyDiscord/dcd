@@ -6,12 +6,23 @@ use super::{enforce_check, Access, Argv, Clock, CmdOutput, CommandRunner, FileSy
 
 type EnvOverlay = Option<std::collections::BTreeMap<String, String>>;
 
+/// One recorded command: everything the runner was actually given. `stdin` is part
+/// of it because over ssh that is the ONLY carrier env values travel on (INV-12) —
+/// discarding it left no unit test able to observe what dcd really sent.
+struct RecordedCall {
+    argv: Argv,
+    access: Access,
+    env: EnvOverlay,
+    stdin: Option<Vec<u8>>,
+}
+
 /// Records every command and returns canned outputs keyed by an argv substring.
 /// Unit tests assert the recorded argv sequence with no Docker.
 #[derive(Default)]
 pub struct RecordingRunner {
-    calls: RefCell<Vec<(Argv, Access, EnvOverlay)>>,
+    calls: RefCell<Vec<RecordedCall>>,
     responses: Vec<(String, CmdOutput)>,
+    unmatched: RefCell<Vec<String>>,
 }
 
 impl RecordingRunner {
@@ -37,34 +48,73 @@ impl RecordingRunner {
     }
 
     pub fn calls(&self) -> Vec<Argv> {
-        self.calls.borrow().iter().map(|(a, _, _)| a.clone()).collect()
+        self.calls.borrow().iter().map(|call| call.argv.clone()).collect()
     }
 
     pub fn display_calls(&self) -> Vec<String> {
-        self.calls.borrow().iter().map(|(a, _, _)| a.display()).collect()
+        self.calls.borrow().iter().map(|call| call.argv.display()).collect()
     }
 
     pub fn env_overlay_of(&self, needle: &str) -> EnvOverlay {
         self.calls
             .borrow()
             .iter()
-            .find(|(argv, _, _)| argv.display().contains(needle))
-            .and_then(|(_, _, env)| env.clone())
+            .find(|call| call.argv.display().contains(needle))
+            .and_then(|call| call.env.clone())
+    }
+
+    /// What was piped to the command — over ssh, the document carrying every env
+    /// value.
+    pub fn stdin_of(&self, needle: &str) -> Option<Vec<u8>> {
+        self.calls
+            .borrow()
+            .iter()
+            .find(|call| call.argv.display().contains(needle))
+            .and_then(|call| call.stdin.clone())
+    }
+
+    pub fn access_of(&self, needle: &str) -> Option<Access> {
+        self.calls
+            .borrow()
+            .iter()
+            .find(|call| call.argv.display().contains(needle))
+            .map(|call| call.access)
+    }
+
+    /// Commands the double answered with a default `exit 0, stdout ""` because no
+    /// canned response matched. Engine code that parses stdout then takes its
+    /// "nothing to do" branch and the test passes because the double said nothing —
+    /// so a needle that stops matching after an argv change degrades to green.
+    /// Assert this is empty in any test whose subject reads a command's output.
+    pub fn unmatched(&self) -> Vec<String> {
+        self.unmatched.borrow().clone()
     }
 
     fn lookup(&self, argv: &Argv) -> CmdOutput {
         let shown = argv.display();
-        self.responses
+        let matched = self
+            .responses
             .iter()
             .find(|(needle, _)| shown.contains(needle.as_str()))
-            .map(|(_, out)| out.clone())
-            .unwrap_or_else(CmdOutput::ok)
+            .map(|(_, out)| out.clone());
+        match matched {
+            Some(out) => out,
+            None => {
+                self.unmatched.borrow_mut().push(shown);
+                CmdOutput::ok()
+            }
+        }
     }
 }
 
 impl CommandRunner for RecordingRunner {
     fn run(&self, argv: &Argv, access: Access, opts: &RunOpts) -> Result<CmdOutput, RunError> {
-        self.calls.borrow_mut().push((argv.clone(), access, opts.env.clone()));
+        self.calls.borrow_mut().push(RecordedCall {
+            argv: argv.clone(),
+            access,
+            env: opts.env.clone(),
+            stdin: opts.stdin.clone(),
+        });
         enforce_check(argv, self.lookup(argv), opts)
     }
 }
@@ -105,6 +155,7 @@ impl<R: CommandRunner> CommandRunner for DryRunRunner<R> {
 #[derive(Default)]
 pub struct MemoryFs {
     files: RefCell<HashMap<PathBuf, Vec<u8>>>,
+    modes: RefCell<HashMap<PathBuf, Option<u32>>>,
     dirs: RefCell<HashSet<PathBuf>>,
 }
 
@@ -112,11 +163,18 @@ impl MemoryFs {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// The mode a write asked for. Dropping it left `dcd-state.json`'s `0600` — the
+    /// one permission dcd sets deliberately — with no regression coverage at all.
+    pub fn mode_of(&self, path: &Path) -> Option<u32> {
+        self.modes.borrow().get(path).copied().flatten()
+    }
 }
 
 impl FileSystem for MemoryFs {
-    fn write(&self, path: &Path, bytes: &[u8], _mode: Option<u32>) -> std::io::Result<()> {
+    fn write(&self, path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
         self.files.borrow_mut().insert(path.to_path_buf(), bytes.to_vec());
+        self.modes.borrow_mut().insert(path.to_path_buf(), mode);
         Ok(())
     }
 
