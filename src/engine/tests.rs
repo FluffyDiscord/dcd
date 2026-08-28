@@ -104,14 +104,14 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
 
     assert!(has("docker pull reg:app-1"));
     assert!(has("docker pull reg:db-1"));
-    assert!(has("docker inspect demo-postgres --format {{.Config.Image}}"));
+    assert!(has("docker inspect demo-postgres --format '{{.Config.Image}}'"));
     assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml up -d --no-recreate --wait --wait-timeout 120 postgres"));
     assert!(has("docker exec demo-postgres sh -c pg_isready"));
     assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run --rm -T --no-deps --entrypoint migrate app before"));
     assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run -d --name demo-app-1000 --use-aliases --no-deps app"));
     assert!(has("docker update --restart unless-stopped demo-app-1000"));
-    assert!(has("docker exec demo-nginx sh -c curl -sf http://demo-app-1000:2114/health"));
-    assert!(has("docker exec demo-nginx sh -c nginx -s reload"));
+    assert!(has("docker exec demo-nginx sh -c 'curl -sf http://demo-app-1000:2114/health'"));
+    assert!(has("docker exec demo-nginx sh -c 'nginx -s reload'"));
     assert!(has("docker exec demo-app-1000 migrate after"));
     // N containers from ONE compose service — no rendered workers file (spec §7.12)
     assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run -d --name worker-async --no-deps worker async"));
@@ -129,6 +129,9 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
     assert!(!fs.exists(std::path::Path::new("./compose.env")).unwrap());
     assert!(!fs.exists(std::path::Path::new("./workers.yml")).unwrap());
     assert!(fs.exists(std::path::Path::new("./dcd-state.json")).unwrap());
+    // The one permission dcd sets deliberately: state records what is deployed and
+    // to where, and is the file INV-3 recovery reads.
+    assert_eq!(fs.mode_of(std::path::Path::new("./dcd-state.json")), Some(0o600));
 }
 
 #[test]
@@ -607,7 +610,10 @@ fn gc_all_offers_only_host_tags_no_stage_records_and_names_each_survivors_rule()
     assert!(!plan.removals().iter().any(|tag| tag.contains("<none>")));
     // the host is only ever asked about repositories this config resolves to
     let queries: Vec<String> = runner.display_calls().into_iter().filter(|c| c.starts_with("docker images")).collect();
-    assert_eq!(queries, vec!["docker images reg.example.com/demo --format {{.Repository}}:{{.Tag}}".to_string()]);
+    assert_eq!(
+        queries,
+        vec!["docker images reg.example.com/demo --format '{{.Repository}}:{{.Tag}}'".to_string()]
+    );
 }
 
 #[test]
@@ -841,7 +847,9 @@ stages:
     // static workers, one container each from the SAME service
     assert!(calls.iter().any(|c| c == &format!("{compose} run -d --name worker-default --no-deps worker default")));
     assert!(calls.iter().any(|c| c == &format!("{compose} run -d --name worker-mail --no-deps worker mail")));
-    assert!(calls.iter().any(|c| c == "docker exec blogapp-web sh -c wget -qO- http://blogapp-app-1234:9000/up"));
+    assert!(calls
+        .iter()
+        .any(|c| c == "docker exec blogapp-web sh -c 'wget -qO- http://blogapp-app-1234:9000/up'"));
 }
 
 #[test]
@@ -1051,7 +1059,10 @@ fn lua_after_hook_runs_through_the_engine() {
     engine.deploy().unwrap();
 
     // the Lua after_healthcheck hook ran a ctx.in_release command through the engine
-    assert!(runner.display_calls().iter().any(|c| c == "docker exec demo-app-1000 sh -c php warmup demo"));
+    assert!(runner
+        .display_calls()
+        .iter()
+        .any(|c| c == "docker exec demo-app-1000 sh -c 'php warmup demo'"));
 }
 
 #[test]
@@ -1156,7 +1167,7 @@ fn the_first_v2_deploy_reaps_v1_workers_that_discovery_cannot_see() {
         .with_stdout("inspect demo-postgres", "reg:db-1")
         .with_stdout("list-transports", "async")
         .with_stdout(
-            r#"--format {{.Names}} {{.Label "com.docker.compose.service"}}"#,
+            r#"--format '{{.Names}} {{.Label "com.docker.compose.service"}}'"#,
             "worker-async worker-async
 worker-keep worker
 ",
@@ -1244,4 +1255,36 @@ fn an_image_pin_for_an_unknown_service_is_a_config_error() {
     let message = error.to_string();
     assert!(message.contains("--image 'ap' is not a service"), "{message}");
     assert!(message.contains("app"), "the error must list the known services: {message}");
+}
+
+/// §8.2: `docker compose config` inlines every resolved env value, so its stdout is
+/// the whole secret set. dcd's own model resolution bypasses the reporter, but a
+/// `compose:` hook or `ctx.compose` routes through `run_argv` — where `-v` would
+/// otherwise print all of it.
+#[test]
+fn a_compose_config_hook_never_traces_its_resolved_output() {
+    let source = cfg_src().replace(
+        "stages:\n  prod: {}",
+        "hooks:\n  after_pull:\n    - compose: ['config']\nstages:\n  prod: {}",
+    );
+    let cfg = config::load(&source, Some("prod"), &[], &HashMap::new()).unwrap();
+
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async")
+        .with_stdout(
+            "config",
+            r#"{"services":{"app":{"image":"reg:app-1","environment":{"DB_PASSWORD":"hunter2-SECRET"}}}}"#,
+        );
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture_verbose(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts(), model());
+    engine.deploy().unwrap();
+
+    let trace = reporter.lines().join("\n");
+    assert!(!trace.contains("hunter2-SECRET"), "the resolved model reached the trace: {trace}");
+    assert!(trace.contains("output suppressed"), "the suppression must be visible: {trace}");
 }
