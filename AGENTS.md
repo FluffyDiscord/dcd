@@ -44,24 +44,31 @@ does the app image contain a probe binary, or must the health check run from the
 ## 2. The schema, at a glance
 
 ```yaml
-version: 2                 # required — v1 configs are rejected with a migration hint
+version: 2                 # defaults to 2; write it anyway. A v1 config is rejected by its
+                           # removed KEYS, with a migration hint naming each one
 project: myapp             # optional — defaults to the deploy_root folder name
 
 ssh: deploy@prod.example   # a target, or an ~/.ssh/config Host alias. OMIT to run against a
                            # local Docker socket. Override per run with --ssh
 deploy_root: /srv/myapp    # absolute path ON THE TARGET — default: $DEPLOY_ROOT, else "."
 host: prod.example         # optional guard: refuse to run unless the TARGET reports this name
+registry: registry.example # optional, and used ONLY by `dcd gc --all` as the ownership proof
+                           # for repositories it may prune. Images come from compose
 
 compose:
   files: [docker-compose.prod.yml]   # required; a stage APPENDS more. Uploaded every deploy
   profiles: [dcd-release]            # enabled when RESOLVING the model — default: [dcd-release]
-  env: {}                            # optional override; the whole dotenv chain is passed anyway
+  env: {}                            # optional override; the whole dotenv chain is passed anyway.
+                                     # dcd sets COMPOSE_PROJECT_NAME here from `project:` unless
+                                     # you set it yourself, so compose never infers it
 
 directories:               # optional — created on the TARGET; relative, no ".."
   - { path: .docker/logs, owner: '1000:1000' }
 
 release:
-  service: app             # THE compose service to deploy (or `run:` — see §6)
+  service: app             # THE compose service to deploy. Mutually exclusive with `run:`,
+                           # the fallback for a project with no compose service (§6, and the
+                           # full field list in docs/examples/all_in_one/dcd.yaml)
   container_prefix: myapp-app        # optional — default {project}-{service}
   healthcheck:             # OPTIONAL if the compose service declares its own `healthcheck:`
     exec_in: nginx         #   a compose SERVICE name
@@ -199,7 +206,10 @@ token is expanded everywhere afterwards, so `{project}-foo` namespaces per stage
 
 - **The compose file is half the config.** If a container option is missing, it belongs in
   compose, not here. There is no `image:`, `volumes:`, `restart:` or `network_alias:` in
-  `dcd.yaml` any more.
+  `dcd.yaml` any more — with one exception, `release.run:`, the fallback for a project
+  with no compose service for its app. It keeps all four, because there is no compose
+  service to carry them; dcd renders it into a one-service compose document so the deploy
+  still travels the same path.
 - **Give the release and worker services `profiles: ["dcd-release"]`.** Not required, but
   without it a hand-run `docker compose up` starts a second app container beside the one
   dcd is deploying. dcd's own compose calls are always service-qualified, so it never does.
@@ -211,7 +221,9 @@ token is expanded everywhere afterwards, so `{project}-foo` namespaces per stage
 - **dcd uploads compose *documents*, not what they reference.** A relative bind-mount
   source, an `env_file:`, or a `build.context` must already exist on the target. Docker
   silently creates an empty directory for a missing bind source, so a router whose config
-  never arrived starts cleanly and serves nothing. `check` warns, naming each path.
+  never arrived starts cleanly and serves nothing. `check` warns for **bind-mount sources**
+  (excluding paths dcd itself writes or pre-creates via `directories:`); `env_file:` and
+  `build.context` are on you — the resolved model dcd reads does not carry them.
 - **The router must bind-mount the upstream file.** dcd writes
   `{deploy_root}/{cutover.upstream_file}` on the target; only the compose file can put it
   inside the router container.
@@ -266,12 +278,12 @@ token is expanded everywhere afterwards, so `{project}-foo` namespaces per stage
 | `retention.keep_images cannot set 'X': it is release.service` | per-service count on the release | remove it; tune `keep_releases` |
 | `retention.keep_releases must be at least 1` | `keep_releases: 0` | use 1 or more; 0 leaves no local rollback target |
 | `cannot resolve the compose model: …` | a compose file is missing, or its `${VAR}`s are unset | run from the checkout with the same env CI uses |
-| `deploy_root <path> does not exist on <target>` | first deploy to a fresh host | create it, or let `sync` create it — never reported as a held lock |
+| `deploy_root <path> is not usable: …` | the path cannot be created on the target | check the path and the deploy user's permissions — never reported as a held lock |
 | `another deploy holds <stage>` | a live deploy is heartbeating the lock | wait; the lock releases itself if that deploy dies |
-| `flock is required on <target>` | minimal target image | install `util-linux` |
+| `cannot reach <target> to take the <stage> lock` | ssh itself failed (auth, DNS, dropped link) — exit 6, not a held lock | fix the connection |
 | `not sweeping 'X'` / `no repository of P can be shown` (from `dcd gc --all`) | the repository is a Docker Hub name, not a registry host | expected for public images; set `registry:` to one you own |
-| `unknown field 'X'` | typo | fix the key |
-| `unresolved … ${VAR}` | var in no chain file and not exported | add it to a chain layer, export it, or write `${VAR:-default}` |
+| ``unknown field `X` `` | typo | fix the key |
+| `${VAR} is not set` | var in no chain file and not exported | add it to a chain layer, export it, or write `${VAR:-default}` |
 | `X in <file> is reserved (configures dcd's own tooling)` | `DOCKER_*`/`COMPOSE_*`/`PATH`/proxy var in a chain file | remove it |
 | `Too many levels of variable indirection in env vars: …` | circular `${VAR}` references | break the cycle |
 | a dotenv parse error with a `^` caret | syntax error in a chain file | fix the named file:line |

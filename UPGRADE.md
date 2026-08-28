@@ -49,9 +49,11 @@ Before the first v2 deploy
   container.
 - **Check what your compose file references by relative path.** dcd uploads the compose
   documents and nothing they point at — bind-mount sources, `env_file:` targets and build
-  contexts must already exist on the target. `dcd check` warns, naming each one.
+  contexts must already exist on the target. `dcd check` warns for bind-mount sources;
+  `env_file:` and build contexts it cannot see, so check those yourself.
 - The deploying machine needs `docker` with the compose plugin (the model is resolved
-  locally) and `ssh`; the target needs `docker`, `sshd`, a POSIX shell and `flock`.
+  locally) and `ssh`; the target needs `docker`, `sshd`, a POSIX shell, `flock` and
+  `base64` (busybox provides the last two). `preflight` names either if it is missing.
 
 v1 workers are reaped once, automatically
 -----------------------------------------

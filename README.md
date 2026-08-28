@@ -42,8 +42,8 @@ dcd deploy prod                                   # do it
 | `dcd --version` | the built version (`-V`) |
 
 Global flags: `--config <path>` · `--ssh <target>` · `--env-dir <path>` · `--env-file <path>` ·
-`--env-stdin` · `--json` · `--image <service>=<ref>` (repeatable) · `--set path=value`
-(repeatable) · `--yes` · `--reason <text>` · `-v/--verbose` · `-V/--version`.
+`--env-stdin` · `--json` · `--dry-run` · `--resume` · `--image <service>=<ref>` (repeatable) ·
+`--set path=value` (repeatable) · `--yes` · `--reason <text>` · `-v/--verbose` · `-V/--version`.
 
 Env comes from a Symfony-style dotenv chain next to `dcd.yaml` (`.env` → `.env.local` →
 `.env.<stage>` → `.env.<stage>.local`, real env wins); every chain-defined key reaches the
@@ -201,8 +201,8 @@ git tag v0.5.3 && git push origin v0.5.3
 
 ```bash
 cargo test                                                  # unit + integration, no Docker
-DCD_E2E=1 cargo test --test e2e -- --test-threads=1         # real-Docker integration
-DCD_E2E=1 cargo test --test e2e_ssh -- --test-threads=1     # a full deploy over ssh
+cargo test --test e2e -- --test-threads=1 --include-ignored      # real-Docker integration
+cargo test --test e2e_ssh -- --test-threads=1 --include-ignored  # a full deploy over ssh
 cargo build --release --target x86_64-unknown-linux-musl    # static binary
 ```
 

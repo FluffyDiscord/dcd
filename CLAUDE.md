@@ -17,10 +17,21 @@ and validator). Field reference: `docs/examples/all_in_one/dcd.yaml`. A real, le
 cargo build
 cargo clippy --all-targets -- -D warnings        # must be clean
 cargo test                                        # unit + integration, ZERO Docker
-DCD_E2E=1 cargo test --test e2e -- --test-threads=1          # real Docker, needs a daemon
-DCD_E2E=1 cargo test --test ssh_shells -- --test-threads=1   # the transport, under 9 real login shells
-DCD_E2E=1 cargo test --test e2e_ssh -- --test-threads=1      # a full deploy over ssh into a real sshd
 ```
+
+The Docker suites are `#[ignore]`d, so a plain `cargo test` reports them **ignored**
+rather than passing — a gate that returns early reports green while asserting nothing.
+Opt in explicitly:
+
+```bash
+cargo test --test e2e         -- --test-threads=1 --include-ignored   # real Docker
+cargo test --test ssh_shells  -- --test-threads=1 --include-ignored   # 9 real login shells
+cargo test --test e2e_ssh     -- --test-threads=1 --include-ignored   # a deploy over a real sshd
+```
+
+`e2e_ssh` bind-mounts `/var/run/docker.sock` into the fixture, so it needs a
+socket-reachable daemon and fails loudly against a TCP-only `DOCKER_HOST` (a dind
+CI service). CI runs the first two; `e2e_ssh` is developer-machine-only.
 
 ## Where things live
 
@@ -49,11 +60,14 @@ Also touch `docs/examples/roadrunner_app/`, `docs/examples/fpm_app/`, `UPGRADE.m
 (`check` resolves the compose model, so each example ships a compose file):
 
 ```bash
-(cd docs/examples/all_in_one && dcd check prod)                        # no env needed
+(cd docs/examples/all_in_one && dcd check prod && dcd check beta)      # no env needed
 (cd docs/examples/roadrunner_app && DEPLOY_SSH=x DEPLOY_ROOT=/srv/a dcd check prod)
 (cd docs/examples/fpm_app && DEPLOY_SSH=x DEPLOY_ROOT=/srv/a REGISTRY=r APP_TAG=v1 \
-   ROUTER_TAG=r1 ROUTER_PORT=8080 COMPOSE_PROJECT_NAME=fpm dcd check prod)
+   ROUTER_TAG=r1 ROUTER_PORT=8080 dcd check prod)
 ```
+
+**Both** stages of `all_in_one`, not just `prod` — half a field reference that only
+resolves for one stage is half a field reference.
 
 ## Conventions
 
@@ -62,4 +76,8 @@ Also touch `docs/examples/roadrunner_app/`, `docs/examples/fpm_app/`, `UPGRADE.m
   from the Symfony-style dotenv chain (`src/dotenv/`, spec §5.2) and reach containers as bare `-e KEY`, with the
   values riding a document on ssh **stdin**; dcd writes no env file. Never print `docker compose config` stdout —
   it inlines resolved env values. Schema changes here also touch UPGRADE.md.
+  The one place a value could have escaped was the dotenv **parse error**, which quotes raw
+  bytes around the cursor — an apostrophe in one value printed the next variable's secret.
+  `mask_values` now masks every value byte in that window, a deliberate divergence from
+  Symfony's byte-exact snippet. Keep it that way: no path may print a value.
 - One app container per release — there is no replica/scale knob yet.
