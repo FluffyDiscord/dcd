@@ -33,8 +33,17 @@ impl Argv {
         Argv(parts.into_iter().map(Into::into).collect())
     }
 
+    /// Shell-quoted, so `--dry-run` plans and `-v` traces are unambiguous and can
+    /// be pasted into a shell. Joining raw made `docker exec web sh -c nginx -s
+    /// reload` read as six arguments when it is four — and the operator cannot tell
+    /// which. Words needing no quoting are left bare, so the common line is
+    /// unchanged.
     pub fn display(&self) -> String {
-        self.0.join(" ")
+        self.0
+            .iter()
+            .map(|part| crate::ssh::quote(part))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
