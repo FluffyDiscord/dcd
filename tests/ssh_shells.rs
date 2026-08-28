@@ -5,10 +5,10 @@
 //! tcsh do not share POSIX quoting rules — so the only honest way to know the
 //! transport survives them is to have a real sshd run it under each one.
 //!
-//! Gated on `DCD_E2E=1`, like the Docker suite: it builds one sshd image with a
+//! `#[ignore]`d, like the Docker suite: it builds one sshd image per test with a
 //! user per shell and drives `SshRunner` against each.
 //!
-//!   DCD_E2E=1 cargo test --test ssh_shells -- --test-threads=1
+//!   cargo test --test ssh_shells -- --test-threads=1 --include-ignored
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -17,11 +17,13 @@ use std::process::Command;
 use dcd::effects::{Access, Argv, CommandRunner, RunOpts, SshRunner};
 use dcd::ssh::SshTarget;
 
-const IMAGE: &str = "dcd-ssh-shells";
-/// Per-test, not shared. Three tests in one binary running against one container
-/// name, one port and one scratch directory tear each other's fixtures down —
-/// `Fixture::start` opens by removing that directory and `docker rm -f`ing that
-/// name, so whichever test starts second deletes the first's key mid-run.
+/// Per-test, not shared — image tag included. Three tests in one binary against one
+/// container name, one port, one scratch directory and one MUTABLE image tag tear
+/// each other's fixtures down: `Fixture::start` removes that directory, `docker rm
+/// -f`s that name, and rebuilds that tag with its own key, so whichever test starts
+/// second invalidates the first's credentials mid-run. Sharing the tag is what made
+/// `--test-threads=1` load-bearing rather than merely tidy.
+const IMAGE_PREFIX: &str = "dcd-ssh-shells";
 const BASE_PORT: u16 = 22322;
 
 /// Each user's login shell. `sh` here is busybox, which is what most container
@@ -63,19 +65,17 @@ fn hostile_payloads() -> Vec<&'static str> {
     ]
 }
 
-fn enabled() -> bool {
-    std::env::var("DCD_E2E").is_ok()
-}
-
 struct Fixture {
     dir: PathBuf,
     container: String,
+    image: String,
     port: u16,
 }
 
 impl Fixture {
     fn start(tag: &str, port_offset: u16) -> Fixture {
-        let container = format!("dcd-ssh-shells-{}-{tag}", std::process::id());
+        let container = format!("{IMAGE_PREFIX}-{}-{tag}", std::process::id());
+        let image = container.clone();
         let port = BASE_PORT + port_offset;
         let dir = std::env::temp_dir().join(&container);
         let _ = std::fs::remove_dir_all(&dir);
@@ -91,14 +91,14 @@ impl Fixture {
         std::fs::create_dir_all(&context).expect("build context");
         std::fs::copy(source.join("Dockerfile"), context.join("Dockerfile")).expect("stage the Dockerfile");
         std::fs::copy(dir.join("id.pub"), context.join("authorized_key")).expect("stage the key");
-        run("docker", &["build", "-q", "-t", IMAGE, context.to_str().unwrap()]);
+        run("docker", &["build", "-q", "-t", &image, context.to_str().unwrap()]);
 
         let _ = Command::new("docker").args(["rm", "-f", &container]).output();
         run(
             "docker",
-            &["run", "-d", "--name", &container, "-p", &format!("{port}:22"), IMAGE],
+            &["run", "-d", "--name", &container, "-p", &format!("{port}:22"), &image],
         );
-        Fixture { dir, container, port }
+        Fixture { dir, container, image, port }
     }
 
     /// dcd builds its own ssh argv, so the fixture key and host-key policy are
@@ -136,6 +136,8 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = Command::new("docker").args(["rm", "-f", &self.container]).output();
+        // The image is per-fixture now, so it is this fixture's to remove.
+        let _ = Command::new("docker").args(["image", "rm", "-f", &self.image]).output();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -152,10 +154,8 @@ fn run(program: &str, args: &[&str]) {
 /// Every payload must reach the command byte-identically, whatever login shell
 /// the deploy user happens to have.
 #[test]
+#[ignore = "builds and runs a real sshd container; run with `-- --include-ignored`"]
 fn every_login_shell_delivers_arguments_byte_identically() {
-    if !enabled() {
-        return;
-    }
     let fixture = Fixture::start("args", 0);
     fixture.wait_for_sshd();
 
@@ -173,10 +173,8 @@ fn every_login_shell_delivers_arguments_byte_identically() {
 /// INV-12 under every login shell: the value reaches the container's environment
 /// and never appears in an argv on either machine.
 #[test]
+#[ignore = "builds and runs a real sshd container; run with `-- --include-ignored`"]
 fn every_login_shell_delivers_env_values_without_argv_exposure() {
-    if !enabled() {
-        return;
-    }
     let fixture = Fixture::start("env", 1);
     fixture.wait_for_sshd();
 
@@ -186,12 +184,16 @@ fn every_login_shell_delivers_env_values_without_argv_exposure() {
 
     for (user, shell) in SHELLS {
         let target = fixture.target_for(user);
-        assert!(
-            !target.invocation().display().contains("hunter2"),
-            "{shell}: no value may reach the ssh argv"
-        );
-
         let runner = SshRunner::new(target, env.clone(), PathBuf::from("/"));
+
+        // Asserted against the argv the runner really spawns, WITH the env map in
+        // hand. `SshTarget::invocation()` never sees the env, so checking it for the
+        // value cannot fail — an implementation that switched to `-o SetEnv=` would
+        // put the secret in the process table and still pass that form.
+        let spawned = runner.spawn_argv().display();
+        assert!(!spawned.contains("hunter2"), "{shell}: no value may reach the ssh argv: {spawned}");
+        assert!(!spawned.contains("APP_SECRET"), "{shell}: not even the key name: {spawned}");
+
         let out = runner
             .run(
                 &Argv::of(["sh", "-c", "printf %s \"$APP_SECRET\""]),
@@ -206,10 +208,8 @@ fn every_login_shell_delivers_env_values_without_argv_exposure() {
 /// A failed `cd` must abort, not silently run the command in the login shell's
 /// home directory — that would deploy against the wrong tree.
 #[test]
+#[ignore = "builds and runs a real sshd container; run with `-- --include-ignored`"]
 fn a_missing_deploy_root_aborts_under_every_login_shell() {
-    if !enabled() {
-        return;
-    }
     let fixture = Fixture::start("root", 2);
     fixture.wait_for_sshd();
 

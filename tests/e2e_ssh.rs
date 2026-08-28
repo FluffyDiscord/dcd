@@ -6,7 +6,10 @@
 //! target's docker CLI talks to the host daemon through a mounted socket, so the
 //! containers a remote deploy creates are observable from this process.
 //!
-//!   DCD_E2E=1 cargo test --test e2e_ssh -- --test-threads=1
+//!   cargo test --test e2e_ssh -- --test-threads=1 --include-ignored
+//!
+//! Needs a socket-mountable daemon: the fixture bind-mounts `/var/run/docker.sock`,
+//! so a TCP-only `DOCKER_HOST` (a dind CI service) cannot run it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,7 +18,10 @@ use assert_cmd::cargo::CommandCargoExt;
 
 const IMAGE: &str = "dcd-ssh-deploy";
 const CONTAINER: &str = "dcd-ssh-deploy";
-const PORT: u16 = 22324;
+/// Deliberately clear of `ssh_shells`' block (22322 + one per shell test): the two
+/// suites can run concurrently — `cargo test` runs one binary per test target — and
+/// a shared port makes whichever starts second fail on bind.
+const PORT: u16 = 22400;
 const DEPLOY_ROOT: &str = "/srv/dcd";
 const SECRET: &str = "ssh-e2e-hunter2";
 
@@ -23,17 +29,15 @@ const SECRET: &str = "ssh-e2e-hunter2";
 /// TCP-only `DOCKER_HOST` (a dind CI service) cannot run it. Saying so out loud
 /// matters: a test that returns early reports GREEN, and this suite is the only
 /// proof the remote deploy path works at all.
-fn enabled() -> bool {
-    if std::env::var("DCD_E2E").is_err() {
-        return false;
-    }
-    if !Path::new("/var/run/docker.sock").exists() {
-        panic!(
-            "DCD_E2E=1 but /var/run/docker.sock is absent — this suite needs a socket-mountable \
-             daemon and cannot run against a TCP-only DOCKER_HOST. Unset DCD_E2E to skip it."
-        );
-    }
-    true
+/// The fixture drives the host daemon through a bind-mounted socket, so a
+/// TCP-only `DOCKER_HOST` (a dind CI service) cannot run it. Failing loudly beats
+/// returning early: this suite is the only proof the remote deploy path works, and
+/// a test that returns early reports GREEN.
+fn require_socket() {
+    assert!(
+        Path::new("/var/run/docker.sock").exists(),
+        "this suite needs a socket-mountable daemon and cannot run against a TCP-only DOCKER_HOST"
+    );
 }
 
 fn docker(args: &[&str]) -> std::process::Output {
@@ -179,6 +183,11 @@ services:
   nginx:
     recreate: never
     wait: {{ exec_in: nginx, cmd: 'wget -qO- -T 2 http://localhost/ >/dev/null 2>&1 || true', retries: 20, interval: 1s }}
+hooks:
+  # IT-010: snapshot the TARGET's process list from inside the deploy, while dcd's
+  # own commands are running there. Written by dcd, over the same transport.
+  after_healthcheck:
+    - 'ps -eo args > ps-snapshot.txt'
 stages: {{ prod: {{}} }}
 "#
             ),
@@ -316,10 +325,9 @@ impl Drop for Fixture {
 /// compose files travel, the release cuts over, the old one drains, and the
 /// secret that reached the container is nowhere under deploy_root.
 #[test]
+#[ignore = "drives real Docker over a real sshd; run with `-- --include-ignored`"]
 fn it_009_and_it_016_a_full_red_black_deploy_runs_over_ssh() {
-    if !enabled() {
-        return;
-    }
+    require_socket();
     let fx = Fixture::start();
 
     let first = fx.deploy();
@@ -362,4 +370,21 @@ fn it_009_and_it_016_a_full_red_black_deploy_runs_over_ssh() {
 
     let leak = fx.grep_on_target(SECRET, DEPLOY_ROOT);
     assert!(leak.is_empty(), "secret at rest on the target: {leak:?}");
+
+    // IT-010, INV-12's real proof: the value must not appear in the TARGET's process
+    // list either. The snapshot was taken by an `after_healthcheck` hook, i.e. while
+    // dcd's own commands were running there — the moment a `-e KEY=VALUE` argv or an
+    // `ssh -o SetEnv=` would be visible to any user on the box.
+    let snapshot = fx.on_target(&format!("cat {DEPLOY_ROOT}/ps-snapshot.txt"));
+    assert!(
+        snapshot.contains("sshd") || snapshot.contains("ps -eo args"),
+        "the snapshot captured no process list at all: {snapshot}"
+    );
+    assert!(
+        !snapshot.contains(SECRET),
+        "a value reached the target's process list: {snapshot}"
+    );
+    // And the delivery still worked — otherwise "no secret in ps" is trivially true.
+    let printenv = docker(&["exec", &black[0], "printenv", "APP_SECRET"]);
+    assert_eq!(String::from_utf8_lossy(&printenv.stdout).trim(), SECRET);
 }
