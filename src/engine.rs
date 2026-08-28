@@ -126,6 +126,13 @@ fn names_a_registry_host(repository: &str) -> bool {
 /// The repository half of an image reference: everything before the tag, with any
 /// `@sha256:…` digest dropped. A `:` only separates a tag when nothing after it is a
 /// path separator — otherwise it is a registry port (`localhost:5000/app`).
+/// Whether this command's stdout is a resolved compose model — the one output
+/// that inlines every env value and so must never be traced verbatim.
+fn is_compose_config(argv: &Argv) -> bool {
+    let words = &argv.0;
+    words.iter().any(|word| word == "compose") && words.iter().any(|word| word == "config")
+}
+
 fn repository_of(reference: &str) -> String {
     let without_digest = reference.split('@').next().unwrap_or(reference);
     match without_digest.rfind(':') {
@@ -578,6 +585,13 @@ impl<'a> Engine<'a> {
             if let Err(err) = self.run_step(step) {
                 if !self.post_cutover {
                     self.cleanup_black();
+                    // A terminal Ctrl-C reaches the whole process group, so the
+                    // in-flight `docker` child dies first and its non-zero exit
+                    // arrives here as an ordinary step failure. Reporting that as a
+                    // rejected deploy (exit 1) hides a cancelled CI job.
+                    if self.interrupt.triggered() {
+                        return Err(DcdError::Interrupted);
+                    }
                 }
                 return Err(err);
             }
@@ -632,16 +646,20 @@ impl<'a> Engine<'a> {
         let document = self.render_image_override();
         self.fs_write(&override_path, document.as_bytes(), None, "image override")?;
 
-        if !self.opts.remote {
-            return Ok(Outcome::Done(Some("local: nothing to upload".to_string())));
-        }
-
+        // Placed in `deploy_root` in BOTH modes. Every command runs with
+        // `deploy_root` as its cwd, so a local deploy whose cwd is not `deploy_root`
+        // would otherwise hand `docker compose` a `-f` that resolves nowhere — the
+        // model having been resolved from the checkout, one directory over.
         let files = self.cfg.compose.files.clone();
+        let sources = self.cfg.compose.sources.clone();
         let mut uploaded = 0;
-        for file in &files {
-            let bytes = std::fs::read(file)
-                .map_err(|e| DcdError::Config(format!("cannot read {}: {e}", file.display())))?;
+        for (file, source) in files.iter().zip(sources.iter()) {
             let target = self.resolve(file);
+            if !self.opts.remote && source.canonicalize().ok() == target.canonicalize().ok() {
+                continue;
+            }
+            let bytes = std::fs::read(source)
+                .map_err(|e| DcdError::Config(format!("cannot read {}: {e}", source.display())))?;
             // `infra/docker-compose.yml` uploads to {deploy_root}/infra/…, and the
             // write is a redirect — it fails on a fresh target unless the parent
             // is there first.
@@ -653,7 +671,10 @@ impl<'a> Engine<'a> {
             self.fs_write(&target, &bytes, None, "compose file")?;
             uploaded += 1;
         }
-        Ok(Outcome::Done(Some(format!("{uploaded} compose file(s) uploaded"))))
+        if uploaded == 0 {
+            return Ok(Outcome::Done(Some("compose files already in place".to_string())));
+        }
+        Ok(Outcome::Done(Some(format!("{uploaded} compose file(s) placed"))))
     }
 
     /// Pins each service's image to the exact ref this release resolved, so
@@ -731,7 +752,15 @@ impl<'a> Engine<'a> {
     }
 
     fn ensure_upstream(&mut self) -> Result<Outcome> {
-        let current = self.stage().and_then(|s| s.current.clone());
+        // The SERVING release, not `current`: §4.3 defines serving as the
+        // `cutover_pending` release if one exists, else `current`. `rollback` is the
+        // documented recovery from an exit 4 — exactly the state where a pending
+        // release is the one taking traffic and `current` has already been drained.
+        // Reading `current` there declares a healthy live release dead and writes
+        // the fallback over its upstream.
+        let current = self
+            .stage()
+            .and_then(|s| s.serving().map(|release| release.container.clone()));
         // The same rule as the `exists` probe below, on the other input to the same
         // decision: a `docker ps` that could not RUN is not a container that is
         // gone. `read` does not check the exit code, so an empty stdout has to be
@@ -987,8 +1016,33 @@ impl<'a> Engine<'a> {
         };
         let stage = self.cfg.stage.clone();
         self.state.stage_mut(&stage).record_cutover(release);
+
+        // INV-3: the live black must be recoverable from disk. If this write fails
+        // the release is live but UNRECORDED, and every recovery path is then a
+        // dead end — `--resume`, `rollback` and `unlock` all key off the recorded
+        // pending release, and a plain `deploy` would reap the container serving
+        // traffic. The reload is reversible and the missing record is not, so the
+        // cutover is walked back rather than left half-done.
+        if let Err(write) = self.persist_state() {
+            self.reporter
+                .warn(&format!("could not record the cutover ({write}); reversing it"));
+            self.restore_upstream(&upstream, &previous);
+            let reverted = self.try_run(&reload, Access::Mutate);
+            let reload_ok = reverted.map(|out| out.success()).unwrap_or(false);
+            self.state.stage_mut(&stage).drop_cutover(&self.container);
+            if !reload_ok {
+                self.post_cutover = true;
+                return Err(DcdError::PostCutover(format!(
+                    "could not record the cutover ({write}) AND could not reload the router back onto \
+                     the previous release — {} is serving unrecorded; run `dcd unlock {stage}` to accept it",
+                    self.container
+                )));
+            }
+            return Err(DcdError::PreCutover(format!(
+                "could not record the cutover; reversed it and left the previous release serving: {write}"
+            )));
+        }
         self.post_cutover = true;
-        self.persist_state()?; // INV-3: the live black must be recoverable from disk
         Ok(Outcome::Done(Some("router reloaded".to_string())))
     }
 
@@ -1265,6 +1319,17 @@ impl<'a> Engine<'a> {
         }
         let argv = self.docker().exec_sh(&self.container, command);
         let out = self.try_run(&argv, Access::Mutate)?;
+        // A provider that failed is not a project with no workers. Left unchecked,
+        // a broken console command means "zero workers" — and since `drain:red` has
+        // already removed the previous generation, the deploy would exit 0 having
+        // silently left the stage with no background workers at all.
+        if !out.success() {
+            return Err(self.classify(format!(
+                "the worker provider `{command}` failed (exit {}): {}",
+                out.code,
+                out.stderr.trim()
+            )));
+        }
         Ok(out
             .stdout
             .lines()
@@ -1286,8 +1351,7 @@ impl<'a> Engine<'a> {
         let signal = workers.stop_signal.clone();
         let argv = self.docker().worker_ps_names(&worker_service);
         let names: Vec<String> = self
-            .read(&argv)?
-            .stdout
+            .list(&argv)?
             .lines()
             .map(str::trim)
             .filter(|n| !n.is_empty())
@@ -1349,12 +1413,10 @@ impl<'a> Engine<'a> {
         let prefix = format!("{}-", self.cfg.release.container_prefix(&self.cfg.project));
         let argv = self.docker().ps_names(&prefix, true);
         let listing = self.list(&argv)?;
-        let recorded = self.stage().map(|s| {
-            s.releases
-                .iter()
-                .map(|r| r.container.clone())
-                .collect::<HashSet<String>>()
-        });
+        let known: HashSet<String> = self
+            .stage()
+            .map(|s| s.releases.iter().map(|r| r.container.clone()).collect())
+            .unwrap_or_default();
         let found: Vec<String> = listing
             .lines()
             .map(str::trim)
@@ -1362,23 +1424,37 @@ impl<'a> Engine<'a> {
             .map(String::from)
             .collect();
 
-        // No stage row at all means the state file is missing, not that every
-        // container is an orphan — and this runs at step 2 of 13, five steps
-        // before a black exists. Reaping here would `docker rm -f` the container
-        // currently serving traffic.
-        let Some(known) = recorded else {
-            if !found.is_empty() {
-                return Err(DcdError::PreCutover(format!(
-                    "{} has no recorded releases but {} container(s) match {prefix}: {} —                      refusing to reap what may be serving traffic; check dcd-state.json",
-                    self.cfg.stage,
-                    found.len(),
-                    found.join(", ")
-                )));
-            }
-            return Ok(());
-        };
+        // NO RECORDED RELEASES is the dangerous case, and it is not the same as no
+        // stage row: the INV-11 pull ledger creates the row at step 4, so a guard
+        // that tested for a missing row could never fire on a real deploy. A state
+        // file that lost its releases — the exact aftermath of a failed INV-3 write,
+        // where the black is live and unrecorded — would otherwise have this step
+        // `docker rm -f` the container serving traffic, at step 2 of 13.
+        if known.is_empty() && !found.is_empty() {
+            return Err(DcdError::PreCutover(format!(
+                "{} records no releases but {} container(s) match {prefix}: {} — refusing to reap \
+                 what may be serving traffic; run `dcd unlock {}` or check dcd-state.json",
+                self.cfg.stage,
+                found.len(),
+                found.join(", "),
+                self.cfg.stage
+            )));
+        }
+
+        // Belt to that brace: whatever state says, never remove the container the
+        // router is currently pointed at.
+        let serving_backend = self
+            .fs
+            .read(&self.resolve(&self.cfg.cutover.upstream_file))
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
 
         for orphan in found.into_iter().filter(|name| !known.contains(name)) {
+            if serving_backend.contains(&orphan) {
+                self.reporter
+                    .warn(&format!("keeping {orphan}: unrecorded, but the router still points at it"));
+                continue;
+            }
             self.reporter
                 .warn(&format!("removing {orphan}, which no release in state accounts for"));
             let rm = self.docker().rm_f(&orphan);
@@ -1537,6 +1613,15 @@ impl<'a> Engine<'a> {
         let outcome = self.runner.run(argv, access, &RunOpts { check, env, stdin: None });
         let ms = started.elapsed().as_millis() as u64;
         match &outcome {
+            // `docker compose config` RESOLVES and inlines env values, so its stdout
+            // is the whole secret set. dcd's own model resolution bypasses the
+            // reporter entirely, but a hook (`compose: ['config']`) or `ctx.compose`
+            // routes through here — and `-v` would print every value (spec §8.2).
+            Ok(out) if is_compose_config(argv) => {
+                let services = out.stdout.matches("\"image\"").count();
+                let summary = format!("<compose model, {services} service(s) — output suppressed>");
+                self.reporter.command_output(out.code, ms, &summary, &out.stderr)
+            }
             Ok(out) => self.reporter.command_output(out.code, ms, &out.stdout, &out.stderr),
             Err(err) => self.reporter.command_error(ms, &err.to_string()),
         }
@@ -1658,8 +1743,19 @@ impl HookHost for Engine<'_> {
         self.fs_write(&resolved, content.as_bytes(), None, "plugin write").map_err(|e| e.to_string())
     }
 
+    /// `exists` is fallible on purpose — over ssh, "I could not ask" is not "it is
+    /// not there" — but the Lua signature is a bool, so a probe that could not run
+    /// is warned about rather than answered with a silent `false` the plugin would
+    /// branch on.
     fn file_exists(&self, path: &str) -> bool {
-        self.fs.exists(&self.resolve(Path::new(path))).unwrap_or(false)
+        match self.fs.exists(&self.resolve(Path::new(path))) {
+            Ok(present) => present,
+            Err(e) => {
+                self.reporter
+                    .warn(&format!("ctx.file_exists({path}) could not be answered, reporting false: {e}"));
+                false
+            }
+        }
     }
 
     fn env(&self, name: &str) -> Option<String> {
