@@ -1,0 +1,29 @@
+# The beta stage's extra `-f`, appended AFTER docker-compose.prod.yml (stage
+# `compose.files` append rather than replace). Compose merges by service name, so
+# this file only says what differs — it never repeats the base definition.
+#
+# It exists so `dcd check beta` validates too. Half a field reference that only
+# resolves for one stage is half a field reference.
+
+services:
+  # Beta runs the branch build and keeps its scheduler idle: the base file reads
+  # SCHEDULER_ENABLED from the environment, and beta simply never sets it to 1.
+  app:
+    image: registry.example.com/allinone:beta
+
+  worker:
+    image: registry.example.com/allinone:beta
+
+  # One shared host, so the published port must differ from prod's.
+  web:
+    container_name: allinone-beta-web
+
+  postgres:
+    container_name: allinone-beta-postgres
+
+  cache:
+    container_name: allinone-beta-cache
+
+networks:
+  default:
+    name: allinone_beta_default
