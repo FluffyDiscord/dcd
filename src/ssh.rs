@@ -191,6 +191,30 @@ pub const POSIX_SHELL: &str = "sh";
 /// quote is closed, escaped, and reopened. Total — there is no byte it cannot carry.
 /// Standard base64, so file bytes survive inside a shell script unchanged. The
 /// alphabet contains no shell metacharacter, which is the point.
+/// The inverse, for reading a file BACK off the target. Without it a read went
+/// through `String::from_utf8_lossy`, so any non-UTF-8 byte came home as U+FFFD —
+/// asymmetric with the write path, which is base64 precisely to avoid that.
+/// Whitespace is skipped: `base64(1)` wraps its output at 76 columns.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut accumulator: u32 = 0;
+    let mut bits = 0;
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for byte in text.bytes() {
+        if byte.is_ascii_whitespace() || byte == b'=' {
+            continue;
+        }
+        let value = ALPHABET.iter().position(|c| *c == byte)? as u32;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 pub fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -252,6 +276,7 @@ pub fn env_document(env: &std::collections::BTreeMap<String, String>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::SshRunner;
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -379,9 +404,42 @@ mod tests {
     fn a_written_file_is_staged_and_never_exposes_its_bytes_to_the_shell() {
         let script = write_file_script("/srv/app/dcd-state.json", b"{\"quote\":\"a'b $(id) `id`\"}", Some(0o600));
         assert!(!script.contains("$(id)"), "content must not reach the shell as text: {script}");
-        assert!(script.contains("chmod 600"), "mode must be applied before the rename: {script}");
         assert!(script.contains(".tmp."), "the write must be staged: {script}");
-        assert!(script.contains("mv "), "the write must be renamed into place: {script}");
+
+        // ORDER, not mere presence: the mode has to be applied to the staged file
+        // before the rename, or the real path exists at the umask default first.
+        // `contains` cannot prove that; the byte offsets can.
+        let chmod = script.find("chmod 600").expect("mode is applied");
+        let rename = script.find("mv ").expect("the write is renamed into place");
+        assert!(chmod < rename, "chmod must precede the rename: {script}");
+    }
+
+    /// The write path base64s bytes so the shell never sees them; the READ path used
+    /// to `cat` and capture as a lossy String, turning every non-UTF-8 byte into
+    /// U+FFFD. Round-tripping arbitrary bytes is what proves the two agree.
+    #[test]
+    fn arbitrary_bytes_survive_the_base64_round_trip() {
+        let payloads: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0x00],
+            vec![0xff, 0xfe, 0xfd],
+            (0u8..=255).collect(),
+            b"{\"quote\":\"a'b\"}".to_vec(),
+        ];
+        for payload in payloads {
+            let encoded = base64(&payload);
+            let decoded = base64_decode(&encoded).expect("valid base64 decodes");
+            assert_eq!(decoded, payload, "round trip failed for {payload:?}");
+
+            // `base64(1)` wraps at 76 columns, so the decoder must skip newlines.
+            let wrapped = encoded
+                .as_bytes()
+                .chunks(76)
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(base64_decode(&wrapped).expect("wrapped decodes"), payload);
+        }
     }
 
     /// INV-12 through a real shell: the value reaches the command's environment,
@@ -395,14 +453,39 @@ mod tests {
         let argv = Argv::of(["sh", "-c", "printf %s \"$APP_SECRET\""]);
         let script = target().script_for(&argv, None, &env);
 
+        // TC-104. `invocation()` is built from the target, the control path and the
+        // config file — the env map is not even in scope for it, so asserting the
+        // secret is absent from it cannot fail and proves nothing. What must be
+        // checked is that the value lives in the SCRIPT and nowhere in the argv the
+        // runner actually spawns: an implementation that switched to `-o SetEnv=`
+        // or `-e KEY=VALUE` would put it in the argv and still pass the old form.
+        let spawned = SshRunner::new(target(), env.clone(), PathBuf::from("/srv/app")).spawn_argv();
+        // A distinctive fragment, not the whole value: POSIX quoting rewrites the
+        // embedded `'` as `'\''`, so the raw bytes are deliberately not contiguous.
         assert!(
-            !target().invocation().display().contains(secret),
-            "no value may reach the ssh argv"
+            script.windows(7).any(|window| window == b"hunter2"),
+            "the value must travel in the script"
         );
-        for shell in candidate_shells() {
+        assert!(
+            !spawned.display().contains(secret),
+            "no value may reach the ssh argv, got: {}",
+            spawned.display()
+        );
+        assert!(
+            !spawned.display().contains("APP_SECRET"),
+            "not even the key name belongs in the argv: {}",
+            spawned.display()
+        );
+
+        let shells = candidate_shells();
+        assert!(!shells.is_empty(), "no shell to test against");
+        let mut delivered = 0;
+        for shell in &shells {
             let Some(got) = through(shell, &script) else { continue };
             assert_eq!(got, secret, "{shell} did not deliver the value intact");
+            delivered += 1;
         }
+        assert!(delivered > 0, "every candidate shell was skipped: {shells:?}");
     }
 
     /// `cd` failing must abort rather than silently running the command in the
@@ -443,8 +526,16 @@ mod tests {
         let argv = target().bare_argv(&Argv::of(["flock", "-n", "/srv/acme/.dcd.prod.lock", "sh", "/srv/acme/.dcd.prod.lease.sh"]));
         let rendered = argv.display();
         assert!(rendered.ends_with("-- flock -n /srv/acme/.dcd.prod.lock sh /srv/acme/.dcd.prod.lease.sh"));
-        assert!(!rendered.contains('\''), "a quote here would need a login-shell grammar: {rendered}");
         assert!(!rendered.contains("sh -c"));
+
+        // Scoped to what the TARGET's login shell parses. The local ssh options are
+        // this process's business and may well need quoting (`ControlPath=…%C`);
+        // what must be bare is everything after `--`.
+        let remote = rendered.split_once(" -- ").expect("the remote command follows --").1;
+        assert!(
+            !remote.contains('\''),
+            "a quote here would need a login-shell grammar: {remote}"
+        );
     }
 
     /// StrictHostKeyChecking is deliberately left at OpenSSH's default: defaulting
