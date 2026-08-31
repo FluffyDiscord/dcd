@@ -128,12 +128,24 @@ networks:
     }
 
     fn dcd(&self, args: &[&str]) -> std::process::Output {
-        Command::cargo_bin("dcd")
-            .unwrap()
-            .current_dir(&self.dir)
-            .args(args)
-            .output()
-            .unwrap()
+        self.dcd_command(args).output().unwrap()
+    }
+
+    fn dcd_command(&self, args: &[&str]) -> Command {
+        let mut command = Command::cargo_bin("dcd").unwrap();
+        command.current_dir(&self.dir).args(args);
+        command
+    }
+
+    /// A deploy this process keeps a handle on — the lock test has to kill the
+    /// holder while it is really holding the lock, not a flock the test took
+    /// on its behalf.
+    fn spawn_dcd(&self, args: &[&str]) -> std::process::Child {
+        self.dcd_command(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("dcd starts")
     }
 
     /// Appends a service to the compose file, ahead of the top-level `networks:`
@@ -355,6 +367,60 @@ fn it_008_unlock_accepts_a_stuck_release_clears_the_lock_and_leaves_the_stage_de
     let survivors = fx.running("app");
     assert_eq!(survivors.len(), 1, "next deploy must drain the leftovers, got {survivors:?}");
     assert!(!survivors.contains(&black), "the unlocked release is drained by the next deploy");
+}
+
+/// IT-005's other half, and the half a hand-held flock cannot show: two REAL
+/// deploys racing, and a holder that is killed rather than asked to let go. The
+/// flock belongs to the dead process's file descriptor, so the kernel reclaims it
+/// — no `unlock`, no stale-lock heuristic, exactly as the remote lease does (IT-011).
+#[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
+fn it_005b_a_real_deploy_holds_the_stage_and_a_killed_one_releases_it() {
+    let fx = Fixture::new("lockrace");
+    let meta = fx.dir.join(".dcd.it.lock.meta");
+
+    let mut holder = fx.spawn_dcd(&["deploy", "it"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !meta.exists() {
+        assert!(std::time::Instant::now() < deadline, "the deploy never took the lock");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let refused = fx.dcd(&["deploy", "it"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(3),
+        "a second deploy must be refused: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("another deploy holds it"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    holder.kill().expect("the holder can be killed");
+    let _ = holder.wait();
+
+    // The lock is free because the process died, not because anything cleaned up:
+    // asked of the kernel here, and of dcd by the deploy that follows.
+    use fs2::FileExt;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fx.dir.join(".dcd.it.lock"))
+        .expect("the lock file outlives its holder");
+    lock.try_lock_exclusive().expect("the killed holder's flock was not reclaimed");
+    fs2::FileExt::unlock(&lock).unwrap();
+    drop(lock);
+
+    let next = fx.deploy();
+    assert!(
+        next.status.success(),
+        "the stage is not deployable after the holder died: {}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    assert_eq!(fx.running("app").len(), 1);
 }
 
 #[test]
