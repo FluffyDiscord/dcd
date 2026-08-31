@@ -82,8 +82,8 @@ removing the general-graph machinery while preserving the PHP-Deployer feel.
 | Rust | Single static binary, no runtime, strong typing, exhaustive error handling | "enterprise grade", "handle errors gracefully", ship one file |
 | `mlua` (Lua 5.4, vendored) | Mature embedded-Lua binding, sandboxable, no system Lua dependency | "extensible like PHP Deployer", static binary |
 | `clap` (derive) | De-facto Rust CLI framework: help, errors, completions | "PERFECT DX" |
-| `serde` + `serde_yaml` (or `serde_yml`) | Typed config parse with precise error spans | typed config, good errors |
-| `signal-hook` + `fs2`/`rustix` flock | Caught signals + OS-released advisory lock, locally and (leased, over ssh) on the target | INV-4 (the lock cannot outlive its holder, in either mode) |
+| `serde` + `serde_norway` | Typed config parse with precise error spans; the maintained fork of `serde_yaml`, same API and same `Value`/`Mapping` (OQ-3) | typed config, good errors |
+| `signal-hook` + std's `File::try_lock` | Caught signals + OS-released advisory lock, locally and (leased, over ssh) on the target. The lock moved to std in Rust 1.89, retiring the `fs2` dependency | INV-4 (the lock cannot outlive its holder, in either mode) |
 | Shell out to `docker` | Parity with the current script; `docker compose` has no API | ADR-004 |
 | `musl` static target | Runs on any x86-64 Linux server without glibc concerns | ship one file, "on the server" |
 
