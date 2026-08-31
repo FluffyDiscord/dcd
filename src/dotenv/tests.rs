@@ -331,6 +331,10 @@ fn symfony_env_value_wins_over_file_definition_in_expansion() {
 /// escaped newlines, the caret COLUMN and the offset all match upstream
 /// byte-for-byte — only value characters read `*`. Key names survive, because
 /// naming the variable is the whole use of the message.
+///
+/// Every case here is upstream's, unchanged — including the two double-quote ones
+/// (`FOO="foo\nBAR="bar"`, `${FOO:-a"a}`) that pin `"` as always-a-delimiter. The
+/// apostrophe relaxation is deliberately narrow enough to leave them alone.
 #[test]
 fn symfony_format_errors() {
     let cases: Vec<(&str, String)> = vec![
@@ -340,7 +344,7 @@ fn symfony_format_errors() {
         ("FOO=\"foo", "Missing quote to end the value in \".env\" at line 1.\n...FOO=****...\n          ^ line 1 offset 8".to_string()),
         ("FOO='foo", "Missing quote to end the value in \".env\" at line 1.\n...FOO=****...\n          ^ line 1 offset 8".to_string()),
         ("FOO=\"foo\nBAR=\"bar\"", "Missing quote to end the value in \".env\" at line 1.\n...FOO=****\\nBAR=*****...\n                     ^ line 1 offset 18".to_string()),
-        ("FOO='foo\n", "Missing quote to end the value in \".env\" at line 1.\n...FOO=****\\n...\n            ^ line 1 offset 9".to_string()),
+        ("FOO='foo\n","Missing quote to end the value in \".env\" at line 1.\n...FOO=****\\n...\n            ^ line 1 offset 9".to_string()),
         ("export FOO", "Unable to unset an environment variable in \".env\" at line 1.\n...export FOO...\n            ^ line 1 offset 10".to_string()),
         ("FOO=${FOO", "Unclosed braces on variable expansion in \".env\" at line 1.\n...FOO=*****...\n           ^ line 1 offset 9".to_string()),
         ("FOO= BAR", "Whitespace are not supported before the value in \".env\" at line 1.\n...FOO=****...\n      ^ line 1 offset 4".to_string()),
@@ -358,15 +362,177 @@ fn symfony_format_errors() {
     }
 }
 
-/// The leak this masking exists to stop: a syntax error in ONE variable printed
-/// the NEXT variable's value, and an apostrophe in a password is enough to trigger
-/// it. `dcd check` is the CI lint job, so that landed in job logs.
+/// The one divergence from the ported suite, and the reason for it: a password may
+/// contain an apostrophe. Upstream, that apostrophe opens a run consuming every
+/// following line until the next one — so `PASS=pa'ss` either died at EOF (printing
+/// its neighbours through the error window) or silently absorbed their values. An
+/// apostrophe whose partner is not on the same line is a literal apostrophe here.
+/// Nothing else moves: `"` still delimits unconditionally, and every upstream case
+/// in `symfony_format_errors` / `symfony_quotes` still passes verbatim.
+#[test]
+fn a_partnerless_apostrophe_is_a_literal_apostrophe() {
+    assert_eq!(parse_ok("PASS=pa'ss"), pairs(&[("PASS", "pa'ss")]));
+    assert_eq!(parse_ok("PASS=it's-#1"), pairs(&[("PASS", "it's-#1")]));
+    assert_eq!(parse_ok("PASS=don't\nNEXT=x"), pairs(&[("PASS", "don't"), ("NEXT", "x")]));
+
+    // Concatenation, unchanged: the partner IS on the line.
+    assert_eq!(parse_ok("FOO=va'lue'"), pairs(&[("FOO", "value")]));
+    assert_eq!(parse_ok("PASS='pa'\"ss\""), pairs(&[("PASS", "pass")]));
+
+    // The variable that follows keeps its own value, and keeps it whole — the
+    // splice that used to fold a neighbouring secret into PASS.
+    assert_eq!(
+        parse_ok("BROKEN=va'lue\nSTRIPE_KEY=sk_live_51HxxSECRET\n"),
+        pairs(&[("BROKEN", "va'lue"), ("STRIPE_KEY", "sk_live_51HxxSECRET")])
+    );
+
+    // The silent splice, the worse half of the old behaviour: an apostrophe
+    // further down the file closed the run, folding every line between into PASS
+    // — no error, a corrupt value, and one variable carrying another's secret.
+    assert_eq!(
+        parse_ok("PASS=pa'ss\nSECRET=s3cr3t\nNOTE='ok'\n"),
+        pairs(&[("PASS", "pa'ss"), ("SECRET", "s3cr3t"), ("NOTE", "ok")])
+    );
+
+    // The double quote keeps upstream's behaviour, error included.
+    assert!(parse_err("PASS=pa\"ss").starts_with("Missing quote to end the value"));
+}
+
+/// Masking still carries the errors the parser cannot make go away. The window is
+/// 20 bytes either side of the cursor, so it reaches the NEXT line — asserted here,
+/// or the test would pass on a window that never saw the secret.
 #[test]
 fn a_parse_error_never_prints_a_neighbouring_value() {
-    let rendered = parse_err("BROKEN=va'lue\nSTRIPE_KEY=sk_live_51HxxSECRET\n");
+    let rendered = parse_err("BROKEN=va lue\nSTRIPE_KEY=sk_live_51HxxSECRET\n");
+    assert!(rendered.contains("A value containing spaces"), "{rendered}");
+    assert!(
+        rendered.contains("STRIPE_KEY="),
+        "the window must reach the next line, or masking is untested here: {rendered}"
+    );
     assert!(!rendered.contains("sk_live"), "a neighbouring secret leaked: {rendered}");
     assert!(!rendered.contains("SECRET"), "a neighbouring secret leaked: {rendered}");
-    assert!(rendered.contains("Missing quote to end the value"), "{rendered}");
+}
+
+// ---------- the vendored upstream suite, executed (TC-031) ----------
+
+/// Upstream's own providers, machine-extracted from the vendored
+/// `tests/fixtures/symfony/DotenvTest.php` by its sibling `extract_cases.php`.
+/// The tests above are a readable hand-port; this is the port's *oracle*, and it
+/// is the bar the parser has to clear: a case nobody transcribed cannot quietly
+/// go unrun, and refreshing the vendored copy re-poses every question at once.
+const UPSTREAM_CASES: &str = include_str!("../../tests/fixtures/symfony/dotenv_cases.json");
+
+/// The inputs where dcd answers differently ON PURPOSE, each one a completed
+/// `$(…)`: a deploy tool must not shell-execute env-file content (spec §5.2.1,
+/// ADR-012), so upstream's executed value — and its "Issue expanding a command"
+/// error — become a refusal. Listed by exact input, so a new upstream command
+/// case fails this test instead of being swallowed by a pattern.
+const REFUSED_BY_DESIGN: &[&str] = &[
+    "FOO=$(echo foo)",
+    "FOO=$((1+2))",
+    "FOO=FOO$((1+2))BAR",
+    "FOO=$(echo \"$(echo \"$(echo \"$(echo foo)\")\")\")",
+    "FOO=$(echo \"Quotes won't be a problem\")",
+    "FOO=bar\nBAR=$(echo \"FOO is $FOO\")",
+    "FOO=$((1dd2))",
+];
+
+fn upstream_cases(provider: &str) -> Vec<serde_json::Value> {
+    let document: serde_json::Value = serde_json::from_str(UPSTREAM_CASES).expect("vendored cases parse");
+    let cases = document[provider].as_array().expect("provider present").clone();
+    assert!(!cases.is_empty(), "{provider} is empty — the fixture never loaded");
+    cases
+}
+
+/// `getEnvData`: every parsed value, in upstream's order (PHP `assertSame`
+/// compares key order too). The provider's `putenv`/`$_ENV`/`$_SERVER` setup
+/// becomes dcd's one external source, the process env.
+#[test]
+fn upstream_value_provider_passes_verbatim() {
+    let process = env(&[("LOCAL", "local"), ("REMOTE", "remote"), ("SERVERVAR", "servervar")]);
+    let cases = upstream_cases("values");
+    let mut refused = 0;
+
+    for case in &cases {
+        let input = case["input"].as_str().expect("input is a string");
+        if REFUSED_BY_DESIGN.contains(&input) {
+            let message = parse_err(input);
+            assert!(
+                message.starts_with("command expansion is not supported"),
+                "{input:?} must be refused, got: {message}"
+            );
+            refused += 1;
+            continue;
+        }
+
+        let expected: Vec<(String, String)> = case["expected"]
+            .as_array()
+            .expect("expected is a list of pairs")
+            .iter()
+            .map(|pair| {
+                let key = pair[0].as_str().expect("key").to_string();
+                let value = pair[1].as_str().expect("value").to_string();
+                (key, value)
+            })
+            .collect();
+        assert_eq!(parse_with(input, &process), expected, "input: {input:?}");
+    }
+
+    assert_eq!(refused, 6, "the command-expansion cases must still be reached, not dropped upstream");
+    assert!(cases.len() > 80, "the vendored provider shrank unexpectedly: {} cases", cases.len());
+}
+
+/// `getEnvDataWithFormatErrors`: the same messages, with the value bytes masked.
+/// Asserted structurally rather than against a re-masked expectation — masking its
+/// own oracle would prove nothing. The reason and the caret line must match
+/// upstream byte-for-byte; the window may differ only where dcd wrote a `*`, which
+/// pins the 1:1 length that keeps the caret column honest.
+#[test]
+fn upstream_error_provider_passes_with_only_value_bytes_masked() {
+    let mut refused = 0;
+    for case in &upstream_cases("errors") {
+        let input = case["input"].as_str().expect("input is a string");
+        let expected = case["message"].as_str().expect("message is a string");
+        let actual = parse_err(input);
+
+        if REFUSED_BY_DESIGN.contains(&input) {
+            assert!(
+                actual.starts_with("command expansion is not supported"),
+                "{input:?} must be refused, got: {actual}"
+            );
+            refused += 1;
+            continue;
+        }
+
+        let expected_lines: Vec<&str> = expected.split('\n').collect();
+        let actual_lines: Vec<&str> = actual.split('\n').collect();
+        assert_eq!(actual_lines.len(), expected_lines.len(), "input: {input:?}\n{actual}");
+        assert_eq!(actual_lines[0], expected_lines[0], "reason/line differs for {input:?}");
+        assert_eq!(actual_lines[2], expected_lines[2], "caret line differs for {input:?}");
+
+        let upstream_window = expected_lines[1].as_bytes();
+        let masked_window = actual_lines[1].as_bytes();
+        assert_eq!(
+            masked_window.len(),
+            upstream_window.len(),
+            "the window must stay 1:1 with upstream's for {input:?}: {actual}"
+        );
+        for (index, byte) in masked_window.iter().enumerate() {
+            assert!(
+                *byte == upstream_window[index] || *byte == b'*',
+                "byte {index} of the window is neither upstream's nor a mask for {input:?}: {actual}"
+            );
+        }
+        // Masking everything would satisfy the rule above and tell the operator
+        // nothing; which bytes specifically are masked is pinned exactly by
+        // `symfony_format_errors`.
+        let masked_bytes = masked_window.iter().filter(|byte| **byte == b'*').count();
+        assert!(
+            masked_bytes < upstream_window.len(),
+            "the whole window was masked for {input:?}: {actual}"
+        );
+    }
+    assert_eq!(refused, 1, "upstream's command-expansion error case must still be reached");
 }
 
 #[test]

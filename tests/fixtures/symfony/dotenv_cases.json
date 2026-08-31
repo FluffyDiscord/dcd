@@ -1,0 +1,1077 @@
+{
+    "source": "symfony/dotenv 8.1 \u2014 Tests/DotenvTest.php, providers getEnvData + getEnvDataWithFormatErrors",
+    "generated_by": "tests/fixtures/symfony/extract_cases.php",
+    "values": [
+        {
+            "input": "FOO=foo\\\\bar",
+            "expected": [
+                [
+                    "FOO",
+                    "foo\\bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='foo\\\\bar'",
+            "expected": [
+                [
+                    "FOO",
+                    "foo\\\\bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"foo\\\\bar\"",
+            "expected": [
+                [
+                    "FOO",
+                    "foo\\bar"
+                ]
+            ]
+        },
+        {
+            "input": "BAR=bar\nFOO=foo\\\\$BAR",
+            "expected": [
+                [
+                    "BAR",
+                    "bar"
+                ],
+                [
+                    "FOO",
+                    "foo\\bar"
+                ]
+            ]
+        },
+        {
+            "input": "BAR=bar\nFOO='foo\\\\$BAR'",
+            "expected": [
+                [
+                    "BAR",
+                    "bar"
+                ],
+                [
+                    "FOO",
+                    "foo\\\\$BAR"
+                ]
+            ]
+        },
+        {
+            "input": "BAR=bar\nFOO=\"foo\\\\$BAR\"",
+            "expected": [
+                [
+                    "BAR",
+                    "bar"
+                ],
+                [
+                    "FOO",
+                    "foo\\bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=foo\\\\\\$BAR",
+            "expected": [
+                [
+                    "FOO",
+                    "foo\\$BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='foo\\\\\\$BAR'",
+            "expected": [
+                [
+                    "FOO",
+                    "foo\\\\\\$BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"foo\\\\\\$BAR\"",
+            "expected": [
+                [
+                    "FOO",
+                    "foo\\$BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=bar",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": " FOO=bar ",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\n\n\nBAR=bar",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=  ",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=bar",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "\n\nFOO=bar\r\n\n",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=bar\r\nBAR=foo",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ],
+                [
+                    "BAR",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=bar\rBAR=foo",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ],
+                [
+                    "BAR",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=bar\nBAR=foo",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ],
+                [
+                    "BAR",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"bar\"\n",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"bar'foo\"\n",
+            "expected": [
+                [
+                    "FOO",
+                    "bar'foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar'\n",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar\"foo'\n",
+            "expected": [
+                [
+                    "FOO",
+                    "bar\"foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"bar\\\"foo\"\n",
+            "expected": [
+                [
+                    "FOO",
+                    "bar\"foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"bar\\nfoo\"",
+            "expected": [
+                [
+                    "FOO",
+                    "bar\nfoo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"bar\\rfoo\"",
+            "expected": [
+                [
+                    "FOO",
+                    "bar\rfoo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar\\nfoo'",
+            "expected": [
+                [
+                    "FOO",
+                    "bar\\nfoo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar\\rfoo'",
+            "expected": [
+                [
+                    "FOO",
+                    "bar\\rfoo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar\nfoo'",
+            "expected": [
+                [
+                    "FOO",
+                    "bar\nfoo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\" FOO \"",
+            "expected": [
+                [
+                    "FOO",
+                    " FOO "
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"  \"",
+            "expected": [
+                [
+                    "FOO",
+                    "  "
+                ]
+            ]
+        },
+        {
+            "input": "PATH=\"c:\\\\\"",
+            "expected": [
+                [
+                    "PATH",
+                    "c:\\"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\"bar\nfoo\"",
+            "expected": [
+                [
+                    "FOO",
+                    "bar\nfoo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\\\"",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR\""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\\'BAZ",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR'BAZ"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\\\"BAR",
+            "expected": [
+                [
+                    "FOO",
+                    "\"BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar''foo'\n",
+            "expected": [
+                [
+                    "FOO",
+                    "barfoo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar '' baz'",
+            "expected": [
+                [
+                    "FOO",
+                    "bar  baz"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=bar\nBAR='baz'\"$FOO\"",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ],
+                [
+                    "BAR",
+                    "bazbar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar '\\'' baz'",
+            "expected": [
+                [
+                    "FOO",
+                    "bar ' baz"
+                ]
+            ]
+        },
+        {
+            "input": "#FOO=bar\nBAR=foo",
+            "expected": [
+                [
+                    "BAR",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "#FOO=bar # Comment\nBAR=foo",
+            "expected": [
+                [
+                    "BAR",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar foo' # Comment",
+            "expected": [
+                [
+                    "FOO",
+                    "bar foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO='bar#foo' # Comment",
+            "expected": [
+                [
+                    "FOO",
+                    "bar#foo"
+                ]
+            ]
+        },
+        {
+            "input": "# Comment\r\nFOO=bar\n# Comment\nBAR=foo",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ],
+                [
+                    "BAR",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=bar # Another comment\nBAR=foo",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ],
+                [
+                    "BAR",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\n\n# comment\nBAR=bar",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=NOT#COMMENT",
+            "expected": [
+                [
+                    "FOO",
+                    "NOT#COMMENT"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=  # Comment",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=0",
+            "expected": [
+                [
+                    "FOO",
+                    "0"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=false",
+            "expected": [
+                [
+                    "FOO",
+                    "false"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=null",
+            "expected": [
+                [
+                    "FOO",
+                    "null"
+                ]
+            ]
+        },
+        {
+            "input": "export FOO=bar",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "  export   FOO=bar",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=$FOO",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=\"$FOO\"",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR='$FOO'",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "$FOO"
+                ]
+            ]
+        },
+        {
+            "input": "FOO_BAR9=BAR\nBAR=$FOO_BAR9",
+            "expected": [
+                [
+                    "FOO_BAR9",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${FOO}Z",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BARZ"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=$FOO}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BAR}"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=\\$FOO",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "$FOO"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\" \\$ \"",
+            "expected": [
+                [
+                    "FOO",
+                    " $ "
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\" $ \"",
+            "expected": [
+                [
+                    "FOO",
+                    " $ "
+                ]
+            ]
+        },
+        {
+            "input": "BAR=$LOCAL",
+            "expected": [
+                [
+                    "BAR",
+                    "local"
+                ]
+            ]
+        },
+        {
+            "input": "BAR=$REMOTE",
+            "expected": [
+                [
+                    "BAR",
+                    "remote"
+                ]
+            ]
+        },
+        {
+            "input": "BAR=$SERVERVAR",
+            "expected": [
+                [
+                    "BAR",
+                    "servervar"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=$NOTDEFINED",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${FOO:-TEST}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${NOTDEFINED:-TEST}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "TEST"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=${FOO:-TEST}",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    "TEST"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=$FOO:-TEST}",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    "TEST}"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${FOO:=TEST}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${NOTDEFINED:=TEST}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "NOTDEFINED",
+                    "TEST"
+                ],
+                [
+                    "BAR",
+                    "TEST"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=${FOO:=TEST}",
+            "expected": [
+                [
+                    "FOO",
+                    "TEST"
+                ],
+                [
+                    "BAR",
+                    "TEST"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=$FOO:=TEST}",
+            "expected": [
+                [
+                    "FOO",
+                    "TEST"
+                ],
+                [
+                    "BAR",
+                    "TEST}"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${FOO:-}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${NOTDEFINED:-}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    ""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=${FOO:-}",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    ""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=$FOO:-}",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    "}"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${FOO:=}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "BAR",
+                    "BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=BAR\nBAR=${NOTDEFINED:=}",
+            "expected": [
+                [
+                    "FOO",
+                    "BAR"
+                ],
+                [
+                    "NOTDEFINED",
+                    ""
+                ],
+                [
+                    "BAR",
+                    ""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=${FOO:=}",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    ""
+                ]
+            ]
+        },
+        {
+            "input": "FOO=\nBAR=$FOO:=}",
+            "expected": [
+                [
+                    "FOO",
+                    ""
+                ],
+                [
+                    "BAR",
+                    "}"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=foo\nFOOBAR=${FOO}${BAR}",
+            "expected": [
+                [
+                    "FOO",
+                    "foo"
+                ],
+                [
+                    "FOOBAR",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "_FOO=BAR",
+            "expected": [
+                [
+                    "_FOO",
+                    "BAR"
+                ]
+            ]
+        },
+        {
+            "input": "_FOO_BAR=FOOBAR",
+            "expected": [
+                [
+                    "_FOO_BAR",
+                    "FOOBAR"
+                ]
+            ]
+        },
+        {
+            "input": "__FOO_BAR=FOOBAR",
+            "expected": [
+                [
+                    "__FOO_BAR",
+                    "FOOBAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=$(echo foo)",
+            "expected": [
+                [
+                    "FOO",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=$((1+2))",
+            "expected": [
+                [
+                    "FOO",
+                    "3"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=FOO$((1+2))BAR",
+            "expected": [
+                [
+                    "FOO",
+                    "FOO3BAR"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=$(echo \"$(echo \"$(echo \"$(echo foo)\")\")\")",
+            "expected": [
+                [
+                    "FOO",
+                    "foo"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=$(echo \"Quotes won't be a problem\")",
+            "expected": [
+                [
+                    "FOO",
+                    "Quotes won't be a problem"
+                ]
+            ]
+        },
+        {
+            "input": "FOO=bar\nBAR=$(echo \"FOO is $FOO\")",
+            "expected": [
+                [
+                    "FOO",
+                    "bar"
+                ],
+                [
+                    "BAR",
+                    "FOO is bar"
+                ]
+            ]
+        }
+    ],
+    "errors": [
+        {
+            "input": "FOO=BAR BAZ",
+            "message": "A value containing spaces must be surrounded by quotes in \".env\" at line 1.\n...FOO=BAR BAZ...\n             ^ line 1 offset 11"
+        },
+        {
+            "input": "FOO BAR=BAR",
+            "message": "Whitespace characters are not supported after the variable name in \".env\" at line 1.\n...FOO BAR=BAR...\n     ^ line 1 offset 3"
+        },
+        {
+            "input": "FOO",
+            "message": "Missing = in the environment variable declaration in \".env\" at line 1.\n...FOO...\n     ^ line 1 offset 3"
+        },
+        {
+            "input": "FOO=\"foo",
+            "message": "Missing quote to end the value in \".env\" at line 1.\n...FOO=\"foo...\n          ^ line 1 offset 8"
+        },
+        {
+            "input": "FOO='foo",
+            "message": "Missing quote to end the value in \".env\" at line 1.\n...FOO='foo...\n          ^ line 1 offset 8"
+        },
+        {
+            "input": "FOO=\"foo\nBAR=\"bar\"",
+            "message": "Missing quote to end the value in \".env\" at line 1.\n...FOO=\"foo\\nBAR=\"bar\"...\n                     ^ line 1 offset 18"
+        },
+        {
+            "input": "FOO='foo\n",
+            "message": "Missing quote to end the value in \".env\" at line 1.\n...FOO='foo\\n...\n            ^ line 1 offset 9"
+        },
+        {
+            "input": "export FOO",
+            "message": "Unable to unset an environment variable in \".env\" at line 1.\n...export FOO...\n            ^ line 1 offset 10"
+        },
+        {
+            "input": "FOO=${FOO",
+            "message": "Unclosed braces on variable expansion in \".env\" at line 1.\n...FOO=${FOO...\n           ^ line 1 offset 9"
+        },
+        {
+            "input": "FOO= BAR",
+            "message": "Whitespace are not supported before the value in \".env\" at line 1.\n...FOO= BAR...\n      ^ line 1 offset 4"
+        },
+        {
+            "input": "\u0421\u0442\u0430\u0441\u044f\u043d",
+            "message": "Invalid character in variable name in \".env\" at line 1.\n...\u0421\u0442\u0430\u0441\u044f\u043d...\n  ^ line 1 offset 0"
+        },
+        {
+            "input": "FOO!",
+            "message": "Missing = in the environment variable declaration in \".env\" at line 1.\n...FOO!...\n     ^ line 1 offset 3"
+        },
+        {
+            "input": "FOO=$(echo foo",
+            "message": "Missing closing parenthesis. in \".env\" at line 1.\n...FOO=$(echo foo...\n                ^ line 1 offset 14"
+        },
+        {
+            "input": "FOO=$(echo foo\n",
+            "message": "Missing closing parenthesis. in \".env\" at line 1.\n...FOO=$(echo foo\\n...\n                ^ line 1 offset 14"
+        },
+        {
+            "input": "FOO=\nBAR=${FOO:-\\'a{a}a}",
+            "message": "Unsupported character \"'\" found in the default value of variable \"$FOO\". in \".env\" at line 2.\n...\\nBAR=${FOO:-\\'a{a}a}...\n                       ^ line 2 offset 24"
+        },
+        {
+            "input": "FOO=\nBAR=${FOO:-a$a}",
+            "message": "Unsupported character \"$\" found in the default value of variable \"$FOO\". in \".env\" at line 2.\n...FOO=\\nBAR=${FOO:-a$a}...\n                       ^ line 2 offset 20"
+        },
+        {
+            "input": "FOO=\nBAR=${FOO:-a\"a}",
+            "message": "Missing quote to end the value in \".env\" at line 2.\n...FOO=\\nBAR=${FOO:-a\"a}...\n                       ^ line 2 offset 20"
+        },
+        {
+            "input": "_=FOO",
+            "message": "Invalid character in variable name in \".env\" at line 1.\n..._=FOO...\n  ^ line 1 offset 0"
+        },
+        {
+            "input": "FOO=$((1dd2))",
+            "message": "Issue expanding a command (%s\n) in \".env\" at line 1.\n...FOO=$((1dd2))...\n               ^ line 1 offset 13"
+        }
+    ]
+}
