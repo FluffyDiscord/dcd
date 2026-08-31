@@ -334,9 +334,8 @@ fn it_008_unlock_accepts_a_stuck_release_clears_the_lock_and_leaves_the_stage_de
     // Hold the stage lock by hand: unlock overrides a live flock by design.
     let lock_path = fx.dir.join(".dcd.it.lock");
     std::fs::write(&lock_path, b"").unwrap();
-    use fs2::FileExt;
     let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
-    held.try_lock_exclusive().unwrap();
+    held.try_lock().unwrap();
 
     let unlocked = fx.dcd(&["unlock", "it", "-y"]);
     assert!(
@@ -344,7 +343,7 @@ fn it_008_unlock_accepts_a_stuck_release_clears_the_lock_and_leaves_the_stage_de
         "unlock failed: {}",
         String::from_utf8_lossy(&unlocked.stderr)
     );
-    fs2::FileExt::unlock(&held).unwrap();
+    held.unlock().unwrap();
 
     // State-only: the black is the release of record and the lock is gone. The container
     // set is exactly what the failed deploy left — unlock started, stopped, and removed
@@ -404,14 +403,13 @@ fn it_005b_a_real_deploy_holds_the_stage_and_a_killed_one_releases_it() {
 
     // The lock is free because the process died, not because anything cleaned up:
     // asked of the kernel here, and of dcd by the deploy that follows.
-    use fs2::FileExt;
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(fx.dir.join(".dcd.it.lock"))
         .expect("the lock file outlives its holder");
-    lock.try_lock_exclusive().expect("the killed holder's flock was not reclaimed");
-    fs2::FileExt::unlock(&lock).unwrap();
+    lock.try_lock().expect("the killed holder's flock was not reclaimed");
+    lock.unlock().unwrap();
     drop(lock);
 
     let next = fx.deploy();
@@ -430,14 +428,13 @@ fn it_005_concurrent_lock_refuses_second() {
     // hold the lock by hand (flock on the same path the deploy uses)
     let lock_path = fx.dir.join(".dcd.it.lock");
     std::fs::write(&lock_path, b"").unwrap();
-    use fs2::FileExt;
     let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
-    held.try_lock_exclusive().unwrap();
+    held.try_lock().unwrap();
 
     let out = fx.dcd(&["deploy", "it"]);
     assert_eq!(out.status.code(), Some(3), "expected lock-held exit 3, stderr: {}", String::from_utf8_lossy(&out.stderr));
 
-    fs2::FileExt::unlock(&held).unwrap();
+    held.unlock().unwrap();
 }
 
 /// IT-017: `--image <service>=<ref>` pins that service for the run. The v2
@@ -506,12 +503,11 @@ fn it_013_a_dry_run_takes_no_lock_and_writes_nothing() {
     // And it stays a no-op while a real lock is held: the plan is still produced,
     // labelled stale, rather than refused with exit 3.
     std::fs::write(&lock, b"").unwrap();
-    use fs2::FileExt;
     let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
-    held.try_lock_exclusive().unwrap();
+    held.try_lock().unwrap();
 
     let while_held = fx.dcd(&["deploy", "it", "--dry-run"]);
-    fs2::FileExt::unlock(&held).unwrap();
+    held.unlock().unwrap();
     assert!(
         while_held.status.success(),
         "a dry run must not be refused by a held lock: {}",
