@@ -10,8 +10,6 @@ use crate::ssh::SshTarget;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
-
 use crate::error::{DcdError, Result};
 
 /// How a stage lock is held. `Local` is the `flock(2)` this process owns; `Leased`
@@ -343,7 +341,7 @@ impl StageLock {
             .open(&lock_path)
             .map_err(|e| DcdError::Config(format!("cannot open lock {}: {e}", lock_path.display())))?;
 
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => {
                 let _ = std::fs::write(&meta_path, format!("{holder}\n"));
                 Ok(StageLock::Local {
@@ -387,7 +385,7 @@ impl StageLock {
         let Ok(file) = File::open(lock_path(deploy_root, stage)) else {
             return false;
         };
-        let probe = file.try_lock_exclusive();
+        let probe = file.try_lock();
         probe.is_err()
     }
 
