@@ -136,6 +136,35 @@ networks:
             .unwrap()
     }
 
+    /// Appends a service to the compose file, ahead of the top-level `networks:`
+    /// block `new` wrote. Only the worker test needs more than the two services.
+    fn add_compose_service(&self, block: &str) {
+        let path = self.dir.join("compose.prod.yml");
+        let compose = std::fs::read_to_string(&path).unwrap();
+        // The TOP-LEVEL networks block: `app` has an indented `networks:` of its
+        // own, and splitting on the first match wrote the service into it.
+        let (services, networks) = compose
+            .split_once("\nnetworks:")
+            .expect("the fixture compose ends with a top-level networks block");
+        std::fs::write(&path, format!("{services}\n{block}networks:{networks}")).unwrap();
+    }
+
+    fn append_config(&self, block: &str) {
+        let path = self.dir.join("dcd.yaml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(block);
+        std::fs::write(&path, config).unwrap();
+    }
+
+    fn state(&self) -> String {
+        std::fs::read_to_string(self.dir.join("dcd-state.json")).expect("state file")
+    }
+
+    fn inspect(&self, container: &str, format: &str) -> String {
+        let out = docker(&["inspect", container, "--format", format]);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     fn running(&self, name_prefix: &str) -> Vec<String> {
         let out = docker(&[
             "ps",
@@ -428,6 +457,194 @@ fn it_013_a_dry_run_takes_no_lock_and_writes_nothing() {
         String::from_utf8_lossy(&while_held.stderr)
     );
     assert!(combined.contains("may be stale"), "a held lock must be reported: {combined}");
+}
+
+/// IT-003: `dcd rollback` re-points the stage at the previous release — its image,
+/// not the current one — and runs no migration. "No migration ran" is observed in
+/// the container the rollback created, not just believed from the record: the
+/// deploy's `migrate:after` leaves a marker inside the release, and the rollback's
+/// release must not have it while the deploy's did.
+#[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
+fn it_003_rollback_returns_the_previous_image_and_runs_no_migration() {
+    let fx = Fixture::new("rollback");
+    let config = fx.dir.join("dcd.yaml");
+    let yaml = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("  drain: 'true'", "  drain: 'true'\n  migrate: { after: 'touch /tmp/migrated' }");
+    std::fs::write(&config, yaml).unwrap();
+
+    assert!(fx.deploy().status.success(), "the first deploy must establish the rollback target");
+    let v1 = fx.running("app");
+    assert_eq!(v1.len(), 1, "expected one app container, got {v1:?}");
+    let v1 = v1[0].clone();
+
+    let pinned = "nginx:1.27-alpine";
+    let second = fx.dcd(&["deploy", "it", "--image", &format!("app={pinned}")]);
+    assert!(second.status.success(), "second deploy failed: {}", String::from_utf8_lossy(&second.stderr));
+    let v2 = fx.running("app");
+    assert_eq!(v2.len(), 1, "the first release must be drained: {v2:?}");
+    let v2 = v2[0].clone();
+    assert_ne!(v2, v1);
+    assert_eq!(fx.inspect(&v2, "{{.Config.Image}}"), pinned);
+    // The control for the marker: this deploy DID run the migration.
+    docker(&["exec", &v2, "test", "-f", "/tmp/migrated"]);
+
+    let rolled = fx.dcd(&["rollback", "it", "-y"]);
+    assert!(rolled.status.success(), "rollback failed: {}", String::from_utf8_lossy(&rolled.stderr));
+
+    let after = fx.running("app");
+    assert_eq!(after.len(), 1, "expected one app container after rollback, got {after:?}");
+    let restored = after[0].clone();
+    assert_ne!(restored, v2, "the rollback must replace the rolled-back container");
+    assert_eq!(
+        fx.inspect(&restored, "{{.Config.Image}}"),
+        "nginx:alpine",
+        "the rollback must replay the previous release's image, not the current one"
+    );
+
+    // No migration: the marker `migrate:after` would have left is absent. Raw
+    // `Command`, because a non-zero exit is the expected answer here.
+    let marker = Command::new("docker")
+        .args(["exec", &restored, "test", "-f", "/tmp/migrated"])
+        .output()
+        .expect("docker available");
+    assert!(!marker.status.success(), "rollback ran migrate:after");
+
+    // The router points at the restored release, and the record says rolled back.
+    let upstream = std::fs::read_to_string(fx.dir.join("upstream.conf")).expect("upstream file");
+    assert!(upstream.contains(&restored), "upstream still points elsewhere: {upstream}");
+
+    let status = fx.dcd(&["status", "it"]);
+    let printed = String::from_utf8_lossy(&status.stdout).to_string();
+    // The release rows are the indented ones; `current = …` names a container too.
+    let release_line = |container: &str| {
+        printed
+            .lines()
+            .find(|line| line.starts_with("  ") && line.contains(container))
+            .unwrap_or_else(|| panic!("no release row for {container}: {printed}"))
+            .to_string()
+    };
+    let rolled_back_line = release_line(&v2);
+    assert!(rolled_back_line.contains("RolledBack"), "status must show the rollback: {printed}");
+    let restored_line = release_line(&restored);
+    assert!(restored_line.contains("Active"), "the restored release must be active: {printed}");
+    assert!(
+        !restored_line.contains("ran migrations"),
+        "the rollback release must not be recorded as having migrated: {printed}"
+    );
+    assert!(printed.contains(&format!("current = {restored}")), "{printed}");
+}
+
+/// IT-004: a deploy that dies after the cutover leaves the stage incomplete (exit 4);
+/// `dcd deploy --resume` finishes that same release rather than starting another.
+/// The container identity is the whole point — a resume that quietly created a new
+/// black would pass every state-only assertion.
+#[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
+fn it_004_resume_finishes_the_incomplete_release_without_replacing_it() {
+    let fx = Fixture::new("resume");
+    let config = fx.dir.join("dcd.yaml");
+    let healthy = std::fs::read_to_string(&config).unwrap();
+
+    assert!(fx.deploy().status.success(), "the first deploy must establish a red");
+
+    let stuck = healthy.replace("  drain: 'true'", "  drain: 'true'\n  migrate: { after: 'false' }");
+    std::fs::write(&config, &stuck).unwrap();
+    let failed = fx.deploy();
+    assert_eq!(failed.status.code(), Some(4), "expected post-cutover exit 4");
+    let pending = fx.running("app");
+    assert_eq!(pending.len(), 1, "the black is live and the red drained, got {pending:?}");
+    let pending = pending[0].clone();
+    assert!(fx.state().contains("cutover_pending"), "the stage must be stuck: {}", fx.state());
+
+    // Fix the cause, then resume — the operator flow the README prescribes.
+    std::fs::write(&config, &healthy).unwrap();
+    let resumed = fx.dcd(&["deploy", "--resume", "it"]);
+    assert!(resumed.status.success(), "resume failed: {}", String::from_utf8_lossy(&resumed.stderr));
+
+    let after = fx.running("app");
+    assert_eq!(after, vec![pending.clone()], "resume must finish THAT release, not start another");
+    let state = fx.state();
+    assert!(!state.contains("cutover_pending"), "resume left the stage incomplete: {state}");
+    assert!(state.contains(&format!("\"current\": \"{pending}\"")), "current not advanced: {state}");
+    assert!(state.contains("\"active\""), "the resumed release must end active: {state}");
+
+    // And the stage is ordinarily deployable again.
+    let next = fx.deploy();
+    assert!(next.status.success(), "stage not deployable after resume: {}", String::from_utf8_lossy(&next.stderr));
+}
+
+/// IT-014 (INV-13/14): the release container is a one-off `compose run` container,
+/// and it has to survive two things that sweep by label — an operator's
+/// `compose up -d --remove-orphans`, and dcd's own worker drain, which filters on
+/// `com.docker.compose.service={workers.service}`. If either ever matched the
+/// release, a deploy would stop the container it just cut over to.
+#[test]
+#[ignore = "drives real Docker; run with `-- --include-ignored`"]
+fn it_014_the_release_container_survives_compose_reconciliation_and_worker_drain() {
+    let fx = Fixture::new("workers");
+    fx.add_compose_service(
+        "  worker:\n    image: nginx:alpine\n    entrypoint: [\"sh\", \"-c\", \"sleep 3600\"]\n",
+    );
+    fx.append_config(&format!(
+        "workers:\n  service: worker\n  provider: {{ static: [async] }}\n  name_prefix: {}-worker-\n",
+        fx.project
+    ));
+
+    let first = fx.deploy();
+    assert!(
+        first.status.success(),
+        "deploy with workers failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let release = fx.running("app");
+    assert_eq!(release.len(), 1, "expected one app container, got {release:?}");
+    let release = release[0].clone();
+    let worker = format!("{}-worker-async", fx.project);
+    assert_eq!(fx.running("worker"), vec![worker.clone()], "the worker must exist to be drained");
+
+    let id_before = fx.inspect(&release, "{{.Id}}");
+    let started_before = fx.inspect(&release, "{{.State.StartedAt}}");
+    let worker_id_before = fx.inspect(&worker, "{{.Id}}");
+
+    // An operator reconciling the stack by hand. `--remove-orphans` is the sweep
+    // that would take the release container with it if compose counted it as one.
+    let reconcile = Command::new("docker")
+        .current_dir(&fx.dir)
+        .args(["compose", "-p", &fx.project, "-f", "compose.prod.yml", "up", "-d", "--remove-orphans"])
+        .output()
+        .expect("docker compose available");
+    assert!(
+        reconcile.status.success(),
+        "compose up failed: {}",
+        String::from_utf8_lossy(&reconcile.stderr)
+    );
+    assert_eq!(fx.running("app"), vec![release.clone()], "compose up --remove-orphans took the release");
+    assert_eq!(fx.inspect(&release, "{{.Id}}"), id_before, "the release container was recreated");
+    assert_eq!(
+        fx.inspect(&release, "{{.State.StartedAt}}"),
+        started_before,
+        "the release container was restarted"
+    );
+
+    // Now dcd's own worker drain, which runs in `drain:red` — after the cutover,
+    // while the new release container is live and carrying the project label.
+    let second = fx.deploy();
+    assert!(second.status.success(), "second deploy failed: {}", String::from_utf8_lossy(&second.stderr));
+    let live = fx.running("app");
+    assert_eq!(live.len(), 1, "the release must have survived the worker drain, got {live:?}");
+    assert_ne!(live[0], release, "the second deploy creates its own release container");
+    assert_eq!(fx.inspect(&live[0], "{{.State.Running}}"), "true");
+
+    // The control: the drain really ran, so "the release survived" is not the
+    // answer to a drain that never happened.
+    assert_eq!(fx.running("worker"), vec![worker.clone()], "the worker must be back");
+    assert_ne!(
+        fx.inspect(&worker, "{{.Id}}"),
+        worker_id_before,
+        "the worker was never drained and recreated — the discovery path went unexercised"
+    );
 }
 
 /// IT-015 (§7.6): `compose run` forces `restart=no` on a one-off container, so dcd
