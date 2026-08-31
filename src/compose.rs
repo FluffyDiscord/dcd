@@ -194,13 +194,13 @@ impl ComposeService {
 /// Env is deliberately absent: values reach the container as bare `-e KEY` from
 /// the resolved chain (INV-12), and writing them here would put them on disk.
 pub fn render_run_document(service: &str, run: &crate::config::RunSpec) -> String {
-    let mut document = serde_yaml::Mapping::new();
-    let mut definition = serde_yaml::Mapping::new();
+    let mut document = serde_norway::Mapping::new();
+    let mut definition = serde_norway::Mapping::new();
 
-    let key = |name: &str| serde_yaml::Value::String(name.to_string());
-    let text = |value: &str| serde_yaml::Value::String(value.to_string());
+    let key = |name: &str| serde_norway::Value::String(name.to_string());
+    let text = |value: &str| serde_norway::Value::String(value.to_string());
     let list = |values: &[String]| {
-        serde_yaml::Value::Sequence(values.iter().map(|value| text(value)).collect())
+        serde_norway::Value::Sequence(values.iter().map(|value| text(value)).collect())
     };
 
     definition.insert(key("image"), text(&run.image));
@@ -220,29 +220,29 @@ pub fn render_run_document(service: &str, run: &crate::config::RunSpec) -> Strin
     }
 
     if let Some(network) = &run.network {
-        let mut attachment = serde_yaml::Mapping::new();
+        let mut attachment = serde_norway::Mapping::new();
         if let Some(alias) = &run.network_alias {
-            let mut aliases = serde_yaml::Mapping::new();
+            let mut aliases = serde_norway::Mapping::new();
             aliases.insert(key("aliases"), list(std::slice::from_ref(alias)));
-            attachment.insert(text(network), serde_yaml::Value::Mapping(aliases));
+            attachment.insert(text(network), serde_norway::Value::Mapping(aliases));
         } else {
-            attachment.insert(text(network), serde_yaml::Value::Null);
+            attachment.insert(text(network), serde_norway::Value::Null);
         }
-        definition.insert(key("networks"), serde_yaml::Value::Mapping(attachment));
+        definition.insert(key("networks"), serde_norway::Value::Mapping(attachment));
 
-        let mut declared = serde_yaml::Mapping::new();
-        let mut external = serde_yaml::Mapping::new();
+        let mut declared = serde_norway::Mapping::new();
+        let mut external = serde_norway::Mapping::new();
         external.insert(key("name"), text(network));
-        external.insert(key("external"), serde_yaml::Value::Bool(true));
-        declared.insert(text(network), serde_yaml::Value::Mapping(external));
-        document.insert(key("networks"), serde_yaml::Value::Mapping(declared));
+        external.insert(key("external"), serde_norway::Value::Bool(true));
+        declared.insert(text(network), serde_norway::Value::Mapping(external));
+        document.insert(key("networks"), serde_norway::Value::Mapping(declared));
     }
 
-    let mut services = serde_yaml::Mapping::new();
-    services.insert(text(service), serde_yaml::Value::Mapping(definition));
-    document.insert(key("services"), serde_yaml::Value::Mapping(services));
+    let mut services = serde_norway::Mapping::new();
+    services.insert(text(service), serde_norway::Value::Mapping(definition));
+    document.insert(key("services"), serde_norway::Value::Mapping(services));
 
-    serde_yaml::to_string(&serde_yaml::Value::Mapping(document))
+    serde_norway::to_string(&serde_norway::Value::Mapping(document))
         .unwrap_or_else(|_| format!("services:\n  {service}:\n    image: {}\n", run.image))
 }
 
@@ -303,7 +303,7 @@ mod tests {
             ..Default::default()
         };
         let document = render_run_document("demo-release", &run);
-        let model = serde_yaml::from_str::<serde_yaml::Value>(&document).expect("valid YAML");
+        let model = serde_norway::from_str::<serde_norway::Value>(&document).expect("valid YAML");
 
         let service = &model["services"]["demo-release"];
         assert_eq!(service["image"].as_str(), Some("reg/app:v1"));

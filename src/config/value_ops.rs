@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use serde_yaml::Value;
+use serde_norway::Value;
 
 use crate::error::{DcdError, Result};
 
@@ -170,7 +170,7 @@ fn parse_path(path: &str) -> Result<Vec<Seg>> {
 }
 
 fn parse_scalar(raw: &str) -> Value {
-    serde_yaml::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+    serde_norway::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 /// Derive identity so a lean, multi-stage config can omit it: `project` defaults to the
@@ -227,7 +227,7 @@ fn inject_compose_project_name(base: &mut Value, project: &str) {
 }
 
 /// Ensure `parent[key]` is a mapping, creating it if missing, and return it.
-fn ensure_map<'a>(parent: &'a mut serde_yaml::Mapping, key: &str) -> Option<&'a mut serde_yaml::Mapping> {
+fn ensure_map<'a>(parent: &'a mut serde_norway::Mapping, key: &str) -> Option<&'a mut serde_norway::Mapping> {
     let slot = Value::String(key.to_string());
     if !parent.contains_key(slot.clone()) {
         parent.insert(slot.clone(), Value::Mapping(Default::default()));
@@ -253,7 +253,7 @@ mod tests {
     }
 
     fn yaml(s: &str) -> Value {
-        serde_yaml::from_str(s).unwrap()
+        serde_norway::from_str(s).unwrap()
     }
 
     #[test]

@@ -96,17 +96,17 @@ impl LuaHost {
 
     /// The live `cfg` table as YAML, for the engine to read back after a hook may have
     /// mutated it. Compared against the pre-hook value to detect real changes.
-    pub fn read_cfg(&self) -> Result<serde_yaml::Value, String> {
+    pub fn read_cfg(&self) -> Result<serde_norway::Value, String> {
         self.read_table(&self.cfg_key)
     }
 
     /// The live `state` table as YAML (the current stage's deploy state), read back after
     /// a hook may have mutated it.
-    pub fn read_state(&self) -> Result<serde_yaml::Value, String> {
+    pub fn read_state(&self) -> Result<serde_norway::Value, String> {
         self.read_table(&self.state_key)
     }
 
-    fn read_table(&self, key: &RegistryKey) -> Result<serde_yaml::Value, String> {
+    fn read_table(&self, key: &RegistryKey) -> Result<serde_norway::Value, String> {
         let table: Table = self.lua.registry_value(key).map_err(|e| e.to_string())?;
         self.lua.from_value(Value::Table(table)).map_err(|e| e.to_string())
     }
@@ -164,8 +164,8 @@ impl LuaHost {
                 ctx.set("stage", host.stage())?;
 
                 ctx.set("inspect", scope.create_function(|lua, value: Value| {
-                    let yaml: serde_yaml::Value = lua.from_value(value)?;
-                    serde_yaml::to_string(&yaml).map_err(runtime)
+                    let yaml: serde_norway::Value = lua.from_value(value)?;
+                    serde_norway::to_string(&yaml).map_err(runtime)
                 })?)?;
                 ctx.set("dump", scope.create_function(move |lua, value: Value| {
                     let target = if matches!(value, Value::Nil) {
@@ -176,8 +176,8 @@ impl LuaHost {
                     } else {
                         value
                     };
-                    let yaml: serde_yaml::Value = lua.from_value(target)?;
-                    host.log(&format!("[dump]\n{}", serde_yaml::to_string(&yaml).map_err(runtime)?));
+                    let yaml: serde_norway::Value = lua.from_value(target)?;
+                    host.log(&format!("[dump]\n{}", serde_norway::to_string(&yaml).map_err(runtime)?));
                     Ok(())
                 })?)?;
 
@@ -195,12 +195,12 @@ impl LuaHost {
                     serde_json::to_string(&value).map_err(runtime)
                 })?)?;
                 ctx.set("yaml_decode", scope.create_function(|lua, s: String| {
-                    let value: serde_yaml::Value = serde_yaml::from_str(&s).map_err(runtime)?;
+                    let value: serde_norway::Value = serde_norway::from_str(&s).map_err(runtime)?;
                     to_lua(lua, &value)
                 })?)?;
                 ctx.set("yaml_encode", scope.create_function(|lua, v: Value| {
-                    let value: serde_yaml::Value = lua.from_value(v)?;
-                    serde_yaml::to_string(&value).map_err(runtime)
+                    let value: serde_norway::Value = lua.from_value(v)?;
+                    serde_norway::to_string(&value).map_err(runtime)
                 })?)?;
 
                 ctx.set("run", scope.create_function(move |_, cmd: String| host.run_host(&cmd).map_err(mlua::Error::RuntimeError))?)?;
@@ -311,7 +311,7 @@ fn runtime<E: std::fmt::Display>(error: E) -> mlua::Error {
 /// Serialize to Lua with `None`/unit mapped to `nil` (not a null sentinel), so plugins
 /// see idiomatic `nil` for absent values.
 fn to_lua(lua: &Lua, value: &impl Serialize) -> mlua::Result<Value> {
-    let options = mlua::SerializeOptions::new()
+    let options = mlua::serde::SerializeOptions::new()
         .serialize_none_to_null(false)
         .serialize_unit_to_null(false);
     lua.to_value_with(value, options)
@@ -498,7 +498,7 @@ stages: { prod: {} }
         let host = LuaHost::load(&config(), &[("p".into(), plugin.into())]).unwrap();
         host.refresh(&config(), &stage()).unwrap();
         host.fire(&FakeHost::default(), "after_cutover").unwrap();
-        let synced: StageState = serde_yaml::from_value(host.read_state().unwrap()).unwrap();
+        let synced: StageState = serde_norway::from_value(host.read_state().unwrap()).unwrap();
         assert_eq!(synced.current.as_deref(), Some("black-1"));
         assert_eq!(synced.releases[0].status, ReleaseStatus::Superseded);
     }

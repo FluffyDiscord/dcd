@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
+use serde_norway::Value;
 
 use crate::error::{DcdError, Result};
 use value_ops::{apply_set, default_identity, get_sequence, interpolate, merge_value, set_sequence};
@@ -470,7 +470,7 @@ pub fn load(
     env: &HashMap<String, String>,
 ) -> Result<Config> {
     let mut doc: Value =
-        serde_yaml::from_str(source).map_err(|e| DcdError::Config(format!("parse: {e}")))?;
+        serde_norway::from_str(source).map_err(|e| DcdError::Config(format!("parse: {e}")))?;
     reject_removed_keys(&doc)?;
     interpolate(&mut doc, env)?;
 
@@ -502,7 +502,7 @@ pub fn load(
     default_identity(&mut base);
 
     let mut config: Config =
-        serde_yaml::from_value(base).map_err(|e| DcdError::Config(e.to_string()))?;
+        serde_norway::from_value(base).map_err(|e| DcdError::Config(e.to_string()))?;
     config.stage = stage_name;
     validate(&config)?;
     Ok(config)
@@ -513,7 +513,7 @@ pub fn load(
 /// the right stage before `${VAR}` resolution runs (spec §5.2.1).
 pub fn peek_stage(source: &str, requested: Option<&str>) -> Result<String> {
     let mut doc: Value =
-        serde_yaml::from_str(source).map_err(|e| DcdError::Config(format!("parse: {e}")))?;
+        serde_norway::from_str(source).map_err(|e| DcdError::Config(format!("parse: {e}")))?;
     let stages = doc
         .as_mapping_mut()
         .and_then(|map| map.remove(Value::String("stages".into())));
@@ -658,7 +658,7 @@ pub fn from_lua_value(mut value: Value, stage: &str) -> Result<Config> {
     if let Some(map) = value.as_mapping_mut() {
         map.remove(Value::String("stage".to_string())); // engine-owned, not plugin-settable
     }
-    let mut config: Config = serde_yaml::from_value(value).map_err(|e| DcdError::Config(e.to_string()))?;
+    let mut config: Config = serde_norway::from_value(value).map_err(|e| DcdError::Config(e.to_string()))?;
     config.stage = stage.to_string();
     validate(&config)?;
     Ok(config)
@@ -822,7 +822,7 @@ fn validate_cutover_backend(config: &Config) -> Result<()> {
 /// literally called `TODO: user@host`. The prefix is matched exactly, so an
 /// operator's own `TODO_FLUSH=1 bin/console app:drain` is not a placeholder.
 fn validate_no_placeholders_left(config: &Config) -> Result<()> {
-    let document = serde_yaml::to_value(config)
+    let document = serde_norway::to_value(config)
         .map_err(|e| DcdError::Config(format!("cannot inspect the config: {e}")))?;
     let mut unfilled = Vec::new();
     collect_placeholders(&document, String::new(), &mut unfilled);
@@ -835,10 +835,10 @@ fn validate_no_placeholders_left(config: &Config) -> Result<()> {
     )))
 }
 
-fn collect_placeholders(value: &serde_yaml::Value, path: String, unfilled: &mut Vec<String>) {
+fn collect_placeholders(value: &serde_norway::Value, path: String, unfilled: &mut Vec<String>) {
     match value {
-        serde_yaml::Value::String(text) if text.starts_with(PLACEHOLDER) => unfilled.push(path),
-        serde_yaml::Value::Mapping(map) => {
+        serde_norway::Value::String(text) if text.starts_with(PLACEHOLDER) => unfilled.push(path),
+        serde_norway::Value::Mapping(map) => {
             for (key, nested) in map {
                 let name = key.as_str().unwrap_or("?");
                 let nested_path = if path.is_empty() {
@@ -849,7 +849,7 @@ fn collect_placeholders(value: &serde_yaml::Value, path: String, unfilled: &mut 
                 collect_placeholders(nested, nested_path, unfilled);
             }
         }
-        serde_yaml::Value::Sequence(items) => {
+        serde_norway::Value::Sequence(items) => {
             for (index, nested) in items.iter().enumerate() {
                 collect_placeholders(nested, format!("{path}[{index}]"), unfilled);
             }

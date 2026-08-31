@@ -1174,16 +1174,16 @@ impl<'a> Engine<'a> {
 
     /// Adopt a `ctx.cfg` a plugin mutated: re-derive and re-validate the typed config from
     /// the live Lua table. A validation failure aborts the deploy.
-    fn apply_synced_cfg(&mut self, value: serde_yaml::Value) -> Result<()> {
+    fn apply_synced_cfg(&mut self, value: serde_norway::Value) -> Result<()> {
         self.cfg = crate::config::from_lua_value(value, &self.cfg.stage).map_err(|e| self.classify(e.to_string()))?;
         Ok(())
     }
 
     /// Adopt a `ctx.state` a plugin mutated into the current stage. Persisted immediately
     /// once past cutover so the change survives a crash (matching INV-3).
-    fn apply_synced_state(&mut self, value: serde_yaml::Value) -> Result<()> {
+    fn apply_synced_state(&mut self, value: serde_norway::Value) -> Result<()> {
         let mut stage: crate::state::StageState =
-            serde_yaml::from_value(value).map_err(|e| self.classify(format!("ctx.state: {e}")))?;
+            serde_norway::from_value(value).map_err(|e| self.classify(format!("ctx.state: {e}")))?;
         let key = self.cfg.stage.clone();
         // the pull ledger is dcd's record of what it put on this host, not a plugin's
         // to edit: a round-trip that dropped it would make those tags unreclaimable

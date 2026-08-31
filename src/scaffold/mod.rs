@@ -26,9 +26,9 @@ struct ComposeServiceDocument {
     #[serde(default)]
     image: Option<String>,
     #[serde(default)]
-    ports: Vec<serde_yaml::Value>,
+    ports: Vec<serde_norway::Value>,
     #[serde(default)]
-    healthcheck: Option<serde_yaml::Value>,
+    healthcheck: Option<serde_norway::Value>,
     #[serde(default)]
     profiles: Vec<String>,
 }
@@ -65,7 +65,7 @@ impl Scaffold {
     pub fn from_compose(path: &Path, config_path: &Path) -> Result<Scaffold> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| DcdError::Config(format!("cannot read {}: {e}", path.display())))?;
-        let document: ComposeDocument = serde_yaml::from_str(&source)
+        let document: ComposeDocument = serde_norway::from_str(&source)
             .map_err(|e| DcdError::Config(format!("{} is not a compose file: {e}", path.display())))?;
         if document.services.is_empty() {
             return Err(DcdError::Config(format!("{} declares no services", path.display())));
@@ -210,10 +210,10 @@ impl Scaffold {
         let service = self.document.services.get(name)?;
         let first = service.ports.first()?;
         let mapping = match first {
-            serde_yaml::Value::String(text) => text.clone(),
-            serde_yaml::Value::Number(number) => number.to_string(),
-            serde_yaml::Value::Mapping(map) => {
-                let target = map.get(serde_yaml::Value::String("target".to_string()))?;
+            serde_norway::Value::String(text) => text.clone(),
+            serde_norway::Value::Number(number) => number.to_string(),
+            serde_norway::Value::Mapping(map) => {
+                let target = map.get(serde_norway::Value::String("target".to_string()))?;
                 return Some(target.as_u64()?.to_string());
             }
             _ => return None,
@@ -236,9 +236,9 @@ impl Scaffold {
         out.push_str(&format!("project: {}\n", self.project));
         out.push_str("ssh: \"TODO: user@host of the target — omit the key to use a local Docker socket\"\n");
         out.push_str("deploy_root: \"TODO: absolute path on the target\"\n\n");
-        // Rendered through serde_yaml: a path carrying a comma, '#' or a bracket
+        // Rendered through the YAML emitter: a path carrying a comma, '#' or a bracket
         // would otherwise silently reparse as a different list.
-        let files = serde_yaml::to_string(&vec![self.compose_file.clone()])
+        let files = serde_norway::to_string(&vec![self.compose_file.clone()])
             .unwrap_or_else(|_| format!("- {}\n", self.compose_file));
         out.push_str("compose:\n  files:\n");
         for line in files.lines() {
