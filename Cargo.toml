@@ -2,6 +2,10 @@
 name = "dcd"
 version = "0.5.3"
 edition = "2021"
+# `File::try_lock`/`unlock` (the stage mutex) are std as of 1.89, which retired the
+# last unmaintained dependency (fs2, last released 2018). Declared so a toolchain
+# that predates them says so instead of failing on a missing method.
+rust-version = "1.89"
 description = "Zero-downtime red-black Docker deploys from a YAML config, extensible via Lua."
 license = "MIT"
 
@@ -13,13 +17,15 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# serde_yaml was deprecated and archived by its author in 2024, and so was the
+# unsafe-libyaml it parses with. serde_norway is the fork that kept both alive —
+# same API, same `Value`/`Mapping`, so config semantics do not move.
+serde_norway = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 thiserror = "2"
-fs2 = "0.4"
-signal-hook = "0.3"
-gethostname = "0.5"
-mlua = { version = "0.10", features = ["lua54", "vendored", "serialize"] }
+signal-hook = "0.4"
+gethostname = "1"
+mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
 regex-lite = "0.1.9"
 schemars = { version = "1.2.2", features = ["indexmap2"] }
 
