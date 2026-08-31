@@ -78,6 +78,13 @@ resolves for one stage is half a field reference.
   it inlines resolved env values. Schema changes here also touch UPGRADE.md.
   The one place a value could have escaped was the dotenv **parse error**, which quotes raw
   bytes around the cursor — an apostrophe in one value printed the next variable's secret.
-  `mask_values` now masks every value byte in that window, a deliberate divergence from
-  Symfony's byte-exact snippet. Keep it that way: no path may print a value.
+  Two fixes, both kept: the **parser** treats a partnerless apostrophe inside a value as a
+  literal byte, so `PASS=pa'ss` parses (spec §5.2.1); `mask_values` masks every value byte in
+  the error window for the errors that remain, a deliberate divergence from Symfony's byte-exact
+  snippet. Keep both: no path may print a value.
+- The dotenv oracle is upstream's own suite, vendored: `tests/fixtures/symfony/DotenvTest.php`
+  (the real file) → `extract_cases.php` (run in a php container) → `dotenv_cases.json`, which
+  `src/dotenv/tests.rs` executes case by case. **Every upstream case must pass verbatim** —
+  the only allowed answers-differently list is the completed-`$(…)` refusals, named by exact
+  input. Change the parser only in ways that keep that true.
 - One app container per release — there is no replica/scale knob yet.

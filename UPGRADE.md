@@ -234,6 +234,12 @@ Config
    earlier `redis://${REDIS_HOST}`, forward references work, self-referencing
    `${VAR:-default}` sees the pre-chain value), circular references are an error
 
+ * One deliberate divergence from upstream: an apostrophe *inside* a value is a
+   literal apostrophe unless its partner is on the same line, so `PASS=pa'ss`
+   parses instead of opening a run that swallows the following lines. Everything
+   else is unchanged — `FOO="a b"`, `FOO='a'"$B"`, multi-line quoted values,
+   `'bar '\'' baz'`, and `"` still has to be closed
+
  * If the project has its own `.env`/`.env.<stage>` files, point dcd at a separate
    base with `--env-file .env.deploy` — the whole chain rebases onto it
    (`.env.deploy` → `.env.deploy.local` → `.env.deploy.<stage>` →

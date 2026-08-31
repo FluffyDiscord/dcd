@@ -244,6 +244,8 @@ token is expanded everywhere afterwards, so `{project}-foo` namespaces per stage
   key is delivered as a bare `-e KEY`, and over SSH the values ride a document on **stdin** —
   so no value ever appears in an argv, on either machine, and nothing is written to disk.
   Filter with `release.run.env_include`/`env_exclude` when using the `run` fallback.
+  Chain files parse like Symfony's, with one relaxation: an apostrophe inside a value is a
+  literal apostrophe (`PASS=pa'ss` is fine). Values with spaces or a `"` still need quotes.
 - **Rollback runs no migrations.** It replays the previous release's *images* (pinned
   exactly via the override file) under the *current* compose spec — the same semantics side
   services have always had. Env is re-read from today's chain, and dcd warns when the key
