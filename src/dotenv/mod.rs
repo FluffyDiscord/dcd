@@ -250,9 +250,48 @@ impl Parser {
         Ok(name)
     }
 
+    /// Where a quote is a segment delimiter and where it is just a byte in the
+    /// value. Upstream says "always a delimiter", which makes `PASS=pa'ss` open a
+    /// quoted run that swallows every following line until the next apostrophe —
+    /// so an ordinary password either failed to parse at EOF (printing its
+    /// neighbours through the error window) or silently absorbed their values.
+    ///
+    /// Exactly one case is narrowed: an **apostrophe** inside an unquoted run,
+    /// which delimits only when its partner is on the SAME line. `"` is untouched,
+    /// and so is any quote opening a segment (the value's first byte, or right
+    /// after a quoted segment closed) — multi-line values included. That keeps
+    /// every ported PHP case passing verbatim: the suite pins the double quote
+    /// (`${FOO:-a"a}`, `FOO="foo\nBAR="bar"`) and never pins a lone apostrophe
+    /// mid-value, which is precisely where a password puts one.
+    fn opens_quoted_segment(&self, at: usize, segment_start: bool) -> bool {
+        let quote = self.byte(at);
+        if !matches!(quote, b'\'' | b'"') {
+            return false;
+        }
+        if segment_start || quote == b'"' {
+            return true;
+        }
+        self.closing_apostrophe_on_this_line(at)
+    }
+
+    /// Mirrors the single-quote lexer's own rule while scanning for the partner:
+    /// inside `'…'` there are no escapes, so the first apostrophe wins.
+    fn closing_apostrophe_on_this_line(&self, opening: usize) -> bool {
+        let mut index = opening + 1;
+        while index < self.end {
+            match self.byte(index) {
+                b'\n' => return false,
+                b'\'' => return true,
+                _ => index += 1,
+            }
+        }
+        false
+    }
+
     /// Symfony 8.1 `lexValue`: raw segments. Single quotes double backslashes
     /// and mark `$` literal; double quotes unescape then protect `\$`; unquoted
     /// segments protect `\$` and only refuse spaces when no `$` is involved.
+    /// Which quotes delimit a segment is [`Parser::opens_quoted_segment`].
     fn lex_value(&mut self) -> Result<String> {
         let mut probe = self.cursor;
         while matches!(self.byte(probe), b' ' | b'\t') {
@@ -276,9 +315,11 @@ impl Parser {
         }
 
         let mut assembled = String::new();
+        let mut at_segment_start = true;
         loop {
+            let opens_quote = self.opens_quoted_segment(self.cursor, at_segment_start);
             match self.byte(self.cursor) {
-                b'\'' => {
+                b'\'' if opens_quote => {
                     let mut len = 0;
                     loop {
                         len += 1;
@@ -294,8 +335,9 @@ impl Parser {
                         .into_owned();
                     assembled.push_str(&raw.replace('\\', "\\\\").replace('$', "\0"));
                     self.cursor += 1 + len;
+                    at_segment_start = true;
                 }
-                b'"' => {
+                b'"' if opens_quote => {
                     let mut raw = Vec::new();
                     self.cursor += 1;
                     if self.cursor == self.end {
@@ -320,14 +362,22 @@ impl Parser {
                         .replace("\\r", "\r")
                         .replace("\\n", "\n");
                     assembled.push_str(&protect_escaped_dollars(&unescaped));
+                    at_segment_start = true;
                 }
                 _ => {
                     let mut raw = Vec::new();
                     let mut prev = if self.cursor >= 1 { self.byte(self.cursor - 1) } else { 0 };
-                    while self.cursor < self.end
-                        && !matches!(self.byte(self.cursor), b'\n' | b'"' | b'\'')
-                        && !(matches!(prev, b' ' | b'\t') && self.byte(self.cursor) == b'#')
-                    {
+                    while self.cursor < self.end {
+                        let current = self.byte(self.cursor);
+                        if current == b'\n' {
+                            break;
+                        }
+                        if self.opens_quoted_segment(self.cursor, false) {
+                            break;
+                        }
+                        if matches!(prev, b' ' | b'\t') && current == b'#' {
+                            break;
+                        }
                         if self.byte(self.cursor) == b'\\'
                             && matches!(self.byte(self.cursor + 1), b'"' | b'\'')
                         {
@@ -358,6 +408,7 @@ impl Parser {
                         );
                     }
                     assembled.push_str(&protected);
+                    at_segment_start = false;
                     if self.cursor < self.end && self.byte(self.cursor) == b'#' {
                         break;
                     }
