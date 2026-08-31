@@ -167,7 +167,7 @@ fn everything_the_scaffold_renders_is_valid_yaml() {
         let path = directory.join(format!("compose-{index}.yml"));
         std::fs::write(&path, body).unwrap();
         let rendered = Scaffold::from_compose(&path, &directory.join("dcd.yaml")).unwrap().render();
-        serde_yaml::from_str::<serde_yaml::Value>(&rendered)
+        serde_norway::from_str::<serde_norway::Value>(&rendered)
             .unwrap_or_else(|e| panic!("case {index} is not YAML: {e}\n{rendered}"));
     }
     let _ = std::fs::remove_dir_all(&directory);
@@ -316,7 +316,7 @@ services:
     .unwrap()
     .render();
 
-    serde_yaml::from_str::<serde_yaml::Value>(&rendered).expect("still valid YAML");
+    serde_norway::from_str::<serde_norway::Value>(&rendered).expect("still valid YAML");
 
     let error = crate::config::load(&rendered, Some("prod"), &[], &std::collections::HashMap::new())
         .unwrap_err()
@@ -352,7 +352,7 @@ fn a_compose_filename_with_a_metacharacter_survives_the_round_trip() {
     std::fs::write(&compose, TYPICAL).unwrap();
 
     let rendered = Scaffold::from_compose(&compose, &directory.join("dcd.yaml")).unwrap().render();
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered).expect("valid YAML");
+    let parsed: serde_norway::Value = serde_norway::from_str(&rendered).expect("valid YAML");
     let files = parsed["compose"]["files"].as_sequence().expect("a files list");
     assert_eq!(files.len(), 1, "the name must not split: {rendered}");
     assert_eq!(files[0].as_str(), Some("in,fra#1.yml"), "{rendered}");

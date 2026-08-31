@@ -462,15 +462,15 @@ fn the_emitted_schema_describes_every_shipped_example() {
         "docs/examples/fpm_app/dcd.yaml",
     ] {
         let source = std::fs::read_to_string(example).unwrap_or_else(|e| panic!("{example}: {e}"));
-        let document: serde_yaml::Mapping = serde_yaml::from_str(&source).unwrap_or_else(|e| panic!("{example}: {e}"));
+        let document: serde_norway::Mapping = serde_norway::from_str(&source).unwrap_or_else(|e| panic!("{example}: {e}"));
 
         for key in document.keys() {
             let key = key.as_str().expect("a scalar key");
             assert!(properties.contains_key(key), "{example}: the schema does not describe `{key}`");
         }
 
-        let stages = document.get(serde_yaml::Value::String("stages".into()));
-        let stages = stages.and_then(serde_yaml::Value::as_mapping).unwrap_or_else(|| panic!("{example}: no stages"));
+        let stages = document.get(serde_norway::Value::String("stages".into()));
+        let stages = stages.and_then(serde_norway::Value::as_mapping).unwrap_or_else(|| panic!("{example}: no stages"));
         for (name, body) in stages {
             let Some(body) = body.as_mapping() else { continue };
             for key in body.keys() {
