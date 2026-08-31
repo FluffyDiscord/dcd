@@ -14,4 +14,8 @@ COPY authorized_key /root/.ssh/authorized_keys
 RUN chmod 600 /root/.ssh/authorized_keys
 
 EXPOSE 22
-CMD ["/usr/sbin/sshd", "-D", "-e"]
+# sshd is NOT pid 1: the transport-loss tests kill it on purpose, and a target
+# that vanishes with its sshd cannot be inspected afterwards — which is exactly
+# where the state written before the link dropped has to be checked. Backgrounded
+# sshd + a pid 1 that outlives it keeps the target there to look at.
+CMD ["sh", "-c", "/usr/sbin/sshd -e && exec tail -f /dev/null"]

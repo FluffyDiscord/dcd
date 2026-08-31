@@ -1,4 +1,4 @@
-//! A full red-black deploy driven over ssh (spec §2.7, IT-016).
+//! A full red-black deploy driven over ssh (spec §2.7, IT-009…IT-016).
 //!
 //! `tests/ssh_shells.rs` proves the transport; this proves the deploy that rides
 //! it. dcd runs here, on the test machine, and reaches a target that has sshd and
@@ -12,23 +12,22 @@
 //! so a TCP-only `DOCKER_HOST` (a dind CI service) cannot run it.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::CommandCargoExt;
 
-const IMAGE: &str = "dcd-ssh-deploy";
-const CONTAINER: &str = "dcd-ssh-deploy";
+/// Per test, like `ssh_shells`: several tests in one binary sharing one container
+/// name, port and image tear each other's fixtures down — and two of these kill
+/// sshd on purpose, which would take every other test's target with it.
+const IMAGE_PREFIX: &str = "dcd-ssh-deploy";
 /// Deliberately clear of `ssh_shells`' block (22322 + one per shell test): the two
 /// suites can run concurrently — `cargo test` runs one binary per test target — and
 /// a shared port makes whichever starts second fail on bind.
-const PORT: u16 = 22400;
+const BASE_PORT: u16 = 22400;
 const DEPLOY_ROOT: &str = "/srv/dcd";
 const SECRET: &str = "ssh-e2e-hunter2";
 
-/// The fixture drives the host daemon through a bind-mounted socket, so a
-/// TCP-only `DOCKER_HOST` (a dind CI service) cannot run it. Saying so out loud
-/// matters: a test that returns early reports GREEN, and this suite is the only
-/// proof the remote deploy path works at all.
 /// The fixture drives the host daemon through a bind-mounted socket, so a
 /// TCP-only `DOCKER_HOST` (a dind CI service) cannot run it. Failing loudly beats
 /// returning early: this suite is the only proof the remote deploy path works, and
@@ -94,6 +93,19 @@ fn run(program: &str, args: &[&str]) {
     );
 }
 
+/// Polls `condition` until it holds, and fails naming what never happened —
+/// a test that hangs instead reports nothing at all.
+fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) -> Duration {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if condition() {
+            return started.elapsed();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{what} did not happen within {limit:?}");
+}
+
 struct Fixture {
     project: String,
     /// The checkout dcd is invoked from — compose files live here and are uploaded.
@@ -102,12 +114,17 @@ struct Fixture {
     /// through PATH, so a shim is how the fixture key and host-key policy reach it
     /// without a dcd flag for it and without touching the developer's ~/.ssh.
     bin: PathBuf,
+    base: PathBuf,
+    container: String,
+    image: String,
+    port: u16,
 }
 
 impl Fixture {
-    fn start() -> Fixture {
-        let project = format!("dcdssh{}", std::process::id());
-        let base = std::env::temp_dir().join(&project);
+    fn start(tag: &str, port_offset: u16) -> Fixture {
+        let container = format!("{IMAGE_PREFIX}-{}-{tag}", std::process::id());
+        let project = format!("dcdssh{}{tag}", std::process::id());
+        let base = std::env::temp_dir().join(&container);
         let _ = std::fs::remove_dir_all(&base);
         let bin = base.join("bin");
         let workdir = base.join("checkout");
@@ -132,40 +149,44 @@ impl Fixture {
         std::fs::create_dir_all(&context).unwrap();
         std::fs::copy(source.join("Dockerfile"), context.join("Dockerfile")).unwrap();
         std::fs::copy(base.join("id_ed25519.pub"), context.join("authorized_key")).unwrap();
-        run("docker", &["build", "-q", "-t", IMAGE, context.to_str().unwrap()]);
+        let image = container.clone();
+        run("docker", &["build", "-q", "-t", &image, context.to_str().unwrap()]);
 
-        let _ = docker(&["rm", "-f", CONTAINER]);
+        let _ = docker(&["rm", "-f", &container]);
+        let port = BASE_PORT + port_offset;
         run(
             "docker",
             &[
                 "run",
                 "-d",
                 "--name",
-                CONTAINER,
+                &container,
                 "-p",
-                &format!("{PORT}:22"),
+                &format!("{port}:22"),
                 "-v",
                 "/var/run/docker.sock:/var/run/docker.sock",
-                IMAGE,
+                &image,
             ],
         );
 
-        let fixture = Fixture { project, workdir, bin };
+        let fixture = Fixture { project, workdir, bin, base, container, image, port };
         fixture.write_checkout();
         fixture.wait_for_sshd();
         fixture
     }
 
     /// Everything dcd needs lives in the checkout; the target gets the compose
-    /// documents uploaded to it and nothing else.
+    /// documents uploaded to it and nothing else. Hooks are appended per test —
+    /// two of these tests hook a step in order to sever the link there.
     fn write_checkout(&self) {
         let project = &self.project;
+        let port = self.port;
         std::fs::write(
             self.workdir.join("dcd.yaml"),
             format!(
                 r#"version: 2
 project: {project}
-ssh: root@127.0.0.1:{PORT}
+ssh: root@127.0.0.1:{port}
 deploy_root: {DEPLOY_ROOT}
 compose:
   files: [compose.prod.yml]
@@ -183,11 +204,6 @@ services:
   nginx:
     recreate: never
     wait: {{ exec_in: nginx, cmd: 'wget -qO- -T 2 http://localhost/ >/dev/null 2>&1 || true', retries: 20, interval: 1s }}
-hooks:
-  # IT-010: snapshot the TARGET's process list from inside the deploy, while dcd's
-  # own commands are running there. Written by dcd, over the same transport.
-  after_healthcheck:
-    - 'ps -eo args > ps-snapshot.txt'
 stages: {{ prod: {{}} }}
 "#
             ),
@@ -222,19 +238,26 @@ networks:
         std::fs::write(self.workdir.join(".env.prod"), format!("APP_SECRET={SECRET}\n")).unwrap();
     }
 
+    fn append_config(&self, block: &str) {
+        let path = self.workdir.join("dcd.yaml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(block);
+        std::fs::write(&path, config).unwrap();
+    }
+
     /// The one ssh call the test makes on its own behalf. It goes through the same
     /// shim dcd will use, so a reachable target here means a reachable target there.
     fn wait_for_sshd(&self) {
         for _ in 0..60 {
             let out = self
                 .shimmed("ssh")
-                .args(["-p", &PORT.to_string(), "root@127.0.0.1", "--", "true"])
+                .args(["-p", &self.port.to_string(), "root@127.0.0.1", "--", "true"])
                 .output()
                 .expect("ssh available");
             if out.status.success() {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(250));
         }
         panic!("sshd never became reachable");
     }
@@ -251,16 +274,29 @@ networks:
         command
     }
 
-    fn dcd(&self, args: &[&str]) -> std::process::Output {
+    fn dcd_command(&self, args: &[&str]) -> Command {
         let path = std::env::var("PATH").unwrap_or_default();
-        Command::cargo_bin("dcd")
-            .unwrap()
+        let mut command = Command::cargo_bin("dcd").unwrap();
+        command
             .current_dir(&self.workdir)
             .env("PATH", format!("{}:{path}", self.bin.display()))
             .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap()
+            .stdin(std::process::Stdio::null());
+        command
+    }
+
+    fn dcd(&self, args: &[&str]) -> std::process::Output {
+        self.dcd_command(args).output().unwrap()
+    }
+
+    /// A deploy this process keeps a handle on — the lock tests have to kill or
+    /// freeze the holder while it runs.
+    fn spawn_dcd(&self, args: &[&str]) -> Child {
+        self.dcd_command(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("dcd starts")
     }
 
     fn deploy(&self) -> std::process::Output {
@@ -279,8 +315,10 @@ networks:
         String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect()
     }
 
+    /// Runs on the target through `docker exec`, NOT ssh — the transport tests
+    /// kill sshd, and the target still has to be answerable afterwards.
     fn on_target(&self, script: &str) -> String {
-        let out = docker(&["exec", CONTAINER, "sh", "-c", script]);
+        let out = docker(&["exec", &self.container, "sh", "-c", script]);
         assert!(
             out.status.code().is_some(),
             "docker exec did not run on the target: {}",
@@ -289,12 +327,24 @@ networks:
         String::from_utf8_lossy(&out.stdout).to_string()
     }
 
+    fn exists_on_target(&self, path: &str) -> bool {
+        self.on_target(&format!("test -e {} && echo yes", shell_quote(path))).contains("yes")
+    }
+
+    /// Whether the stage lock on the TARGET is free right now, asked of the
+    /// kernel that holds it rather than of dcd.
+    fn stage_lock_is_free(&self) -> bool {
+        let lock = format!("{DEPLOY_ROOT}/.dcd.prod.lock");
+        let script = format!("flock -n {} -c true; echo $?", shell_quote(&lock));
+        self.on_target(&script).trim() == "0"
+    }
+
     /// `grep -rl` exits 1 when it finds nothing and 2 when it could not look. Only
     /// the first is a clean result — without the distinction the leak assertion
     /// passes identically when the path is absent or the exec failed.
     fn grep_on_target(&self, needle: &str, path: &str) -> Vec<String> {
         let script = format!("grep -rl -- {} {}", shell_quote(needle), shell_quote(path));
-        let out = docker(&["exec", CONTAINER, "sh", "-c", &script]);
+        let out = docker(&["exec", &self.container, "sh", "-c", &script]);
         let code = out.status.code();
         assert!(
             matches!(code, Some(0) | Some(1)),
@@ -316,19 +366,24 @@ impl Drop for Fixture {
             }
         }
         docker_quietly(&["network", "rm", &format!("{}_net", self.project)]);
-        docker_quietly(&["rm", "-f", CONTAINER]);
-        let _ = std::fs::remove_dir_all(self.workdir.parent().unwrap_or(Path::new("/nonexistent")));
+        docker_quietly(&["rm", "-f", &self.container]);
+        docker_quietly(&["image", "rm", "-f", &self.image]);
+        let _ = std::fs::remove_dir_all(&self.base);
     }
 }
 
-/// IT-009 + IT-016: two deploys over ssh against a target that has never seen dcd — the
-/// compose files travel, the release cuts over, the old one drains, and the
-/// secret that reached the container is nowhere under deploy_root.
+/// IT-009 + IT-016 + IT-010: two deploys over ssh against a target that has never seen
+/// dcd — the compose files travel, the release cuts over, the old one drains, and the
+/// secret that reached the container is nowhere under deploy_root nor in the
+/// target's process list.
 #[test]
 #[ignore = "drives real Docker over a real sshd; run with `-- --include-ignored`"]
 fn it_009_and_it_016_a_full_red_black_deploy_runs_over_ssh() {
     require_socket();
-    let fx = Fixture::start();
+    let fx = Fixture::start("deploy", 0);
+    // IT-010: snapshot the TARGET's process list from inside the deploy, while
+    // dcd's own commands are running there. Written by dcd, over the same transport.
+    fx.append_config("hooks:\n  after_healthcheck:\n    - 'ps -eo args > ps-snapshot.txt'\n");
 
     let first = fx.deploy();
     assert!(first.status.success(), "first deploy failed: {}", String::from_utf8_lossy(&first.stderr));
@@ -387,4 +442,159 @@ fn it_009_and_it_016_a_full_red_black_deploy_runs_over_ssh() {
     // And the delivery still worked — otherwise "no secret in ps" is trivially true.
     let printenv = docker(&["exec", &black[0], "printenv", "APP_SECRET"]);
     assert_eq!(String::from_utf8_lossy(&printenv.stdout).trim(), SECRET);
+}
+
+/// IT-011 (INV-4): the remote lock is a lease, not a file — nothing on the target
+/// judges whether the holder is alive, so a SIGKILLed dcd cannot leave the stage
+/// locked. The ssh channel closes with the process, the lease loop reads EOF and
+/// exits, and the kernel drops the `flock` the loop was holding. **No `unlock`.**
+#[test]
+#[ignore = "drives real Docker over a real sshd; run with `-- --include-ignored`"]
+fn it_011_a_killed_deploy_leaves_no_remote_lock_behind() {
+    require_socket();
+    let fx = Fixture::start("kill", 1);
+
+    let mut held = fx.spawn_dcd(&["deploy", "prod"]);
+    wait_until("the remote lock was taken", Duration::from_secs(30), || {
+        fx.exists_on_target(&format!("{DEPLOY_ROOT}/.dcd.prod.lock.meta"))
+    });
+    assert!(!fx.stage_lock_is_free(), "the lock must be held while the deploy runs");
+
+    held.kill().expect("the deploy can be killed");
+    let _ = held.wait();
+
+    // The channel dies with the process, so this is fast — seconds of slack, not
+    // the 30 s lease, which is the fallback for a holder that stops heartbeating.
+    let took = wait_until("the remote lock was released", Duration::from_secs(10), || {
+        fx.stage_lock_is_free()
+    });
+    assert!(took < Duration::from_secs(10));
+
+    // The proof that matters to an operator: the next deploy just runs.
+    let next = fx.deploy();
+    assert_ne!(next.status.code(), Some(3), "the stage is still locked: {}", String::from_utf8_lossy(&next.stderr));
+    assert!(next.status.success(), "the next deploy failed: {}", String::from_utf8_lossy(&next.stderr));
+    assert_eq!(fx.running("app").len(), 1);
+}
+
+/// IT-011, the other half: a holder that is still connected but has stopped
+/// heartbeating. SIGSTOP freezes dcd — its ssh child stays up and the channel
+/// stays open, so only the heartbeat is gone. The lease is what must expire.
+/// Slow by construction: `lease_seconds()` is 30.
+#[test]
+#[ignore = "drives real Docker over a real sshd and waits out a 30 s lease; run with `-- --include-ignored`"]
+fn it_011_a_frozen_holder_loses_the_lock_when_its_lease_runs_out() {
+    require_socket();
+    let fx = Fixture::start("lease", 2);
+
+    let mut held = fx.spawn_dcd(&["deploy", "prod"]);
+    wait_until("the remote lock was taken", Duration::from_secs(30), || {
+        fx.exists_on_target(&format!("{DEPLOY_ROOT}/.dcd.prod.lock.meta"))
+    });
+
+    let pid = held.id().to_string();
+    run("kill", &["-STOP", &pid]);
+    assert!(!fx.stage_lock_is_free(), "freezing the holder must not release the lock by itself");
+
+    let took = wait_until("the lease expired", Duration::from_secs(60), || fx.stage_lock_is_free());
+    assert!(
+        took >= Duration::from_secs(20),
+        "released after {took:?} — that is the channel closing, not the lease expiring"
+    );
+
+    let _ = Command::new("kill").args(["-CONT", &pid]).output();
+    let _ = held.kill();
+    let _ = held.wait();
+}
+
+/// IT-011b (INV-4): while the holder heartbeats, the stage is exclusive, and the
+/// deploy that loses says who has it — read from the `.meta` sidecar on the target.
+#[test]
+#[ignore = "drives real Docker over a real sshd; run with `-- --include-ignored`"]
+fn it_011b_a_second_deploy_is_refused_while_the_first_holds_the_stage() {
+    require_socket();
+    let fx = Fixture::start("excl", 3);
+
+    let first = fx.spawn_dcd(&["deploy", "prod"]);
+    wait_until("the remote lock was taken", Duration::from_secs(30), || {
+        fx.exists_on_target(&format!("{DEPLOY_ROOT}/.dcd.prod.lock.meta"))
+    });
+
+    let refused = fx.deploy();
+    assert_eq!(
+        refused.status.code(),
+        Some(3),
+        "expected lock-held exit 3: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(stderr.contains("another deploy holds prod"), "{stderr}");
+    // The holder line is the sidecar's, not a guess: host, pid and start time.
+    let holder = fx.on_target(&format!("cat {DEPLOY_ROOT}/.dcd.prod.lock.meta"));
+    let holder = holder.trim();
+    assert!(!holder.is_empty(), "the sidecar must name the holder");
+    assert!(stderr.contains(holder), "the refusal must quote the sidecar ({holder}): {stderr}");
+    assert!(holder.contains(&format!("pid {}", first.id())), "the sidecar names another process: {holder}");
+
+    let out = first.wait_with_output().expect("the first deploy finishes");
+    assert!(out.status.success(), "the holder failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fx.running("app").len(), 1, "the deploy that held the lock is the one that ran");
+}
+
+/// IT-012a: the link dies BEFORE the cutover. Exit 6 (transport), and the red is
+/// still serving — dcd must not have half-cut-over, and must not report the loss
+/// as an application failure.
+#[test]
+#[ignore = "drives real Docker over a real sshd; run with `-- --include-ignored`"]
+fn it_012a_transport_loss_before_the_cutover_exits_6_and_leaves_red_serving() {
+    require_socket();
+    let fx = Fixture::start("lost", 4);
+
+    assert!(fx.deploy().status.success(), "the first deploy must establish a red");
+    let red = fx.running("app");
+    assert_eq!(red.len(), 1, "expected one app container, got {red:?}");
+    let red = red[0].clone();
+
+    // The hook runs on the target, over the transport it is about to sever.
+    fx.append_config("hooks:\n  before_pull:\n    - 'pkill sshd'\n");
+    let lost = fx.deploy();
+    let stderr = String::from_utf8_lossy(&lost.stderr).to_string();
+    assert_eq!(lost.status.code(), Some(6), "expected transport exit 6: {stderr}");
+    assert!(
+        stderr.contains("connection to") && stderr.contains("lost"),
+        "the failure must name the lost connection: {stderr}"
+    );
+
+    // INV-1: the red is untouched and still the release of record.
+    assert_eq!(fx.running("app"), vec![red.clone()], "red must still be serving");
+    let state = fx.on_target(&format!("cat {DEPLOY_ROOT}/dcd-state.json"));
+    assert!(state.contains(&format!("\"current\": \"{red}\"")), "current must still name red: {state}");
+    assert!(!state.contains("cutover_pending"), "nothing may be pending before the cutover: {state}");
+}
+
+/// IT-012b: the same loss AFTER the cutover. The phase wins over the transport —
+/// exit 4, not 6 — because the black is live and the operator's next move is
+/// `--resume`/`rollback`/`unlock`, not "check the network".
+#[test]
+#[ignore = "drives real Docker over a real sshd; run with `-- --include-ignored`"]
+fn it_012b_transport_loss_after_the_cutover_exits_4_with_the_black_live() {
+    require_socket();
+    let fx = Fixture::start("lostpost", 5);
+
+    assert!(fx.deploy().status.success(), "the first deploy must establish a red");
+    let red = fx.running("app")[0].clone();
+
+    fx.append_config("hooks:\n  before_migrate_after:\n    - 'pkill sshd'\n");
+    let lost = fx.deploy();
+    let stderr = String::from_utf8_lossy(&lost.stderr).to_string();
+    assert_eq!(lost.status.code(), Some(4), "expected post-cutover exit 4: {stderr}");
+
+    let live = fx.running("app");
+    assert_eq!(live.len(), 1, "the black must be live, got {live:?}");
+    assert_ne!(live[0], red, "the cutover had already happened");
+
+    // The record written before the link dropped is the one `--resume` reads.
+    let state = fx.on_target(&format!("cat {DEPLOY_ROOT}/dcd-state.json"));
+    assert!(state.contains("cutover_pending"), "the incomplete release must be recorded: {state}");
+    assert!(state.contains(&live[0]), "the pending release must be the live black: {state}");
 }
