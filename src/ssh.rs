@@ -37,6 +37,15 @@ impl SshTarget {
         &self.target
     }
 
+    /// ssh reads the destination as a positional argument, so a target beginning
+    /// with `-` is swallowed by its option parser instead — and `-oProxyCommand=…`
+    /// runs a command on the **deploying** machine, before any name is resolved.
+    /// The `--` in `invocation()` does not help: it ends option parsing after the
+    /// destination, not before it.
+    pub fn is_option_like_destination(target: &str) -> bool {
+        target.starts_with('-')
+    }
+
     pub fn get_connect_timeout_seconds() -> u64 {
         10
     }

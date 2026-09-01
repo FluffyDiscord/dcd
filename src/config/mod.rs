@@ -791,6 +791,7 @@ fn validate(config: &Config) -> Result<()> {
         )));
     }
 
+    validate_ssh_target(config)?;
     validate_release_shape(config)?;
     validate_health_gate(config)?;
     validate_worker_rules(config)?;
@@ -856,6 +857,24 @@ fn collect_placeholders(value: &serde_norway::Value, path: String, unfilled: &mu
         }
         _ => {}
     }
+}
+
+/// `ssh:` lands in the argv as ssh's positional destination, so a value starting
+/// with `-` is read as an option instead of a host. `-oProxyCommand=…` is then run
+/// by the local shell on the deploying machine, with the deploy user's agent and
+/// credentials — local command execution out of a data-domain field. Refused here,
+/// with the whole config, rather than at the first connection.
+fn validate_ssh_target(config: &Config) -> Result<()> {
+    let Some(target) = &config.ssh else {
+        return Ok(());
+    };
+    if crate::ssh::SshTarget::is_option_like_destination(target) {
+        return Err(DcdError::Config(format!(
+            "ssh target '{target}' starts with '-': ssh reads it as an option, not a host, and an \
+             option like -oProxyCommand= runs on the deploying machine"
+        )));
+    }
+    Ok(())
 }
 
 /// The release comes from a compose service or from `run`, never both: two
