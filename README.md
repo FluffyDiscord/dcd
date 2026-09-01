@@ -182,20 +182,26 @@ copied into the **CI image that runs the deploy** (dcd runs there, not on the se
 COPY --from=ghcr.io/fluffydiscord/dcd:0.5.3 /usr/local/bin/dcd /usr/local/bin/dcd
 ```
 
-**Every tag is immutable and names one exact version — no `latest`, no `edge`, no `0.5`.** A
-moving tag can only ever downgrade you by surprise, so none is published; pin the version and
-change it deliberately.
+**A version tag is immutable and names one exact release. Pin it.** No `0.5` tag is published —
+a partial-version tag can only ever move you onto a build you did not choose.
 
 | Tag | What it points at |
 |-----|-------------------|
 | `0.5.3` | Debian-slim, the release `v0.5.3` |
 | `0.5.3-alpine` | Alpine, the same release |
+| `latest` | Debian-slim, the current tip of `master` |
+| `latest-alpine` | Alpine, the same build |
 
 Tag a release to publish one:
 
 ```bash
 git tag v0.5.3 && git push origin v0.5.3
 ```
+
+> **`latest` is not a release — do not deploy it.** It is rebuilt on every push to `master`, so
+> it is whatever the branch happens to be: untagged, unreleased, and moving under you between
+> two CI runs of the same pipeline. It exists to try the newest work, nothing more. A version
+> tag is the real release; prefer it everywhere, and in production use nothing else.
 
 ## Build & test
 

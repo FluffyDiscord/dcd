@@ -59,6 +59,14 @@ While a stage has no v2 release recorded, `preflight` removes every container un
 `workers.name_prefix` whose compose service label is not `workers.service`, naming each one.
 Once a stage has a recorded release, its live workers are never swept.
 
+### `latest` is back, as a branch tag
+
+`ghcr.io/fluffydiscord/dcd:latest` (and `latest-alpine`) is rebuilt on every push to `master`.
+It is the tip of the branch, not a release: untagged, unreleased, and free to move between two
+runs of the same pipeline. Use it to try unreleased work; never deploy it. A version tag is the
+release, and production pins one. Pushing a version tag can no longer repoint `latest` — the
+workflow emits it for a default-branch push alone, so the 0.5.2 downgrade cannot recur.
+
 ## 0.5.1 → 0.5.3
 
 Bug fix, no configuration change. Retention converges instead of repeating itself.
@@ -67,11 +75,12 @@ Bug fix, no configuration change. Retention converges instead of repeating itsel
 published moving tags. Its images are deleted. Use 0.5.3.
 
 - No moving tags. `latest`, `latest-alpine`, `edge`, `edge-alpine` and the
-  `{{major}}.{{minor}}` tags are gone from the registry and can no longer be produced: the
-  publish workflow sets `latest=false`, emits only `{{version}}`, and runs on tag pushes
-  alone. `latest` marked whichever non-prerelease semver built last rather than the newest,
-  so pushing an old tag silently downgraded every consumer. Pin an exact version —
-  `ghcr.io/fluffydiscord/dcd:0.5.3`
+  `{{major}}.{{minor}}` tags are gone from the registry: the publish workflow sets
+  `latest=false`, emits only `{{version}}`, and runs on tag pushes alone. `latest` marked
+  whichever non-prerelease semver built last rather than the newest, so pushing an old tag
+  silently downgraded every consumer. Pin an exact version —
+  `ghcr.io/fluffydiscord/dcd:0.5.3`. (v2 brings `latest` back on different terms — see the v2
+  notes above.)
 - Evicting a release removed its container and image but never marked the release row done,
   so `evictions`/`gc_candidates` re-derived the same long-dead work from `releases[]` on
   **every** later deploy. `docker rm -f` answers `0` for a container that is already gone and
