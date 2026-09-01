@@ -241,6 +241,20 @@ fn directory_paths_may_not_escape_deploy_root() {
     }
 }
 
+/// ssh takes the destination positionally, so a leading `-` makes it an option:
+/// `-oProxyCommand=` then runs on the deploying machine, not the target.
+#[test]
+fn an_ssh_target_that_looks_like_an_option_is_rejected() {
+    for target in ["-oProxyCommand=touch /tmp/pwned", "-F/tmp/evil"] {
+        let bad = sample().replace("ssh: deploy@demo.host\n", &format!("ssh: '{target}'\n"));
+        let err = load(&bad, Some("prod"), &[], &env()).unwrap_err().to_string();
+        assert!(err.contains("starts with '-'"), "for {target} got: {err}");
+    }
+
+    let good = load(sample(), Some("prod"), &[], &env()).unwrap();
+    assert_eq!(good.ssh.as_deref(), Some("deploy@demo.host"));
+}
+
 #[test]
 fn healthcheck_without_container_placeholder_is_rejected() {
     let bad = sample().replace("http://{container}:2114/health", "http://app-rr:2114/health");
