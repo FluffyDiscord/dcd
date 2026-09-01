@@ -246,13 +246,28 @@ fn dispatch(cli: Cli) -> Result<()> {
     // unmultiplexed connection, so the length is checked before any connection is
     // attempted.
     if let Some(target) = ssh_target(&cfg, &cli) {
+        require_option_free_destination(&target)?;
         require_control_path_fits(&target)?;
     }
     dispatch_command(&cfg, &cli, &reporter, &resolved, chain_base.as_deref(), config_dir)
 }
 
+/// `ssh:` is already refused by config validation; `--ssh` never passes through it,
+/// and it lands in the same positional slot, where a leading `-` turns the target
+/// into an ssh option that runs on the deploying machine.
+fn require_option_free_destination(target: &SshTarget) -> Result<()> {
+    if !SshTarget::is_option_like_destination(target.target()) {
+        return Ok(());
+    }
+    Err(DcdError::Config(format!(
+        "--ssh '{}' starts with '-': ssh reads it as an option, not a host, and an option like \
+         -oProxyCommand= runs on the deploying machine",
+        target.target()
+    )))
+}
+
 fn require_control_path_fits(target: &SshTarget) -> Result<()> {
-    prepare_control_directory()?;
+    prepare_private_directory()?;
     if target.control_path_fits() {
         return Ok(());
     }
@@ -597,30 +612,45 @@ fn ssh_target(cfg: &Config, cli: &Cli) -> Option<SshTarget> {
 
 /// dcd picks the multiplexing socket itself, and keeps it short: over ~107 bytes
 /// ssh fails outright rather than degrading to an unmultiplexed connection.
-/// The multiplexing socket's home (spec §2.7). `$XDG_RUNTIME_DIR` is already
-/// per-user and `0700`; its usual absence in CI must not land in a shared `/tmp`,
-/// where the filename is derivable from the target and the directory may already
-/// belong to someone else. `prepare_control_directory` is what enforces that.
 fn control_path() -> PathBuf {
-    control_directory().join("cm-%C")
+    private_directory().join("cm-%C")
 }
 
-fn control_directory() -> PathBuf {
+/// Everything dcd generates for itself — the mux socket (spec §2.7) and the
+/// rendered `release.run` document — lives here, and nowhere a second user can
+/// reach. `$XDG_RUNTIME_DIR` is already per-user and `0700`; its usual absence in
+/// CI must not land in a shared `/tmp`, where every name dcd writes is derivable
+/// from the project and the stage. `prepare_private_directory` is what enforces that.
+fn private_directory() -> PathBuf {
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime).join("dcd");
     }
     match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home).join(".dcd/cm"),
+        Ok(home) => PathBuf::from(home).join(".dcd"),
         Err(_) => std::env::temp_dir().join("dcd"),
     }
 }
 
-/// Created and locked to `0700` before any connection: a mux socket in a
-/// directory someone else can write is a socket dcd may be talked into using.
-fn prepare_control_directory() -> Result<()> {
-    let dir = control_directory();
+/// Created and locked to `0700` before anything is written into it: a mux socket in
+/// a directory someone else can write is a socket dcd may be talked into using, and
+/// a compose document someone else can write is a container they choose, started on
+/// the target. The symlink check is what makes the `/tmp` fallback safe — without
+/// it, a pre-planted `/tmp/dcd -> ~victim/.ssh` is followed by both the `chmod` and
+/// every write that follows.
+fn prepare_private_directory() -> Result<()> {
+    let dir = private_directory();
     std::fs::create_dir_all(&dir)
         .map_err(|e| DcdError::Config(format!("cannot create {}: {e}", dir.display())))?;
+
+    let entry = std::fs::symlink_metadata(&dir)
+        .map_err(|e| DcdError::Config(format!("cannot inspect {}: {e}", dir.display())))?;
+    if !entry.is_dir() {
+        return Err(DcdError::Config(format!(
+            "{} is a symlink, not a directory: dcd writes its own files there and will not follow it",
+            dir.display()
+        )));
+    }
+
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| DcdError::Config(format!("cannot make {} private: {e}", dir.display())))
@@ -931,10 +961,17 @@ fn host_check(expected: Option<&str>, actual: &str, stage: &str) -> Result<()> {
 /// release is indistinguishable from a declared service — it resolves in the
 /// model, uploads with `sync`, pulls, and is created by `compose run`.
 ///
-/// It lands in the system temp dir, not the checkout. `docker compose config` must
-/// be able to read it, so it has to exist before `check` and `--dry-run` resolve
+/// It lands in dcd's own private directory, not the checkout. `docker compose config`
+/// must be able to read it, so it has to exist before `check` and `--dry-run` resolve
 /// the model — but those two are documented as having no side effects, and writing
 /// a generated, untracked file into the operator's repository is one.
+///
+/// Not a shared `/tmp`: the name is `{project}-dcd-release-run.{stage}.yml`, which
+/// anyone sharing the machine can derive and pre-create — as a symlink dcd's write
+/// would follow, or as a file they keep owning and rewrite before `sync` uploads it
+/// to the target and `compose` starts what it describes. `prepare_private_directory`
+/// is the whole defence: inside a `0700` directory dcd owns, nobody else can plant
+/// the name in the first place.
 fn materialise_release_run(cfg: &mut Config) -> Result<()> {
     let Some(run) = cfg.release.run.clone() else {
         return Ok(());
@@ -942,7 +979,8 @@ fn materialise_release_run(cfg: &mut Config) -> Result<()> {
     let service = cfg.release.service_name(&cfg.project);
     let document = compose::render_run_document(&service, &run);
     let name = format!("dcd-release-run.{}.yml", cfg.stage);
-    let path = std::env::temp_dir().join(format!("{}-{name}", cfg.project));
+    prepare_private_directory()?;
+    let path = private_directory().join(format!("{}-{name}", cfg.project));
     std::fs::write(&path, document)
         .map_err(|e| DcdError::Config(format!("cannot write {}: {e}", path.display())))?;
 
@@ -1276,7 +1314,8 @@ stages:
     host: prod.example.internal   # dcd refuses to run if the TARGET reports another name
 "#;
 
-const PLUGIN_STUB: &str = r#"-- Plugins (loaded at startup) register tasks and hooks.
+const PLUGIN_STUB: &str = r#"-- Plugins register tasks and hooks. They are read and run on the
+-- deploying machine, resolved against this config file's directory, and never uploaded.
 --
 -- Adjust the config before the deploy, based on runtime truths. cfg is mutable: just
 -- assign to it — the change flows back into the deploy (no helper function):
@@ -1320,6 +1359,40 @@ mod tests {
         assert!(err.to_string().contains("corrupt state"), "got: {err}");
     }
     use super::*;
+
+    /// The generated compose document is read back by `docker compose config`, then
+    /// uploaded and started on the target — so wherever it lands, a second user on
+    /// the deploying machine must not be able to pre-create that name as a symlink
+    /// to follow or as a file of their own to rewrite. A `0700` directory dcd owns
+    /// is the answer; a shared `/tmp` is not.
+    #[test]
+    fn the_generated_release_run_document_lands_in_a_private_directory() {
+        let source = r#"
+version: 2
+project: demo
+deploy_root: /srv/demo
+compose:
+  files: [docker-compose.yml]
+release:
+  run: { image: demo/app:1 }
+  healthcheck: { exec_in: router, cmd: 'curl -sf http://{container}:80/up' }
+cutover: { service: router, backend_port: 80, reload: { exec_in: router, cmd: 'nginx -s reload' } }
+"#;
+        let empty_env = std::collections::HashMap::new();
+        let mut cfg = config::load(source, None, &[], &empty_env).expect("a run-based config");
+        materialise_release_run(&mut cfg).expect("the document is rendered");
+
+        let path = cfg.compose.generated_source.expect("run: renders a document");
+        let directory = path.parent().expect("the document has a home");
+        assert_eq!(directory, private_directory(), "the document must not land in a shared directory");
+        assert_ne!(directory, std::env::temp_dir(), "a bare temp dir is world-writable");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(directory).expect("the directory exists").permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{} is reachable by another user: mode {mode:o}", directory.display());
+
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn host_check_guards_mismatch_only() {
