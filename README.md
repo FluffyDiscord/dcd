@@ -4,13 +4,12 @@ Zero-downtime **red-black** Docker deploys from a YAML file. One static binary t
 **your** machine — a CI runner or a laptop — and drives the target over SSH. Nothing is
 installed on the server.
 
-It creates the new ("black") container from your compose service next to the live ("red")
-one, waits for its health gate, flips the router to it, and drains the old one — without
-dropping a request.
+It creates the new ("black") container from your compose service next to the live ("red") one,
+waits for its health gate, flips the router to it, and drains the old one — without dropping a
+request.
 
-**Your compose file declares the containers; `dcd.yaml` declares the orchestration.**
-Images, env, volumes, restart policies and network aliases stay where you already write
-them.
+**Your compose file declares the containers; `dcd.yaml` declares the orchestration.** Images,
+env, volumes, restart policies and network aliases stay where you already write them.
 
 ## Quickstart
 
@@ -46,17 +45,17 @@ Global flags: `--config <path>` · `--ssh <target>` · `--env-dir <path>` · `--
 `--set path=value` (repeatable) · `--yes` · `--reason <text>` · `-v/--verbose` · `-V/--version`.
 
 Env comes from a Symfony-style dotenv chain next to `dcd.yaml` (`.env` → `.env.local` →
-`.env.<stage>` → `.env.<stage>.local`, real env wins); every chain-defined key reaches the
-containers as a bare `-e KEY`, with the values riding a document on ssh **stdin** — so no
-value ever appears in an argv on either machine, and dcd writes no env file anywhere.
-`--env-file .env.deploy` rebases the whole chain onto another base name
-(`.env.deploy` → `.env.deploy.local` → `.env.deploy.<stage>` → `.env.deploy.<stage>.local`),
-so dcd's chain can live beside the app's own `.env` files without colliding.
+`.env.<stage>` → `.env.<stage>.local`, real env wins). Every chain-defined key reaches the
+containers as a bare `-e KEY`, values riding a document on ssh **stdin** — no value ever
+appears in an argv on either machine, and dcd writes no env file anywhere. `--env-file
+.env.deploy` rebases the whole chain onto another base name (`.env.deploy` →
+`.env.deploy.local` → `.env.deploy.<stage>` → `.env.deploy.<stage>.local`), so dcd's chain can
+live beside the app's own `.env` files without colliding.
 
 ## When a deploy gets stuck
 
-A deploy that dies **after** the cutover leaves the new container live and the release
-recorded as incomplete; `dcd deploy` then refuses (exit 4) until you pick a way out:
+A deploy that dies **after** the cutover leaves the new container live and the release recorded
+as incomplete. `dcd deploy` then refuses (exit 4) until you pick a way out:
 
 ```bash
 dcd status prod                # what is live, what is incomplete
@@ -65,20 +64,21 @@ dcd rollback prod              # go back to the previous release instead
 dcd unlock prod                # accept what is live as done, and clear the lock
 ```
 
-`unlock` is the last resort — for when resuming keeps failing, or a killed deploy left the
-stage locked. It marks the incomplete release active and current, and removes the stage
-lock **even while another dcd holds it**. That is all it does: no containers are started,
-stopped, or removed, no migrations run, no workers are recreated, and no hooks fire — so
-nothing that already failed can block it. It warns about each leftover by name, and the
-next `dcd deploy` runs fresh and cleans them up. With nothing incomplete it only clears
-the lock.
+`unlock` is the last resort — resuming keeps failing, or a killed deploy left the stage locked.
+It marks the incomplete release active and current, and removes the stage lock **even while
+another dcd holds it**. That is all it does:
+
+- No containers started, stopped or removed. No migrations. No workers recreated. No hooks fire
+  — so nothing that already failed can block it.
+- It warns about each leftover by name; the next `dcd deploy` runs fresh and cleans them up.
+- With nothing incomplete, it only clears the lock.
 
 ## dcd.yaml
 
 Drives the orchestration — which service is cut over to, how traffic switches, migrations,
-drain, worker discovery, recreate policy, retention, and simple `hooks`. Containers
-themselves are declared in your compose file. The **common case needs no Lua**.
-See the fully-worked [example](docs/examples/roadrunner_app/) — config *and* its compose file.
+drain, worker discovery, recreate policy, retention, and simple `hooks`. Containers themselves
+are declared in your compose file. The **common case needs no Lua**. See the fully-worked
+[example](docs/examples/roadrunner_app/) — config *and* its compose file.
 
 ## Lua plugins
 
@@ -96,14 +96,14 @@ registers tasks/hooks at the top level; each hook gets a `ctx`.
 | `set(k, v)` / `get(k)` | scratch vars (same store as `ctx.set/get`) |
 | `cfg` / `state` | the live config / deploy state — **mutable**, same tables as `ctx.cfg`/`ctx.state` |
 
-Hook steps you can target with `before_`/`after_`:
+Hook steps for `before_`/`after_`:
 `sync` · `preflight` · `ensure_upstream` · `pull` · `infra` · `migrate:before` · `start:black` ·
 `healthcheck` · `cutover` · `drain:red` · `migrate:after` · `workers` · `finalize`
 (plus the special `configure`).
 
 ### `ctx` — effects
 
-Routed through the engine, so they're **dry-run-safe** (and observable in `--dry-run`).
+Routed through the engine, so they are **dry-run-safe** (and observable in `--dry-run`).
 
 | Call | Returns | Does |
 |------|---------|------|
@@ -131,10 +131,11 @@ Routed through the engine, so they're **dry-run-safe** (and observable in `--dry
 
 ### `ctx` — data
 
-`cfg` and `state` are **live**: assign to them with plain Lua (`ctx.cfg.retention.keep_releases = 5`)
-and the engine reads the change back before the next step — there is no setter function. The
-deploy then honors it: config for steps not yet run, state for what gets persisted. (Structural
-fields fixed at deploy start — `images`, the container name, `deploy_root` — are snapshots.)
+`cfg` and `state` are **live**: assign with plain Lua
+(`ctx.cfg.retention.keep_releases = 5`) and the engine reads the change back before the next
+step — there is no setter function. Config applies to steps not yet run; state to what gets
+persisted. Structural fields fixed at deploy start (`images`, the container name,
+`deploy_root`) are snapshots.
 
 | Field | Is | Mutable |
 |-------|-----|---------|
@@ -145,12 +146,11 @@ fields fixed at deploy start — `images`, the container name, `deploy_root` —
 | `ctx.container` | the new (black) container name | no |
 | `ctx.stage` | the stage, e.g. `'prod'` | no |
 
-> `ctx.state` is full power: you can rewrite `releases`/`current`/`status`. That also means you
-> can break rollback/resume (≤1 `cutover_pending`, etc.) — the engine trusts what you write.
+> `ctx.state` is full power: you can rewrite `releases`/`current`/`status`, and you can
+> break rollback/resume (≤1 `cutover_pending`, etc.) — the engine trusts what you write.
 
-> Raw `os.execute` / `io.open` / `io.popen` are sandboxed out — use `ctx.run(...)` so the
-> action shows up in `--dry-run`. `ctx.run('jq …')`,
-> `ctx.run('bash script.sh')`, etc. are all fair game.
+> Raw `os.execute` / `io.open` / `io.popen` are sandboxed out — use `ctx.run(...)` so the action
+> shows up in `--dry-run`. `ctx.run('jq …')`, `ctx.run('bash script.sh')` are fair game.
 
 ### Examples
 
@@ -182,9 +182,9 @@ copied into the **CI image that runs the deploy** (dcd runs there, not on the se
 COPY --from=ghcr.io/fluffydiscord/dcd:0.5.3 /usr/local/bin/dcd /usr/local/bin/dcd
 ```
 
-**Every tag is immutable and names one exact version — there is no `latest`, no `edge`, and
-no `0.5`.** A moving tag can only ever downgrade you by surprise, so none is published; pin
-the version you want and change it deliberately.
+**Every tag is immutable and names one exact version — no `latest`, no `edge`, no `0.5`.** A
+moving tag can only ever downgrade you by surprise, so none is published; pin the version and
+change it deliberately.
 
 | Tag | What it points at |
 |-----|-------------------|

@@ -1,12 +1,12 @@
 # A PHP-FPM app deployed red-black with `dcd`
 
 A production-shaped example: a **Symfony app whose release image is nginx + php-fpm under
-supervisord** (HTTP on `:8080`), deployed zero-downtime with [`dcd`](../../..) across two stages
-(`prod` + `beta`) on a single host.
+supervisord** (HTTP on `:8080`), deployed zero-downtime with [`dcd`](../../..) across two
+stages (`prod` + `beta`) on a single host.
 
-Where some apps **are** the HTTP server (RoadRunner, FrankenPHP), here the app is a classic FPM
-stack: nginx terminates HTTP inside the container and speaks FastCGI to php-fpm. The dcd wiring is
-the same either way — that's the point. dcd cuts over an HTTP port; what serves it is up to the image.
+Where some apps **are** the HTTP server (RoadRunner, FrankenPHP), here nginx terminates HTTP
+inside the container and speaks FastCGI to php-fpm. The dcd wiring is identical either way:
+dcd cuts over an HTTP port; what serves it is up to the image.
 
 ## The shape
 
@@ -18,9 +18,9 @@ the same either way — that's the point. dcd cuts over an HTTP port; what serve
                                                     webapp-scheduler        (side containers)
 ```
 
-dcd builds `webapp-app-<new-release>` beside the live one, health-checks it **through** the router
-(`curl http://{container}:8080/health`), then rewrites the router's upstream file and reloads nginx —
-the flip is atomic and the old container drains gracefully.
+dcd builds `webapp-app-<new-release>` beside the live one, health-checks it **through** the
+router (`curl http://{container}:8080/health`), then rewrites the router's upstream file and
+reloads nginx. The flip is atomic; the old container drains gracefully.
 
 ## Files
 
@@ -42,11 +42,10 @@ app-image/                REFERENCE (lives in the app repo, baked into the image
 ```
 
 `dcd.yaml` and the compose files live in the **repo**; dcd uploads them to `$DEPLOY_ROOT` at
-the start of every deploy, so nothing is rsynced by hand. The `.env.deploy.*` files are the
-exception — compose reads them by relative path, and dcd uploads the compose *documents* and
-nothing they reference, so those stay operator-managed on the server (`dcd check` warns,
-naming each such path). `app-image/` is shown only so the release side of the picture is
-complete.
+the start of every deploy. The `.env.deploy.*` files are the exception — compose reads them by
+relative path, and dcd uploads the compose *documents* and nothing they reference, so those
+stay operator-managed on the server (`dcd check` warns, naming each such path). `app-image/`
+is shown only to complete the release side of the picture.
 
 ## Why FPM changes almost nothing
 
@@ -58,12 +57,12 @@ complete.
 | DB migrations | `release.migrate.before` runs `doctrine:migrations:migrate` on the new release before cutover |
 | Periodic jobs | a `scheduler` side container loops `schedule:run`, gated per-stage by `SCHEDULER_ENABLED` |
 
-There are **no messenger workers** in this example. If you add them later, the `workers:` block
-stays global so every stage consumes.
+No messenger workers here. Add them later and the `workers:` block stays global, so every
+stage consumes.
 
 ## Two stages, one config
 
-`prod` and `beta` share this one `dcd.yaml`, namespaced by a **pinned** `project` per stage:
+`prod` and `beta` share one `dcd.yaml`, namespaced by a **pinned** `project` per stage:
 
 | | `prod` | `beta` |
 |---|---|---|
@@ -73,11 +72,11 @@ stays global so every stage consumes.
 | router port (loopback) | `8080` | `8081` |
 | extras | scheduler runs (`SCHEDULER_ENABLED=1`) | + mailpit sink, + loopback DB port |
 
-`project` is pinned (not derived from the `deploy_root` folder name) so the two stages coexist on one
-host regardless of their paths — and a folder name with a dot in it (which Compose v2 rejects as a
-project name) can never leak in. Every container name, the network, and `COMPOSE_PROJECT_NAME` come
-from `{project}` — see how `dcd.yaml` uses `'{project}-app'` for the container prefix, and how
-the compose file uses `${COMPOSE_PROJECT_NAME}` for each `container_name`.
+`project` is pinned rather than derived from the `deploy_root` folder name, so the two stages
+coexist on one host regardless of their paths — and a folder name with a dot in it (which
+Compose v2 rejects as a project name) can never leak in. Every container name, the network and
+`COMPOSE_PROJECT_NAME` come from `{project}`: see `'{project}-app'` as the container prefix in
+`dcd.yaml`, and `${COMPOSE_PROJECT_NAME}` per `container_name` in the compose file.
 
 ## One-time bootstrap (per stage)
 
@@ -101,15 +100,15 @@ chown -R 1000:1000 data/uploads data/private data/log
 # 4. Wire the system nginx: adapt host-nginx.example.conf (set X-Forwarded-Proto $scheme!), enable, reload.
 ```
 
-dcd generates `nginx-upstream.conf` itself — do not hand-edit it. The network is declared in the
-compose file and created by `compose up`; dcd only inspects it, to fail early with a clear error.
-Compose gets its variables via the process environment, from the resolved dotenv chain.
+dcd generates `nginx-upstream.conf` itself — do not hand-edit it. The network is declared in
+the compose file and created by `compose up`; dcd only inspects it, to fail early with a clear
+error. Compose gets its variables via the process environment, from the resolved dotenv chain.
 
 Alternative to step 2's at-rest files: keep app secrets in a `.env.prod.local` next to
-`dcd.yaml` — or stream them with `--env-stdin` — and dcd delivers them to the app, migrate and
+`dcd.yaml`, or stream them with `--env-stdin`. dcd then delivers them to the app, migrate and
 worker containers as bare `-e KEY` with the values riding ssh stdin, writing nothing to the
-server. The infra side containers here still use their compose `env_file:`, which is why those
-two files remain operator-managed on the target.
+server. The infra side containers still use their compose `env_file:`, which is why those two
+files remain operator-managed on the target.
 
 ## Operating it
 
@@ -122,7 +121,7 @@ dcd rollback prod --yes        # re-point to the previous release (runs NO migra
 dcd deploy prod --resume       # finish a deploy that died after cutover
 ```
 
-CI runs the deploy; manually it is:
+CI runs the deploy; by hand it is:
 
 ```sh
 cd path/to/this/checkout          # where dcd.yaml and the compose files live
@@ -130,9 +129,9 @@ REGISTRY=<registry-image> DEPLOY_ROOT=/srv/app DEPLOY_SSH=deploy@host \
   dcd deploy prod --image app=<tag>
 ```
 
-Run it from the **checkout**, not from `$DEPLOY_ROOT`: under v2 dcd runs on the
-deploying machine and reaches the target over ssh, so `dcd.yaml` and the compose
-files are read here and `DEPLOY_ROOT` names a path over there.
+Run it from the **checkout**, not from `$DEPLOY_ROOT`: dcd runs on the deploying machine and
+reaches the target over ssh, so `dcd.yaml` and the compose files are read here while
+`DEPLOY_ROOT` names a path over there.
 
-`REGISTRY` and `DEPLOY_ROOT` are read from the environment (CI sets them per job), so they aren't
+`REGISTRY` and `DEPLOY_ROOT` come from the environment (CI sets them per job), so they are not
 repeated in `dcd.yaml`. `--image app=<tag>` threads in the tag the build stage produced.
