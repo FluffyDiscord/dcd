@@ -3,11 +3,11 @@
 **v2 revision 2026-08-25.** dcd runs on the **deploying machine** and reaches the target over SSH (ADR-001 v2, ADR-014); **compose owns container definition** and dcd owns orchestration policy (ADR-013). v1 configs are not accepted — there is no migration path, by explicit decision.
 
 **Document type:** Implementation
-**Status:** v1 specified 2026-06-11 and **implemented**, including the §5.2 environment rework (specified 2026-07-28, shipped in 0.5.x — `src/dotenv/` exists and is wired at `src/cli.rs`). **v2 — SSH transport + compose-owned containers, this revision, 2026-08-25: specified, NOT implemented.**
+**Status:** v1 specified 2026-06-11 and **implemented**, including the §5.2 environment rework (specified 2026-07-28, shipped in 0.5.x). **v2 — SSH transport + compose-owned containers — specified 2026-08-25 and implemented**: `src/ssh.rs`, `SshRunner`/`SshFs`, the compose model in `src/compose.rs`, and the v2 schema in `src/config/` are all in the tree, and all three example configs pass `dcd check`.
 **Source:** reverse-engineered from an existing production red-black deploy script, its CI deploy stage, and the compose file for the managed side services.
 **Strategy & rationale:** [Strategic Blueprint](strategic-blueprint.md)
 
-`dcd` is a single static Rust binary that runs a zero-downtime **red-black** Docker deploy on the target server from a YAML config, extensible via sandboxed embedded-Lua plugins. Strategy/scope/7-Questions live in the Blueprint; this is the buildable HOW. The exact-argv discipline in §7 exists so code generation is mechanical and unit tests assert the precise `docker …` commands.
+`dcd` is a single static Rust binary running a zero-downtime **red-black** Docker deploy from a YAML config, extensible via sandboxed embedded-Lua plugins. Strategy/scope/7Q live in the Blueprint; this is the buildable HOW. §7's exact-argv discipline makes code generation mechanical and lets unit tests assert the precise `docker …` commands.
 
 ---
 
@@ -61,12 +61,14 @@ parse args ─▶ load+merge config ─▶ resolve stage ─▶ open ssh master 
    ─▶ report   (the ssh master is left to `ControlPersist`; see §2.7)
 ```
 
-**Where each thing runs.** The engine, the config, the state machine, the dotenv
-chain, the Lua host and all failure handling run on the **deploying machine**.
-Only `docker`/`docker compose`/`hostname` invocations and the handful of file
-operations dcd owns cross the wire. Lua plugins are read and executed locally —
-nothing on the target ever reads a `.lua` file — so `plugins:` resolves against
-the **config file's directory**, not `deploy_root`.
+**Where each thing runs.**
+
+- **Deploying machine:** the engine, the config, the state machine, the dotenv chain, the Lua
+  host, all failure handling.
+- **Across the wire:** `docker`/`docker compose`/`hostname` invocations and the handful of file
+  operations dcd owns. Nothing else.
+- Lua plugins are read and executed locally — nothing on the target ever reads a `.lua` file —
+  so `plugins:` resolves against the **config file's directory**, not `deploy_root`.
 
 ### 2.2 Modules
 
@@ -140,9 +142,18 @@ The dynamic worker provider (`exec` in black) is `Mutate`-adjacent: in dry-run t
   The lease loop and the `.meta` sidecar are written by the **one** target-write builder (`ssh::write_file_script`), which embeds the payload as base64 inside the script. Nothing may be appended to a script for the remote `sh` to `cat` off its own stdin: sh buffers the whole stream, so the file lands **empty** — an empty lease script exits 0 without ever taking the lock, and every deploy then reads that as "the stage is held". That defect shipped and was caught by IT-009, not by any unit test.
 
   dcd writes a heartbeat line every `getLockHeartbeatSeconds()=10` on that channel's stdin, and a sibling `.dcd.{stage}.lock.meta` records host, pid and ISO start for the human message. **Both death modes are now covered by IT-011** against a real sshd: `SIGKILL` closes the channel and the lock is free within seconds (EOF, not the lease — first measured at 51 ms), while `SIGSTOP` keeps the channel open and withholds heartbeats, and the lock goes free only after the 30 s lease — asserted as *at least* 20 s, so a channel that merely closed cannot pass for a lease that expired. IT-011b covers the third state: while heartbeating, a competing deploy exits 3.
-- **Why this and not the alternatives.** An atomic `mkdir` mutex is exclusive but *inert*: nothing on the target ever releases it, so a killed dcd leaves it forever and recovery becomes a human judgment about a pid on another machine — which is unknowable, and which turns every "is it stale?" into a race between an operator and a slow-but-alive deploy. Age-based auto-reclaim is worse: it steals the lock from a live holder that is merely slow (a large pull, a long migration), and then two deploys race on one state file. The lease removes the judgment entirely — the lock is either heartbeating or gone. `docker create --name` as a mutex is atomic but equally inert.
+- **Why this and not the alternatives.** The lease removes the judgment entirely — the lock is
+  either heartbeating or gone.
+  - **Atomic `mkdir` mutex:** exclusive but *inert*. Nothing on the target releases it, so a
+    killed dcd leaves it forever and recovery becomes a human judgment about a pid on another
+    machine — unknowable, and a race between an operator and a slow-but-alive deploy.
+  - **Age-based auto-reclaim:** worse. It steals the lock from a live holder that is merely slow
+    (a large pull, a long migration), and then two deploys race on one state file.
+  - **`docker create --name` as a mutex:** atomic, equally inert.
 - **The cost, stated:** this needs `flock(1)` on the target (util-linux). Verified present in `alpine:3.20`, `debian:12-slim` and `ubuntu:24.04`; the target already runs Docker, so it is a real Linux host. `preflight` probes `command -v flock` and fails with a named error rather than silently deploying unlocked.
 - **The stage lock does not protect cross-stage concurrency on a shared `deploy_root`.** `dcd-state.json` is explicitly cross-stage (retention subtracts other stages' tags), and v2 adds two more shared files. dcd therefore makes every state write a **read-modify-write of one stage's row**: `persist_state` re-reads `dcd-state.json`, replaces only `stages[{stage}]`, and writes the merged document. A concurrent stage's history — its `cutover_pending` record included — survives a write it did not make, which whole-document writes silently discarded. The per-stage generated files are named `dcd-image-override.{stage}.yml` and `dcd-release-run.{stage}.yml`.
+
+- **Nothing dcd generates lands in a shared directory.** `dcd-release-run.{stage}.yml` is rendered on the *deploying* machine, prefixed with the project and therefore fully derivable by anyone sharing that machine — and it is read back by `docker compose config`, uploaded by `sync`, and started on the target. Written into `/tmp` it is two vulnerabilities: a symlink planted at that name is followed by the write, and a file planted there stays its planter's to rewrite between dcd's write and its reads, which makes the compose service dcd starts on the target theirs to choose. It goes into the same `0700` directory as the mux socket (§2.7), created by `prepare_private_directory`, which refuses a symlink in place of that directory so the `/tmp` fallback cannot be redirected either.
 
   **Residual, stated:** the merge narrows the lost-update window to the gap between that re-read and the write; it does not close it. Closing it needs a lock the remote transport can hold across a round trip, which the leased-flock machinery could provide at the cost of an ssh session per state write (three or more per deploy). Not taken — the observed exposure is two stages finalising within milliseconds of each other on one `deploy_root`.
 - **Signals:** a `signal` handler sets an atomic `Interrupt`. The executor checks it between tasks and inside retry loops. Interrupt **before** cutover → pre-cutover cleanup (remove black) + lock release via normal unwind, exit `130`. Interrupt **during** cutover → finish the in-flight reload-or-restore deterministically (never leave the upstream half-written), then exit. SIGKILL cannot run cleanup; the lock auto-releases in **both** modes (locally the kernel, remotely the leased holder — INV-4); `--resume`/orphan-reaping (§7.1) recover the rest.
@@ -174,7 +185,7 @@ it does):
 | `BatchMode` | `yes` | a passphrase prompt in CI hangs until the job timeout |
 | `ConnectTimeout` | `getConnectTimeoutSeconds()` = **10** | bounds a dead host |
 | `ServerAliveInterval` / `ServerAliveCountMax` | `getServerAliveIntervalSeconds()` = **15** / `getServerAliveCountMax()` = **4** | 15×4 = **60 s**, and that number *is* the stale-lock window INV-4 depends on |
-| `ControlMaster` / `ControlPath` / `ControlPersist` | `auto` / `%C` under `$XDG_RUNTIME_DIR/dcd/` when set, else a `0700` `~/.dcd/cm/` / `getControlPersistSeconds()` = **60** | see below |
+| `ControlMaster` / `ControlPath` / `ControlPersist` | `auto` / `%C` under `$XDG_RUNTIME_DIR/dcd/` when set, else a `0700` `~/.dcd/` / `getControlPersistSeconds()` = **60** | see below |
 | `StrictHostKeyChecking` | **not set** — OpenSSH's default stands | defaulting to `accept-new` is silent TOFU into production; an unknown key must be a clean `BatchMode` failure |
 
 **Connection reuse is mandatory, and measured.** 60 commands over loopback,
@@ -198,51 +209,47 @@ fails *fast*, the run initially looked 5.7× faster than the unmultiplexed one.
 dcd therefore builds the path itself as `%C` under a short directory and
 preflights its length with a named error.
 
-**The script travels on stdin; the login shell sees one bare word.** ssh joins
-everything after the destination and hands it to the **login shell of the deploy
-user** — which dcd does not choose, and which may be fish, tcsh or ksh, whose
-quoting grammars differ from POSIX. Putting a script there means it is parsed
-twice, by two grammars. dcd therefore invokes `ssh <opts> <target> -- sh` and
-pipes the script to that `sh` on **stdin**: every shell agrees what one bare word
-means, and the script is then parsed exactly once, by the POSIX shell dcd named.
-`quote()` is the only grammar in play.
+**The script travels on stdin; the login shell sees one bare word.** ssh joins everything after
+the destination and hands it to the **login shell of the deploy user** — which dcd does not
+choose, and which may be fish, tcsh or ksh, whose quoting grammars differ from POSIX. A script
+there is parsed twice, by two grammars. dcd therefore invokes `ssh <opts> <target> -- sh` and
+pipes the script to that `sh` on **stdin**: every shell agrees what one bare word means, and
+the script is parsed exactly once, by the POSIX shell dcd named. `quote()` is the only grammar
+in play.
 
-**Consequence — stdin carries the script, so it cannot also carry a payload.**
-Verified: a shell reading a script from a pipe does not hand the remainder to the
-command it runs. So uploads embed their bytes as **base64 inside the script**
-(the alphabet contains no shell metacharacter), and the stage lock — whose stdin
-*must* stay a live heartbeat channel — is the one command invoked as **bare
-words**: `ssh … -- flock -n <lock> sh <lease-file>`, with the lease loop written
-to that file beforehand through the ordinary script mechanism. Nothing in that
-argv needs quoting, which is why `deploy_root` is validated to contain no
-whitespace or shell metacharacters.
+**Consequence — stdin carries the script, so it cannot also carry a payload.** Verified: a
+shell reading a script from a pipe does not hand the remainder to the command it runs. So:
 
-**This was found by running a real deploy, not by reading the code.** An earlier
-design put `sh`, `-c`, `<script>` on the ssh argv as separate words; the
-argv-shape unit tests passed throughout, because the defect lives in what ssh
-does *between* the two argv layers. `tests/ssh_shells.rs` now covers it against a
-real sshd with nine login shells (busybox sh, dash, bash, zsh, mksh, loksh, yash,
-fish, tcsh), asserting byte-identical argument delivery, env delivery with no
-argv exposure, and that a failed `cd` aborts instead of running in `$HOME`.
+- **Uploads** embed their bytes as **base64 inside the script** (the alphabet contains no shell
+  metacharacter).
+- **The stage lock** — whose stdin *must* stay a live heartbeat channel — is the one command
+  invoked as **bare words**: `ssh … -- flock -n <lock> sh <lease-file>`, the lease loop written
+  to that file beforehand through the ordinary script mechanism. Nothing in that argv needs
+  quoting, which is why `deploy_root` is validated to contain no whitespace or shell
+  metacharacters.
 
-**Quoting is a pure, unit-tested function.** `ssh target -- a b c` does not
-`execve`; the remote **login shell re-parses** the joined arguments, so `Argv` is
-no longer a syscall-level boundary and its safety rests entirely on quoting
-against a shell dcd does not choose. The wrapper therefore lives in `src/ssh.rs`
-as a pure `Argv → Argv` builder mirroring `src/docker.rs`, unit-asserted against
-hostile fixtures (`$`, backticks, newlines, single quotes, `!`, whitespace-only
-arguments). `SystemRunner`'s `current_dir = deploy_root` has no ssh equivalent,
-so the wrapper also emits the `cd <deploy_root> &&` prefix — and that prefix is
-part of the same tested function, never string-built at a call site.
+**Found by running a real deploy, not by reading the code.** An earlier design put `sh`, `-c`,
+`<script>` on the ssh argv as separate words; the argv-shape unit tests passed throughout,
+because the defect lives in what ssh does *between* the two argv layers. `tests/ssh_shells.rs`
+covers it against a real sshd with nine login shells (busybox sh, dash, bash, zsh, mksh, loksh,
+yash, fish, tcsh), asserting byte-identical argument delivery, env delivery with no argv
+exposure, and that a failed `cd` aborts instead of running in `$HOME`.
 
-**Transport failure is distinct from remote failure.** `ssh` exits **255** for
-its own errors (auth, DNS, connection reset). Treating that as an ordinary
-non-zero would let `Engine::classify` report a severed connection as an
-application failure, and the best-effort `try_run` sites (`drain:red`,
-`cleanup_black`, `remove_images`) would swallow "the network is gone" and keep
-issuing commands. `SshRunner` distinguishes the two and aborts with
-`connection to <target> lost after <step>; the target's state may lag — run
-dcd status <stage>`.
+**Quoting is a pure, unit-tested function.** `ssh target -- a b c` does not `execve`; the remote
+**login shell re-parses** the joined arguments, so `Argv` is no longer a syscall-level boundary
+and its safety rests entirely on quoting against a shell dcd does not choose. The wrapper lives
+in `src/ssh.rs` as a pure `Argv → Argv` builder mirroring `src/docker.rs`, unit-asserted against
+hostile fixtures (`$`, backticks, newlines, single quotes, `!`, whitespace-only arguments).
+`SystemRunner`'s `current_dir = deploy_root` has no ssh equivalent, so the wrapper also emits
+the `cd <deploy_root> &&` prefix — part of the same tested function, never string-built at a
+call site.
+
+**Transport failure is distinct from remote failure.** `ssh` exits **255** for its own errors
+(auth, DNS, connection reset). Treating that as an ordinary non-zero would let
+`Engine::classify` report a severed connection as an application failure, and the best-effort
+`try_run` sites (`drain:red`, `cleanup_black`, `remove_images`) would swallow "the network is
+gone" and keep issuing commands. `SshRunner` distinguishes the two and aborts with `connection
+to <target> lost after <step>; the target's state may lag — run dcd status <stage>`.
 
 ---
 
@@ -289,7 +296,21 @@ Tasks 5, 11, 12 are **skipped** (logged) when their config is absent.
 
 ### 4.2 `dcd deploy --resume [stage]` (recovers an exit-4 state, INV-3)
 
-If state holds a `cutover_pending` release (a prior deploy died/​failed after cutover), `--resume` re-runs **only** the post-cutover tasks (`drain:red` → `migrate:after` → `workers` → `finalize`) against that recorded live black — it does **not** start a new black or re-cutover. Resume reads `current` and the `cutover_pending` release from the on-disk state; `drain:red` on resume re-checks whether the old `current` container is still running (the failed run likely already removed it) and skips it if gone (§7.10). Because the `drained` flag is per-process, resume re-runs the worker drain (safe: `workers.drain` is best-effort and the `workers` task recreates the set). `migrate:after` re-runs and so must be idempotent (Doctrine version-tracking skips applied migrations). Without `--resume`, a `deploy` that finds a `cutover_pending` release refuses (exit `4`) and tells the operator to `--resume`, `rollback`, or `unlock` (§4.4). As a defensive guard, any run that finds **more than one** `cutover_pending` (which INV-10 forbids) aborts with a clear state-corruption error rather than guessing.
+If state holds a `cutover_pending` release (a prior deploy died/​failed after cutover),
+`--resume` re-runs **only** the post-cutover tasks (`drain:red` → `migrate:after` → `workers` →
+`finalize`) against that recorded live black. It does **not** start a new black or re-cutover.
+
+- Resume reads `current` and the `cutover_pending` release from the on-disk state.
+- `drain:red` re-checks whether the old `current` container is still running (the failed run
+  likely already removed it) and skips it if gone (§7.10).
+- The `drained` flag is per-process, so resume re-runs the worker drain — safe: `workers.drain`
+  is best-effort and the `workers` task recreates the set.
+- `migrate:after` re-runs and must therefore be idempotent (Doctrine version-tracking skips
+  applied migrations).
+- Without `--resume`, a `deploy` that finds a `cutover_pending` release refuses (exit `4`) and
+  names the three ways out: `--resume`, `rollback`, `unlock` (§4.4).
+- Defensive guard: any run finding **more than one** `cutover_pending` (INV-10 forbids it)
+  aborts with a state-corruption error rather than guessing.
 
 ### 4.3 State transitions (authoritative)
 
@@ -320,9 +341,19 @@ The last resort when `--resume` cannot finish and `rollback` is not wanted — t
 | 5 | persist | one state write, mode `0600`, as any finalize |
 | 6 | clear the lock | **Local:** delete `.dcd.{stage}.lock` and its `.meta`, overriding a held flock. **Remote:** delete `.dcd.{stage}.lock` and its `.meta`. Under INV-4 a stale remote lock cannot exist, so this is an operator override of a *live* holder, never a repair — the prompt says so |
 
-**Nothing else happens:** no `drain:red`, no `migrate:after`, no `workers`, no retention/image GC, and **no** hooks (YAML or Lua). A stuck deploy is usually stuck on exactly those, so none of them may stand between the operator and a deployable stage — and a broken or unreachable Docker daemon cannot block the repair. Every leftover is the next deploy's job: `preflight` reaps unrecorded containers (§7.1), `drain:red` reaps every stale app container, and `finalize` applies retention. `unlock` warns by name about each thing it left behind — the after-migration, the workers, and the previous container still running.
+**Nothing else happens:** no `drain:red`, no `migrate:after`, no `workers`, no retention/image
+GC, and **no** hooks (YAML or Lua). A stuck deploy is usually stuck on exactly those, so none
+may stand between the operator and a deployable stage — and a broken or unreachable Docker
+daemon cannot block the repair.
 
-With no `cutover_pending` release (a deploy that died *before* cutover, or a lock left behind by a killed process) `unlock` touches no state at all and only clears the lock. `--dry-run` prints the transition and the lock files it would remove, writing nothing. The command is idempotent: a second run reports nothing to promote and no lock present.
+- Every leftover is the next deploy's job: `preflight` reaps unrecorded containers (§7.1),
+  `drain:red` reaps every stale app container, `finalize` applies retention.
+- `unlock` warns by name about each thing it left behind — the after-migration, the workers, the
+  previous container still running.
+- No `cutover_pending` release (a deploy that died *before* cutover, or a lock left by a killed
+  process) → no state is touched at all; only the lock is cleared.
+- `--dry-run` prints the transition and the lock files it would remove, writing nothing.
+- Idempotent: a second run reports nothing to promote and no lock present.
 
 ---
 
@@ -498,9 +529,59 @@ Loaded before config interpolation. The chain hangs off a **base file**: `--env-
 
 Later layers override earlier; the **real process environment overrides every layer** (captured once at startup, `src/cli.rs`). An **absent** file is silently skipped (an empty chain is the pre-rework status quo); a file that is present but unreadable, a directory, or not valid UTF-8 is a loud `ConfigError` naming the path — never a silent skip. A `--env-dir` pointing at a missing directory is a `ConfigError`. A stage resolved to the empty string (no `stages:`) loads layers 1–2 only — never `.env.` / `.env..local`.
 
-**Parser:** a Rust port of `symfony/dotenv` **8.1** (`Dotenv::parse` + `parseRaw`), including the exact grammar (quoting, concatenated segments, `export`, comments, CRLF/BOM rules, NUL-byte rejection, `_*`-prefixed variable names, `${VAR}` / `${VAR:-default}` / `${VAR:=default}` with Symfony's brace/default edge cases) and the `FormatException` context format (`<msg> in "<file>" at line N` + snippet + caret). 8.1 lexes values **raw** — literal `$` is protected as a `\x00` marker (`\$`, single-quoted `$`), backslashes stay escaped — and resolves afterwards; an unquoted value containing `$` may contain spaces (only space-without-`$` errors). Ported deviations, each a hard error or documented: `$(command)` is **lexed but never executed** — a completed `$(…)` expression is a `ConfigError` (a deploy tool must not shell-execute env-file content; during deferred chain resolution the error names the key instead of a file position; the refusal also fires for `$(…)` spanning a quoted newline, and — fail-closed divergence — for empty `$()`/`$(())`, which Symfony's command regex leaves literal); no `$_SERVER`/`HTTP_`/`putenv` semantics (dcd is process-env-model only; the process-env snapshot is the single "external" source); no `.env.local.php`; and **an apostrophe inside an unquoted run delimits a segment only when its partner is on the same line**. Upstream, every quote delimits, so `PASS=pa'ss` — an ordinary password — opens a quoted run that consumes each following line until the next apostrophe: it then either died at EOF, printing its neighbours through the error window, or silently absorbed their values into `PASS`. dcd reads a partnerless apostrophe as a literal byte. The relaxation is deliberately the narrowest one that fixes the password: `"` still delimits unconditionally, a quote that **starts** a segment is untouched (multi-line values included), and concatenation survives wherever the partner is on the line (`FOO=va'lue'` → `value`, `'bar '\'' baz'` → `bar ' baz`). **Every case in the vendored upstream providers still passes verbatim** — including the two that pin the double quote (`FOO="foo\nBAR="bar"`, `${FOO:-a"a}`). Conformance is executed, not transcribed: `tests/fixtures/symfony/DotenvTest.php` is the upstream file, `extract_cases.php` dumps its two providers to `dotenv_cases.json`, and the Rust suite runs every case out of that JSON (§10.1 TC-031).
+**Parser:** a Rust port of `symfony/dotenv` **8.1** (`Dotenv::parse` + `parseRaw`).
 
-**Variable resolution** (Symfony 8.1 deferred model, map-based — no process-env mutation): chain layers are parsed **raw**, layered (process env wins for keys it already defines — those keep their external value verbatim, backslashes and `$` included, never executed), then resolved together in **up to 5 passes to a fixpoint** (`resolveLoadedVars`). Consequences, each pinned by a ported case: a later layer overriding `REDIS_HOST` rewrites an earlier layer's `redis://${REDIS_HOST}`; **forward references** across layers resolve; a **self-referencing** value (`MY_VAR=${MY_VAR}_suffix`, `${MY_VAR:-default}`) hides its own raw value and sees the pre-chain external value / the previous layer's value / the default; values still changing after 5 passes are a `ConfigError`: `Too many levels of variable indirection in env vars: <NAMES>.`. A `$NAME` lookup resolves against the working map (process env ∪ loaded layers) with Symfony's external-value protection. `:=` additionally assigns the default. **The ported test suite (TC-031) is the authoritative oracle**: where this prose and a ported Symfony case could be read to disagree, the case wins and the prose is corrected.
+Ported verbatim: the exact grammar (quoting, concatenated segments, `export`, comments, CRLF/BOM
+rules, NUL-byte rejection, `_*`-prefixed variable names, `${VAR}` / `${VAR:-default}` /
+`${VAR:=default}` with Symfony's brace/default edge cases) and the `FormatException` context
+format (`<msg> in "<file>" at line N` + snippet + caret). 8.1 lexes values **raw** — literal `$`
+is protected as a `\x00` marker (`\$`, single-quoted `$`), backslashes stay escaped — and
+resolves afterwards; an unquoted value containing `$` may contain spaces (only space-without-`$`
+errors).
+
+**Deviations, each a hard error or documented:**
+
+- **`$(command)` is lexed but never executed** — a completed `$(…)` expression is a
+  `ConfigError`; a deploy tool must not shell-execute env-file content. During deferred chain
+  resolution the error names the key instead of a file position. The refusal also fires for
+  `$(…)` spanning a quoted newline and — fail-closed divergence — for empty `$()`/`$(())`, which
+  Symfony's command regex leaves literal.
+- **No `$_SERVER`/`HTTP_`/`putenv` semantics** — dcd is process-env-model only; the process-env
+  snapshot is the single "external" source. No `.env.local.php`.
+- **An apostrophe inside an unquoted run delimits a segment only when its partner is on the same
+  line.** Upstream every quote delimits, so `PASS=pa'ss` — an ordinary password — opens a quoted
+  run consuming each following line until the next apostrophe: it then either died at EOF,
+  printing its neighbours through the error window, or silently absorbed their values into
+  `PASS`. dcd reads a partnerless apostrophe as a literal byte.
+  - The narrowest relaxation that fixes the password: `"` still delimits unconditionally, a
+    quote that **starts** a segment is untouched (multi-line values included), and concatenation
+    survives wherever the partner is on the line (`FOO=va'lue'` → `value`, `'bar '\'' baz'` →
+    `bar ' baz`).
+
+**Every case in the vendored upstream providers still passes verbatim** — including the two that
+pin the double quote (`FOO="foo\nBAR="bar"`, `${FOO:-a"a}`). Conformance is executed, not
+transcribed: `tests/fixtures/symfony/DotenvTest.php` is the upstream file, `extract_cases.php`
+dumps its two providers to `dotenv_cases.json`, and the Rust suite runs every case out of that
+JSON (§10.1 TC-031).
+
+**Variable resolution** (Symfony 8.1 deferred model, map-based — no process-env mutation): chain
+layers are parsed **raw**, layered (process env wins for keys it already defines — those keep
+their external value verbatim, backslashes and `$` included, never executed), then resolved
+together in **up to 5 passes to a fixpoint** (`resolveLoadedVars`).
+
+Consequences, each pinned by a ported case:
+
+- A later layer overriding `REDIS_HOST` rewrites an earlier layer's `redis://${REDIS_HOST}`.
+- **Forward references** across layers resolve.
+- A **self-referencing** value (`MY_VAR=${MY_VAR}_suffix`, `${MY_VAR:-default}`) hides its own
+  raw value and sees the pre-chain external value / the previous layer's value / the default.
+- Values still changing after 5 passes → `ConfigError`: `Too many levels of variable indirection
+  in env vars: <NAMES>.`
+- A `$NAME` lookup resolves against the working map (process env ∪ loaded layers) with Symfony's
+  external-value protection. `:=` additionally assigns the default.
+
+**The ported test suite (TC-031) is the authoritative oracle**: where this prose and a ported
+Symfony case could be read to disagree, the case wins and the prose is corrected.
 
 #### 5.2.2 The two resolved maps
 
@@ -525,9 +606,43 @@ A chain layer that defines any of `PATH`, `HOME`, `LD_*`, `DOCKER_*`, `COMPOSE_*
 
 #### 5.2.5 Observability & lifecycle
 
-- **`dcd check [stage]`** prints: chain files found/skipped (paths), per-layer key counts, the sorted key **names** delivered to each container after filters, keys shadowed by the process env, and reserved-key errors. **Resolved values are never printed** (redaction stays removed — the right response is to never print values at all), and there is **no exception**. A dotenv **parse error** reproduces Symfony's snippet+caret (§5.2.1) in everything except the value bytes, which `mask_values` replaces 1:1 with `*` — key names, `=`, escaped newlines, the caret column and the offset all still match upstream. Both halves are load-bearing and neither replaces the other: the **parser** no longer turns an apostrophe in a password into a syntax error at all (§5.2.1), and the **masking** covers every error that remains, because the window is 20 raw bytes either side of the cursor and reaches whatever line the cursor is near. `check` is the CI lint job, so one leak is one leak in every job log; Symfony parity loses to the standing promise, and the parity oracle pins the masked form. `--dry-run` prints bare `-e KEY` argv — strictly better than the pre-rework `-e K=V`.
-- **State fingerprint:** each `Release` records `env_keys` (sorted container-env key names — names are not secrets; `dcd-state.json` stays `0600`). `rollback` and `--resume` diff the recorded set against the currently-resolved set and print a loud warning naming added/removed keys (env is *not* versioned — a rollback runs old images under **today's** chain; the warning is the guard). Value hashes are deliberately not stored (low-entropy secrets are offline-crackable from a hash).
-- **Recovery model:** the chain files live at the launch source (operator machine, CI secrets, or `ssh host 'dcd deploy prod --env-stdin --yes' < .env.prod.local` for a genuinely disk-free path — `--env-stdin` consumes stdin, so interactive prompts error and `-y/--yes` is required for any confirming command). Server loss no longer loses secrets. Residual at-rest copies on the server, named deliberately: Docker's own container config under `/var/lib/docker` (inherent — it is what makes reboot-restart work; root-only), the optional operator-managed `release.run.env_file`, any `env_file:` entries inside user-owned compose files (UPGRADE.md shows the bare-key migration), and — in the default layout, where `--env-dir` is the config directory on the server — the operator's own chain files themselves; `--env-stdin` (or values-over-ssh with a secret-free `.env` manifest) is the path that removes that last class. The claim dcd itself makes is precise: **dcd writes no secret bytes to disk** (IT-007's grep proves it over dcd-written files).
+- **`dcd check [stage]`** prints: chain files found/skipped (paths), per-layer key counts, the
+  sorted key **names** delivered to each container after filters, keys shadowed by the process
+  env, and reserved-key errors. **Resolved values are never printed**, with **no exception** —
+  redaction stays removed; the right response is to never print a value at all.
+  - A dotenv **parse error** reproduces Symfony's snippet+caret (§5.2.1) in everything except
+    the value bytes, which `mask_values` replaces 1:1 with `*`. Key names, `=`, escaped
+    newlines, the caret column and the offset all still match upstream.
+  - Both halves are load-bearing and neither replaces the other: the **parser** no longer turns
+    an apostrophe in a password into a syntax error at all (§5.2.1), and the **masking** covers
+    every error that remains — the window is 20 raw bytes either side of the cursor and reaches
+    whatever line the cursor is near.
+  - `check` is the CI lint job, so one leak is one leak in every job log. Symfony parity loses
+    to the standing promise, and the parity oracle pins the masked form.
+  - `--dry-run` prints bare `-e KEY` argv — strictly better than the pre-rework `-e K=V`.
+- **State fingerprint:** each `Release` records `env_keys` (sorted container-env key names —
+  names are not secrets; `dcd-state.json` stays `0600`). `rollback` and `--resume` diff the
+  recorded set against the currently-resolved set and print a loud warning naming added/removed
+  keys: env is *not* versioned, a rollback runs old images under **today's** chain, and the
+  warning is the guard. Value hashes are deliberately not stored (low-entropy secrets are
+  offline-crackable from a hash).
+- **Recovery model:** the chain files live at the launch source — operator machine, CI secrets,
+  or `ssh host 'dcd deploy prod --env-stdin --yes' < .env.prod.local` for a genuinely disk-free
+  path (`--env-stdin` consumes stdin, so interactive prompts error and `-y/--yes` is required
+  for any confirming command). Server loss no longer loses secrets.
+
+  Residual at-rest copies on the server, named deliberately:
+  - Docker's own container config under `/var/lib/docker` — inherent, it is what makes
+    reboot-restart work; root-only.
+  - The optional operator-managed `release.run.env_file`.
+  - Any `env_file:` entries inside user-owned compose files (UPGRADE.md shows the bare-key
+    migration).
+  - In the default layout, where `--env-dir` is the config directory on the server, the
+    operator's own chain files. `--env-stdin` (or values-over-ssh with a secret-free `.env`
+    manifest) removes that last class.
+
+  The claim dcd itself makes is precise: **dcd writes no secret bytes to disk** (IT-007's grep
+  proves it over dcd-written files).
 
 ---
 
@@ -553,7 +668,13 @@ release:
   healthcheck: { exec_in: nginx, cmd: '…{container}…' }
 ```
 
-dcd renders this into a **one-service compose document** at `dcd-release-run.{stage}.yml`, written **next to the config** at load time (`materialise_release_run`) and **appended to `compose.files`** — so from that point it is an ordinary compose file: it resolves in the model, `sync` uploads it, and it is passed as a `-f` before `dcd-image-override.{stage}.yml`. Writing it at load rather than in `sync` is what lets `docker compose config` see the service at all; a document produced later would leave the model without the release service and every reference to it undeclared.
+dcd renders this into a **one-service compose document** at `dcd-release-run.{stage}.yml`,
+written at load time (`materialise_release_run`, into dcd's private directory — §2.5) and
+**appended to `compose.files`**. From that point it is an ordinary compose file: it resolves in
+the model, `sync` uploads it, and it is passed as a `-f` before `dcd-image-override.{stage}.yml`.
+Writing it at load rather than in `sync` is what lets `docker compose config` see the service at
+all; a document produced later would leave the model without the release service and every
+reference to it undeclared.
 
 The rendered service is named `{project}-release`, carries `profiles: ["dcd-release"]`, and that synthetic name is the key used for `Release.images`, `retention.keep_images` and `gc_logicals()` (§5.4), and the name `--image` addresses. The engine then runs the **same** `compose run` primitive against it — one creation path, one test surface.
 
@@ -563,15 +684,17 @@ Note the renderer's direction: this is *dcd-config → compose*, which is total 
 
 ### 5.4 Image identity is the compose service name
 
-v1 keyed release images, the pull ledger and retention on `docker.images` logical
-names (`Release.images`, `PulledImage.logical`, `KeepPolicy.per_logical`,
-`gc_candidates(keep, logicals)`, and an `Engine::gc_logicals()` that hardcoded
-`"app"`). That map is gone, so the whole axis is re-keyed to the **compose
-service name** — a 1:1 replacement that leaves every retention algorithm intact,
-makes `retention.keep_images: { postgres: 2 }` read better than the v1 form, and
-lets `gc_logicals()` derive from the resolved compose services instead of
-hardcoding a name. This is a `state.rs` schema rename with real cost: no
-migration is written (v1 state is not read), but §10's state tests move with it.
+v1 keyed release images, the pull ledger and retention on `docker.images` logical names
+(`Release.images`, `PulledImage.logical`, `KeepPolicy.per_logical`, `gc_candidates(keep,
+logicals)`, and an `Engine::gc_logicals()` that hardcoded `"app"`). That map is gone, so the
+whole axis is re-keyed to the **compose service name** — a 1:1 replacement that:
+
+- leaves every retention algorithm intact,
+- makes `retention.keep_images: { postgres: 2 }` read better than the v1 form,
+- lets `gc_logicals()` derive from the resolved compose services instead of hardcoding a name.
+
+A `state.rs` schema rename with real cost: no migration is written (v1 state is not read), but
+§10's state tests move with it.
 
 ### 5.5 The generated image-override file
 
@@ -583,26 +706,27 @@ services:
   app: { image: registry.example.com/acme:app-1a2b3c }
 ```
 
-It exists because the app's image now comes from the operator's compose file,
-typically as `image: ${REGISTRY}:${APP_TAG}` — a variable dcd does not own,
-cannot validate, and cannot report a good error for when it is spelled
-differently. The override file makes `--image <service>=<ref>` work regardless of
-how the compose file names its variables, records an exact resolved ref in the
-release ledger, and — decisively — is how **rollback pins the old image exactly**
-rather than hoping the environment still reproduces it.
+It exists because the app's image now comes from the operator's compose file, typically as
+`image: ${REGISTRY}:${APP_TAG}` — a variable dcd does not own, cannot validate, and cannot
+report a good error for when it is spelled differently. The override file:
 
-It carries image references only. It must never carry anything else: `docker
-compose config` **resolves and inlines env values**, so snapshotting the resolved
-model would write secret bytes into a dcd-owned file, breaking §5.2.5 and IT-007.
+- makes `--image <service>=<ref>` work regardless of how the compose file names its variables,
+- records an exact resolved ref in the release ledger,
+- and, decisively, is how **rollback pins the old image exactly** rather than hoping the
+  environment still reproduces it.
 
-`--image` is applied by pinning the **resolved compose model** (`ComposeModel::pin_image`,
-right after `resolve_compose_model`), never by a config path. `Engine::resolved_images`
-is the model's only image reader, so one pin reaches the override file, the pull, the
-pull ledger, retention and the release record together — there is no second image path
-to keep in step. A pin naming a service the compose files do not declare is a config
-error listing the services that exist (IT-018). v1's `--set docker.images.<name>` route
-is gone with the key (§UPGRADE); it survived the v2 migration in `cli.rs` and made every
-`--image` run fail at config load until IT-017 caught it.
+**Image references only.** It must never carry anything else: `docker compose config` **resolves
+and inlines env values**, so snapshotting the resolved model would write secret bytes into a
+dcd-owned file, breaking §5.2.5 and IT-007.
+
+`--image` is applied by pinning the **resolved compose model** (`ComposeModel::pin_image`, right
+after `resolve_compose_model`), never by a config path. `Engine::resolved_images` is the model's
+only image reader, so one pin reaches the override file, the pull, the pull ledger, retention
+and the release record together — there is no second image path to keep in step. A pin naming a
+service the compose files do not declare is a config error listing the services that exist
+(IT-018). v1's `--set docker.images.<name>` route is gone with the key (§UPGRADE); it survived
+the v2 migration in `cli.rs` and made every `--image` run fail at config load until IT-017
+caught it.
 
 ---
 
@@ -647,7 +771,26 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 
 ### 6.5 The `configure` hook
 
-Registered with `configure(fn)`; fires **once before the recipe**, with a host offering `run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` (no `in_release`/`docker`/`compose`/`cp_*` — there is no release container yet). Its `run` commands execute under the same §5.2.4 runner env and `deploy_root` cwd as recipe commands, and its `ctx.env` reads the §5.2.2 interpolation env — the configure host and the deploy host see one environment. It adjusts the initial config by **mutating `ctx.cfg` directly** (`ctx.cfg.retention.keep_releases = 5`); the mutated table is read back, re-parsed and re-validated into the typed config the engine then runs against. The **same live read-back applies to every hook mid-deploy** (§6.2), not just `configure`: a `before_`/`after_` hook may mutate `ctx.cfg` (honored for any step not yet run) or `ctx.state` (read back into deploy state, persisted once past cutover). Implementation: before firing a slot's hooks the engine `refresh`es the `cfg`/`state` tables from the typed values; after, it re-reads them and, if changed, re-parses (`cfg` re-validated; a failure aborts the deploy). The round-trip goes through Lua, so an empty map serializes as an empty table and is parsed back as an empty map (`de_lenient_map`); map ordering (`env`/`services`) is not guaranteed across a mutated round-trip but does not affect correctness. `ctx.vars` remains for scratch state that is not part of cfg/state.
+Registered with `configure(fn)`; fires **once before the recipe**, with a host offering
+`run`/`read_file`/`write_file`/`file_exists`/`env`/utilities/`cfg`/`state` — no
+`in_release`/`docker`/`compose`/`cp_*`, there is no release container yet.
+
+- Its `run` commands execute under the same §5.2.4 runner env and `deploy_root` cwd as recipe
+  commands, and its `ctx.env` reads the §5.2.2 interpolation env: the configure host and the
+  deploy host see one environment.
+- It adjusts the initial config by **mutating `ctx.cfg` directly**
+  (`ctx.cfg.retention.keep_releases = 5`); the mutated table is read back, re-parsed and
+  re-validated into the typed config the engine runs against.
+- The **same live read-back applies to every hook mid-deploy** (§6.2), not just `configure`: a
+  `before_`/`after_` hook may mutate `ctx.cfg` (honored for any step not yet run) or `ctx.state`
+  (read back into deploy state, persisted once past cutover).
+- **Implementation:** before firing a slot's hooks the engine `refresh`es the `cfg`/`state`
+  tables from the typed values; after, it re-reads them and, if changed, re-parses (`cfg`
+  re-validated; a failure aborts the deploy).
+- The round-trip goes through Lua, so an empty map serializes as an empty table and parses back
+  as an empty map (`de_lenient_map`). Map ordering (`env`/`services`) is not guaranteed across a
+  mutated round-trip but does not affect correctness.
+- `ctx.vars` remains for scratch state that is not part of cfg/state.
 
 ### 6.3 YAML hook actions (zero-Lua path)
 
@@ -747,7 +890,7 @@ unless an action explicitly asks for `sh -c`.
 
 ### 7.9 worker drain (shared helper)
 - `names = docker ps --filter label=com.docker.compose.service={workers.service} --filter label=com.docker.compose.project={project} --format '{{.Names}}'` *(Read)*.
-- **The label filter is load-bearing (INV-14).** v1 matched on `com.docker.compose.project` plus an **unanchored `name=` substring** (`docker.rs` `worker_ps_names`), which was safe only because the black was a plain `docker run` (`docker.rs` `run_black`) carrying no compose labels. **ADR-013 introduces this hazard** — it does not exist today. Under ADR-013 the release container will carry the project label, so that substring filter would match it — and the next line issues `docker stop` on every match, post-cutover, against the container serving traffic. Filtering on the worker **service** cannot match the release service, and §5.1 makes `workers.service == release.service` a config error so the two can never coincide. `workers.name_prefix` is container naming only, never discovery.
+- **The label filter is load-bearing (INV-14).** v1 matched on `com.docker.compose.project` plus an **unanchored `name=` substring** (`docker.rs` `worker_ps_names`), which was safe only because the black was a plain `docker run` (`docker.rs` `run_black`) carrying no compose labels. **ADR-013 introduced this hazard**: under it the release container carries the project label, so that substring filter would match it — and the next line issues `docker stop` on every match, post-cutover, against the container serving traffic. Filtering on the worker **service** cannot match the release service, and §5.1 makes `workers.service == release.service` a config error so the two can never coincide. `workers.name_prefix` is container naming only, never discovery.
 - For each: `docker exec {name} sh -c '{workers.drain}'` *(Mutate, best-effort)*.
 - `docker stop --signal {workers.stop_signal} --timeout {workers.stop_timeout} {names…}` then `docker rm -f {names…}` *(Mutate)*.
 - **Removal, not just stopping, is the v2 contract.** Workers are recreated by `compose run --name`, which fails against a *stopped* container still holding the name. This makes "every deploy recreates every worker" explicit; it loses compose's "unchanged worker keeps running" optimisation, which is acceptable because workers are drained and stopped on every deploy anyway.
@@ -844,7 +987,20 @@ One `Event` stream → reporter renders by environment: **rich** (TTY: per-task 
 
 Under `ssh:`, the reporter prints one `via ssh <target> (cwd <deploy_root>)` header at run start and then the **plain** argv per command — not the ssh-wrapped form. The wrapped form is what actually executes, but 70 lines each prefixed with `ssh -o ControlPath=…` is worse operator output, and the plan line is emitted by the engine (`run_argv`), above the runner where wrapping happens. `-v` traces the real, wrapped argv.
 
-`-v/--verbose` adds a second layer under those task lines: every command the engine spawns is traced at its single choke point (`Engine::run_argv`, plus the `configure` hook's own runner) as `$ <argv>` / `  exit <code> in <ms>ms` with stdout prefixed `  | ` and stderr `  ! `, or `{"exec":…}` + `{"exec_result":…}`/`{"exec_error":…}` under `--json`. Commands stubbed by `--dry-run` are not traced — they already print as `plan` lines, and nothing ran. **argv can never carry a value; captured stdout can.** Chain env is delivered as a bare `-e KEY` (§5.2.4), so no value is ever part of an argv — but `docker compose config` **resolves and inlines env values** into its output (§5.5), and §5 passes the whole resolved chain to compose. Verified 2026-08-25: with `DB_PASSWORD` set, `docker compose --env-file /dev/null config --format json` prints `"DB_PASSWORD": "hunter2-SECRET"`. dcd therefore parses that output internally and **never traces its stdout**: the `-v` line for that one command reads `<compose model, N services — output suppressed (contains resolved env values)>`. The same suppression applies to `dcd check`.
+`-v/--verbose` adds a second layer under those task lines: every command the engine spawns is
+traced at its single choke point (`Engine::run_argv`, plus the `configure` hook's own runner) as
+`$ <argv>` / `  exit <code> in <ms>ms` with stdout prefixed `  | ` and stderr `  ! `, or
+`{"exec":…}` + `{"exec_result":…}`/`{"exec_error":…}` under `--json`. Commands stubbed by
+`--dry-run` are not traced — they already print as `plan` lines, and nothing ran.
+
+**argv can never carry a value; captured stdout can.** Chain env is delivered as a bare `-e KEY`
+(§5.2.4), so no value is ever part of an argv — but `docker compose config` **resolves and
+inlines env values** into its output (§5.5), and §5 passes the whole resolved chain to compose.
+Verified 2026-08-25: with `DB_PASSWORD` set, `docker compose --env-file /dev/null config
+--format json` prints `"DB_PASSWORD": "hunter2-SECRET"`. dcd therefore parses that output
+internally and **never traces its stdout**: the `-v` line for that one command reads `<compose
+model, N services — output suppressed (contains resolved env values)>`. The same suppression
+applies to `dcd check`.
 
 ### 8.3 CI integration
 
@@ -868,7 +1024,23 @@ dcd deploy prod --yes --image app=$TAG
 
 `dcd init` writes a runnable `./dcd.yaml` skeleton; `--with-plugin` also writes `plugins/app.lua`. Refuses if `dcd.yaml` exists unless `--force`. The skeleton is asserted by loading it — `scaffold_parses_and_validates` parses `SCAFFOLD` through the real loader, which is what matters; there is no snapshot test.
 
-**`dcd init --from-compose <file>`** reads an existing compose file as YAML — never through `docker compose config`, so an unresolved `${APP_TAG}` and a missing daemon do not stop it — and emits a filled-in config: services detected, `services:` policy rows stubbed, the release service guessed (the one behind a `dcd-release` profile, else a conventional name, else the single non-router service publishing ports), `cutover.service` guessed from a router image **or a router service name** (`${REGISTRY}:${ROUTER_TAG}` names nothing), `cutover.backend_port` read from the release's `ports:`, and `TODO:` markers left **only** on the genuinely red-black-specific fields (`ssh`, `deploy_root`, `cutover.reload`, and either service that could not be guessed). Every emitted document is valid YAML — a `TODO:` in value position is quoted, or the file will not parse at all. `validate_no_placeholders_left` then makes `dcd check` name each unfilled field. This is the highest-leverage answer to "dcd is hard to set up": the schema shrinking (ADR-013) removes what must be written, and `--from-compose` removes writing most of the rest by hand.
+**`dcd init --from-compose <file>`** reads an existing compose file as YAML — never through
+`docker compose config`, so an unresolved `${APP_TAG}` and a missing daemon do not stop it — and
+emits a filled-in config:
+
+- services detected, `services:` policy rows stubbed;
+- the release service guessed: the one behind a `dcd-release` profile, else a conventional name,
+  else the single non-router service publishing ports;
+- `cutover.service` guessed from a router image **or a router service name**
+  (`${REGISTRY}:${ROUTER_TAG}` names nothing);
+- `cutover.backend_port` read from the release's `ports:`;
+- `TODO:` markers left **only** on the genuinely red-black-specific fields (`ssh`, `deploy_root`,
+  `cutover.reload`, and either service that could not be guessed).
+
+Every emitted document is valid YAML — a `TODO:` in value position is quoted, or the file will
+not parse at all. `validate_no_placeholders_left` then makes `dcd check` name each unfilled
+field. This is the highest-leverage answer to "dcd is hard to set up": the schema shrinking
+(ADR-013) removes what must be written, `--from-compose` removes writing most of the rest.
 
 **`dcd schema`** prints a JSON Schema **derived** from the typed `Config` (`schemars`), for editor completion and inline validation. Derived, not written: a hand-authored schema would be a fifth representation to keep in sync.
 
@@ -1237,24 +1409,34 @@ Compared with the v1 form of this same fixture, `dcd.yaml` drops from 48 to 23 s
 
 ---
 
-## 16. Documentation deliverables (acceptance criteria)
+## 16. Documentation sync
 
-CLAUDE.md requires four representations of the schema to change together. v2 rewrites the schema, so **all of these are acceptance criteria for the implementation, not follow-up work.** Each line is a known contradiction with this spec today.
+The schema has four representations that must agree. **Change one → change all** (CLAUDE.md
+holds the same rule for day-to-day work):
 
-| File | What still states the v1 model |
-|------|-------------------------------|
-| `src/config/mod.rs` | the whole typed `Config` — source of truth, changes first |
-| `src/cli.rs` — clap help | `long_about` "runs … on the server"; `after_help`; **`--ssh` absent**; `--image` help + `value_name = "LOGICAL=TAG"`; the `"--image \`{image}\` must be logical=tag"` error and its `docker.images.{logical}` `--set`; `Gc` long help; `check_report`'s `&workers.template` and its missing `compose receives: […]` line; the `.env` probe that stats the **local** filesystem though `deploy_root` is now a target path |
-| `src/cli.rs` — `SCAFFOLD` | entirely v1: `version: 1`, `docker.images`, `docker.services`, `compose.env` re-listing, `release.image`, `run.network_alias`, `release.healthcheck` as the default. Missing `ssh:`, `release.service`, `cutover.service`, top-level `services:` |
-| `src/cli.rs` — `PLUGIN_STUB` | "loaded at startup" → read and executed **locally**, resolved against the config file's directory, never uploaded |
-| `docs/examples/all_in_one/dcd.yaml` | every `docker.*`, `release.run.*`, `workers.template.*`, `cutover` without `service:`, `keep_images` keyed by logicals, the hook step list without `sync`, `plugins` "relative to deploy_root". Missing every v2 field |
-| `AGENTS.md` | §2 schema walkthrough, §5 rules (incl. the now-**inverted** "top-level `services` is now `docker.services`"), §7 error→fix table, the minimal skeleton, "`{container}` not the alias — the #1 mistake" |
-| `README.md` | "runs on the server, talks to the local Docker socket"; flags table (no `--ssh`); hook step list (no `sync`); the `COPY --from=ghcr.io/…/dcd` base-image section |
-| `UPGRADE.md` | **no v2 entry exists**; CLAUDE.md mandates one. Must carry the key-by-key v1→v2 map and the one-time v1 worker reap (§7.1) |
-| `CLAUDE.md` | "runs on the target server"; "**12 steps**" → 13; module map missing `src/ssh.rs` / `SshRunner` / `SshFs`; the example-config env list needs `DEPLOY_SSH` |
-| `docs/examples/fpm_app/*` | `dcd.yaml` is wholly v1; its compose files declare **no** `app` or `worker` service, which v2 requires; its README describes the scp/rsync workflow |
-| `docs/examples/roadrunner_app/` | `dcd.yaml` is already v2 — but `docker-compose.prod.yml` **is missing from the repo**, so the worked example cannot be `dcd check`ed, and its README still documents the v1 scp/ssh CI block |
+| # | File | Its role |
+|---|------|----------|
+| 1 | `src/config/mod.rs` | the typed `Config` — the source of truth, changes first |
+| 2 | `docs/examples/all_in_one/dcd.yaml` | every field, described, with its default |
+| 3 | `AGENTS.md` | the authoring guide: §2 schema, §5 rules, §7 error→fix table |
+| 4 | `src/cli.rs` | the clap `--help` text **and** the `SCAFFOLD` that `dcd init` writes |
 
-**Known-broken today:** `docs/examples/roadrunner_app/dcd.yaml` is v2 while `src/config/mod.rs` is v1, so CLAUDE.md's "re-run `dcd check` on both example configs" invariant fails on `master` until the implementation lands. This is deliberate — the spec leads the code — and is the first thing the implementation closes.
+A user-visible change also touches `docs/examples/roadrunner_app/`, `docs/examples/fpm_app/`,
+`UPGRADE.md` and this spec.
+
+After any schema edit, re-run `dcd check` from inside each example directory — **both** stages
+of `all_in_one`, since a field reference that resolves for only one stage is half a field
+reference:
+
+```bash
+(cd docs/examples/all_in_one && dcd check prod && dcd check beta)      # no env needed
+(cd docs/examples/roadrunner_app && DEPLOY_SSH=x DEPLOY_ROOT=/srv/a dcd check prod)
+(cd docs/examples/fpm_app && DEPLOY_SSH=x DEPLOY_ROOT=/srv/a REGISTRY=r APP_TAG=v1 \
+   ROUTER_TAG=r1 ROUTER_PORT=8080 dcd check prod)
+```
+
+The v2 rewrite's own documentation deliverables — the clap help, the `SCAFFOLD`, the example
+stacks, the `UPGRADE.md` v2 entry — are done; this section is the standing rule, not a to-do
+list.
 
 ---
