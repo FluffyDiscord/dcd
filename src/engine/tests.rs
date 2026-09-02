@@ -772,6 +772,33 @@ fn gc_never_removes_a_tag_another_stage_still_records() {
 }
 
 #[test]
+fn drain_red_gracefully_stops_the_old_release_before_removing_it() {
+    // The red app must get a bounded `docker stop` (SIGTERM -> in-flight drain)
+    // before `rm -f` SIGKILLs it — parity with the worker drain (spec §7.10).
+    let cfg = cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async")
+        // drain:red discovers the old red container. The `-a` preflight variant is a
+        // different display and stays unstubbed (empty), so nothing is reaped early.
+        .with_stdout("ps --filter 'name=^demo-app-'", "demo-app-OLD");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts(), model());
+    engine.deploy().unwrap();
+
+    let calls = runner.display_calls();
+    let idx = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap_or(usize::MAX);
+    let stop = idx("docker stop --signal SIGTERM --timeout 120 demo-app-OLD");
+    let rm = idx("docker rm -f demo-app-OLD");
+    assert!(stop != usize::MAX, "red gets a graceful docker stop with the default 120s window");
+    assert!(rm != usize::MAX, "red is removed after draining");
+    assert!(stop < rm, "graceful stop must precede rm -f");
+}
+
+#[test]
 fn infra_drains_workers_before_recreating_db_and_waits_after() {
     let cfg = cfg();
     let runner = RecordingRunner::new()

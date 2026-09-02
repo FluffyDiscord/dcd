@@ -147,6 +147,15 @@ pub struct Release {
     pub migrate: Option<Migrate>,
     #[serde(default)]
     pub drain: Option<String>,
+    /// `docker stop --timeout` applied to the red release before `rm -f`, giving
+    /// in-flight requests a bounded graceful window (spec §7.10). Mirrors
+    /// `workers.stop_timeout`; the app's PID-1 SIGTERM handler is the drainer.
+    #[serde(default = "onehundredtwenty", deserialize_with = "de_secs")]
+    #[schemars(schema_with = "duration_schema")]
+    pub stop_timeout: u64,
+    /// `docker stop --signal` for the red release drain. Mirrors `workers.stop_signal`.
+    #[serde(default = "sigterm")]
+    pub stop_signal: String,
 }
 
 impl Release {

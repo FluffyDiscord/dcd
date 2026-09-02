@@ -1051,6 +1051,8 @@ impl<'a> Engine<'a> {
         let argv = self.docker().ps_names(&prefix, false);
         let running = self.list(&argv)?;
         let drain_cmd = self.cfg.release.drain.clone();
+        let stop_timeout = self.cfg.release.stop_timeout;
+        let stop_signal = self.cfg.release.stop_signal.clone();
         let targets: Vec<String> = running
             .lines()
             .map(str::trim)
@@ -1062,6 +1064,11 @@ impl<'a> Engine<'a> {
                 let drain = self.docker().exec_sh(&target, cmd);
                 let _ = self.try_run(&drain, Access::Mutate);
             }
+            // Bounded graceful stop before removal (spec §7.10), symmetric with the
+            // worker path: SIGTERM lets the app drain in-flight requests before rm -f
+            // SIGKILLs. Best-effort like the removal it precedes.
+            let stop = self.docker().stop(std::slice::from_ref(&target), stop_timeout, &stop_signal);
+            let _ = self.try_run(&stop, Access::Mutate);
             let rm = self.docker().rm_f(&target);
             let _ = self.try_run(&rm, Access::Mutate);
         }
