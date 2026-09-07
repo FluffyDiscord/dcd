@@ -713,12 +713,8 @@ fn warn_compose_shape(cfg: &Config, model: &ComposeModel, reporter: &Reporter) {
 
     let upstream = cfg.deploy_root.join(&cfg.cutover.upstream_file);
     let router = model.service(&cfg.cutover.service);
-    let mounts_upstream = router.is_some_and(|service| {
-        service
-            .bind_sources()
-            .iter()
-            .any(|source| upstream.ends_with(source.trim_start_matches("./")) || source.ends_with(&cfg.cutover.upstream_file.display().to_string()))
-    });
+    let mounts_upstream = router
+        .is_some_and(|service| upstream_is_mounted(&upstream, &cfg.cutover.upstream_file, &service.bind_sources()));
     if !mounts_upstream {
         reporter.warn(&format!(
             "{} does not bind-mount {} — dcd writes the upstream file on the target, but only your compose file can put it inside the router",
@@ -726,6 +722,19 @@ fn warn_compose_shape(cfg: &Config, model: &ComposeModel, reporter: &Reporter) {
             cfg.cutover.upstream_file.display()
         ));
     }
+}
+
+/// Whether the router mounts a path the upstream file lands inside. Three shapes count,
+/// and the third is the one to reach for: dcd writes the upstream file staged-then-renamed
+/// (`ssh.rs::write_file_script`), so mounting the FILE pins the original inode and the
+/// router reloads the config it already had — mounting the directory above it is what
+/// survives. Split out from `warn_compose_shape` so the matching is covered without Docker.
+fn upstream_is_mounted(upstream: &Path, upstream_file: &Path, bind_sources: &[String]) -> bool {
+    bind_sources.iter().any(|source| {
+        upstream.ends_with(source.trim_start_matches("./"))
+            || source.ends_with(&upstream_file.display().to_string())
+            || (Path::new(source).is_absolute() && upstream.starts_with(source))
+    })
 }
 
 /// The escape hatch (spec §4.4): promote the stuck release and drop the stage lock —
@@ -1581,6 +1590,43 @@ stages:
         for spec in ["app", "app=", "=reg:tag", ""] {
             let error = image_pins(&[spec.to_string()]).unwrap_err().to_string();
             assert!(error.contains("must be service=reference"), "{spec}: {error}");
+        }
+    }
+
+    /// Mounting the directory is the shape the docs steer operators to — a single-file
+    /// mount pins the inode dcd renames away from — so warning about it was telling
+    /// them the correct config was wrong.
+    #[test]
+    fn a_directory_mount_above_the_upstream_file_counts_as_mounting_it() {
+        let upstream_file = Path::new("nginx-conf/upstream-block.conf");
+        let upstream = Path::new("/srv/app").join(upstream_file);
+
+        for source in ["/srv/app/nginx-conf", "/srv/app", "/srv/app/nginx-conf/upstream-block.conf"] {
+            assert!(
+                upstream_is_mounted(&upstream, upstream_file, &[source.to_string()]),
+                "{source} places the upstream file inside the router"
+            );
+        }
+
+        assert!(
+            upstream_is_mounted(&upstream, upstream_file, &["./nginx-conf/upstream-block.conf".to_string()]),
+            "the relative form compose absolutizes from is still recognised"
+        );
+    }
+
+    /// The warning has to keep firing for a router that mounts something else entirely,
+    /// including a sibling whose path merely shares a prefix STRING with the upstream
+    /// directory — `starts_with` compares components, which is what makes that safe.
+    #[test]
+    fn an_unrelated_mount_does_not_count_as_mounting_the_upstream_file() {
+        let upstream_file = Path::new("nginx-conf/upstream-block.conf");
+        let upstream = Path::new("/srv/app").join(upstream_file);
+
+        for source in ["/srv/app/certs", "/srv/other/nginx-conf", "/srv/app/nginx-conf-backup"] {
+            assert!(
+                !upstream_is_mounted(&upstream, upstream_file, &[source.to_string()]),
+                "{source} does not place the upstream file inside the router"
+            );
         }
     }
 }

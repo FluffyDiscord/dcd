@@ -1,6 +1,6 @@
 [package]
 name = "dcd"
-version = "0.5.3"
+version = "2.0.0"
 edition = "2021"
 # `File::try_lock`/`unlock` (the stage mutex) are std as of 1.89, which retired the
 # last unmaintained dependency (fs2, last released 2018). Declared so a toolchain
