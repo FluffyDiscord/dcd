@@ -124,14 +124,27 @@ registers tasks and hooks at the top level, and every hook is handed a `ctx`.
 | `set(k, v)` / `get(k)` | Scratch variables, the same store as `ctx.set`/`ctx.get`. |
 | `cfg` / `state` | The live config and deploy state. Mutable; the same tables as `ctx.cfg`/`ctx.state`. |
 
-Steps you can hook with `before_`/`after_`. Anything else is an error at load:
+These are the steps you can hook with `before_`/`after_`, in the order they run. Anything
+else is an error at load.
 
-`sync` · `preflight` · `ensure_upstream` · `pull` · `infra` · `migrate:before` ·
-`start:black` · `healthcheck` · `cutover` · `drain:red` · `migrate:after` · `workers` ·
-`finalize`
+| Step | What happens |
+|------|--------------|
+| `sync` | Copy the compose files to the server, plus the file that pins the image refs. |
+| `preflight` | Check the networks exist, create the `directories:` entries, remove containers left by earlier deploys. |
+| `ensure_upstream` | Point the router at the fallback if the current container is dead or the upstream file is missing. Runs before `infra` so a restarted router never points at a container that is gone. |
+| `pull` | Record every image tag in the state file, then pull. Recording first means a failed deploy's images can still be cleaned up later. |
+| `infra` | Start or recreate the supporting services — database, router, cache — and wait for their health checks. |
+| `migrate:before` | Run the pre-deploy migration in a throwaway container. Skipped if you set none. |
+| `start:black` | Create the new container and apply its restart policy. |
+| `healthcheck` | Poll the new container until its health check passes. If it never does, remove it and leave the old one serving. |
+| `cutover` | Write the new container into the upstream file and reload the router. **Past this point there is no automatic way back.** |
+| `drain:red` | Drain and remove the old app container, then the old workers. |
+| `migrate:after` | Run the post-deploy migration inside the new container. Make it idempotent — `--resume` can run it again. |
+| `workers` | Work out the worker names, then start one container per name. |
+| `finalize` | Mark the release active, save the state file, and remove images past the retention counts. |
 
-`configure` is not one of them — register it with `configure(fn)`. A `task()` is not one
-either; wire it into a step with `after('cutover', 'my_task')`.
+`configure` is not a step — register it with `configure(fn)`. A `task()` is not one either;
+wire it into a step with `after('cutover', 'my_task')`.
 
 ### ctx — doing things
 
