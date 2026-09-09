@@ -745,7 +745,7 @@ Loaded after config resolution, before plan execution. Zero plugins is valid (AD
 | `set(key, value)` / `get(key)` | | scratch var store (the same persistent `vars` table seen by `ctx`) |
 | `cfg` / `state` | table | the live config / current-stage state — the same **mutable** tables as `ctx.cfg` / `ctx.state` (§6.2) |
 
-`before`/`after` may only target a recipe task or another registered task; a hook referencing an unknown task → run error.
+`before`/`after` may only target a **recipe step** (§3), never a `task()` a plugin registered: nothing fires a registered task, so hooking one would be a hook that never runs. Both are load errors as of 2.0.1 — an unknown step at registration, and a hook body naming an unregistered task once every plugin has run — rather than the run error an `after_cutover` hook used to raise past the point of no return. A `task()` is a reusable body to *wire into* a slot, not a slot.
 
 ### 6.2 `ctx` (passed to every hook body)
 
@@ -794,7 +794,7 @@ Registered with `configure(fn)`; fires **once before the recipe**, with a host o
 
 ### 6.3 YAML hook actions (zero-Lua path)
 
-A `hooks.<slot>` entry is one typed action (a bare string = `run`), each mapping to the same effect as the `ctx` method of the same name: `run` · `exec_in: {service, cmd}` · `exec_in_release` · `docker: [args]` · `compose: [args]` · `cp_from_release: {from,to}` · `cp_to_release: {from,to}`. Slots: `before_<task>` / `after_<task>` for every §3 task.
+A `hooks.<slot>` entry is one typed action (a bare string = `run`), each mapping to the same effect as the `ctx` method of the same name: `run` · `exec_in: {service, cmd}` · `exec_in_release` · `docker: [args]` · `compose: [args]` · `cp_from_release: {from,to}` · `cp_to_release: {from,to}`. Slots: `before_<task>` / `after_<task>` for every §3 task, `:` written as `_`. The slot set is **derived from the recipe** (`config::hook_slots()` over `DEPLOY_STEPS`), never listed twice, and any other key is refused at load: a slot is a map key, so `deny_unknown_fields` cannot see it, and the engine only ever looks slots up — an unrecognised one would sit in the config looking wired and never fire. The same check guards a plugin's `before`/`after` at registration, where the slot string is built from the same input.
 
 ### 6.4 Sandboxing
 

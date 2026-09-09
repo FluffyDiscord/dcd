@@ -131,6 +131,45 @@ fn keep_images_rejects_the_release_service_so_the_rollback_target_survives() {
     assert!(err.to_string().contains("it is release.service"), "{err}");
 }
 
+fn with_hooks(slot: &str) -> String {
+    format!("{}\nhooks:\n  {slot}:\n    - 'echo hi'\n", sample())
+}
+
+#[test]
+fn every_step_takes_a_before_and_an_after_slot() {
+    for step in crate::engine::DEPLOY_STEPS {
+        let key = step.replace(':', "_");
+        for slot in [format!("before_{key}"), format!("after_{key}")] {
+            let c = load(&with_hooks(&slot), Some("prod"), &[], &env())
+                .unwrap_or_else(|e| panic!("{slot} must be accepted: {e}"));
+            assert!(c.hooks.contains_key(&slot), "{slot}");
+        }
+    }
+}
+
+#[test]
+fn a_hook_slot_that_no_step_fires_is_rejected() {
+    // Each of these parses as a map KEY, which `deny_unknown_fields` cannot see, and the
+    // engine only ever looks slots up — so a key nothing looks up runs silently never.
+    for slot in ["after_finalise", "before_pyll", "after_cutover_", "finalize", "on_deploy"] {
+        let err = match load(&with_hooks(slot), Some("prod"), &[], &env()) {
+            Ok(c) => panic!("'{slot}' names no step and must not load; accepted: {:?}", c.hooks.keys()),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains(slot), "error must name the offending slot: {msg}");
+        assert!(msg.contains("after_finalize"), "error must list the valid slots: {msg}");
+    }
+}
+
+#[test]
+fn the_colon_steps_are_spelled_with_an_underscore_in_a_slot() {
+    // `migrate:before` is the step, `before_migrate_before` its slot. The colon form is
+    // the natural typo, so it has to be refused rather than silently ignored.
+    let err = load(&with_hooks("'before_migrate:before'"), Some("prod"), &[], &env()).unwrap_err();
+    assert!(err.to_string().contains("before_migrate:before"), "{err}");
+}
+
 #[test]
 fn set_override_applies_after_interpolation() {
     let c = load(sample(), Some("prod"), &["retention.keep_releases=9".to_string()], &env()).unwrap();

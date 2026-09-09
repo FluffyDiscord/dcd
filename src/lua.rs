@@ -78,7 +78,30 @@ impl LuaHost {
                 .exec()
                 .map_err(|e| format!("{name}: {e}"))?;
         }
+        host.validate_task_refs()?;
         Ok(host)
+    }
+
+    /// A `before('cutover', 'warmup')` naming a task no plugin registered used to survive
+    /// until the slot fired, which for an `after_cutover` hook is past the point of no
+    /// return. Every plugin has run by now, so the task set is complete and this is the
+    /// last moment a bad reference is still cheap.
+    fn validate_task_refs(&self) -> Result<(), String> {
+        let tasks = self.tasks.borrow();
+        for (slot, refs) in self.hooks.borrow().iter() {
+            for href in refs {
+                let HookRef::Task(name) = href else { continue };
+                if !tasks.contains_key(name) {
+                    let mut known: Vec<&str> = tasks.keys().map(String::as_str).collect();
+                    known.sort_unstable();
+                    return Err(format!(
+                        "{slot} references unknown task `{name}` (registered: {})",
+                        if known.is_empty() { "none".to_string() } else { known.join(", ") }
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn has_hook(&self, slot: &str) -> bool {
@@ -246,6 +269,17 @@ impl LuaHost {
                 global,
                 self.lua.create_function(move |lua, (task, hook): (String, Value)| {
                     let slot = format!("{prefix}_{}", task.replace(':', "_"));
+                    // The engine only ever looks slots up, so a misspelled step here would
+                    // register a hook that never fires and never complains. A task defined
+                    // with `task()` is not a slot either: nothing fires one, so hooking it
+                    // is the same silent no-op under a friendlier name.
+                    let known = crate::config::hook_slots();
+                    if !known.iter().any(|candidate| candidate == &slot) {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "{prefix}('{task}'): no such step (known steps: {})",
+                            crate::engine::DEPLOY_STEPS.join(", ")
+                        )));
+                    }
                     let href = match hook {
                         Value::String(name) => HookRef::Task(name.to_str()?.to_string()),
                         Value::Function(func) => HookRef::Inline(lua.create_registry_value(func)?),
@@ -441,6 +475,46 @@ stages: { prod: {} }
     }
 
     #[test]
+    fn a_plugin_hook_on_a_step_that_does_not_exist_is_refused_at_load() {
+        // Same defect class as the YAML `hooks:` key: the slot string is built here and
+        // only ever looked up later, so a typo registers a hook that never fires.
+        let err = match LuaHost::load(&config(), &[("p".into(), "after('finalise', function() end)".into())]) {
+            Ok(_) => panic!("'finalise' names no step and must not load"),
+            Err(e) => e,
+        };
+        assert!(err.contains("finalise"), "must name the offending step: {err}");
+        assert!(err.contains("finalize"), "must list the real steps: {err}");
+    }
+
+    #[test]
+    fn a_registered_task_is_a_body_to_wire_in_not_a_step_to_hook() {
+        // `task()` defines a body; nothing ever fires one as a slot, so `after('warm', …)`
+        // would be the same silent no-op as a misspelled step.
+        let plugin = "task('warm', function() end) after('warm', function() end)";
+        let err = match LuaHost::load(&config(), &[("p".into(), plugin.into())]) {
+            Ok(_) => panic!("hooking a registered task must not load"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no such step"), "{err}");
+    }
+
+    #[test]
+    fn a_task_registered_after_the_hook_that_names_it_still_resolves() {
+        // The check runs once every plugin has executed, so declaration order is free.
+        let plugin = "after('cutover', 'warmup') task('warmup', function() end)";
+        LuaHost::load(&config(), &[("p".into(), plugin.into())]).unwrap();
+    }
+
+    #[test]
+    fn a_plugin_may_hook_every_real_step() {
+        for step in crate::engine::DEPLOY_STEPS {
+            let plugin = format!("before('{step}', function() end)");
+            let host = LuaHost::load(&config(), &[("p".into(), plugin)]).unwrap_or_else(|e| panic!("{step}: {e}"));
+            assert!(host.has_hook(&format!("before_{}", step.replace(':', "_"))), "{step}");
+        }
+    }
+
+    #[test]
     fn cfg_and_state_are_readable() {
         let plugin = r#"
             after('cutover', function(ctx)
@@ -525,18 +599,20 @@ stages: { prod: {} }
 
     #[test]
     fn unknown_task_reference_errors() {
+        // At LOAD, not when the slot fires: an after_cutover hook fires past the point of
+        // no return, so the run-time error this used to assert arrived too late to act on.
         // A distinctive name, not a word that could appear in an unrelated message:
         // `ghost` is five letters and could match by accident, which would let this
         // pass on the wrong error entirely.
         let missing = "no-such-task-zqx";
         let plugin = format!("after('cutover', '{missing}')");
-        let host = LuaHost::load(&config(), &[("p".into(), plugin)]).unwrap();
-        let err = host.fire(&FakeHost::default(), "after_cutover").unwrap_err();
+        let err = match LuaHost::load(&config(), &[("p".into(), plugin)]) {
+            Ok(_) => panic!("a hook naming an unregistered task must not load"),
+            Err(e) => e,
+        };
         assert!(err.contains(missing), "the error must name the task: {err}");
-        assert!(
-            err.contains("task") || err.contains("unknown"),
-            "and say what was wrong with it: {err}"
-        );
+        assert!(err.contains("unknown task"), "and say what was wrong with it: {err}");
+        assert!(err.contains("after_cutover"), "and name the slot it would have run in: {err}");
     }
 
     /// `LuaHost::load` EXECUTES the chunk, so the payload must be harmless if the

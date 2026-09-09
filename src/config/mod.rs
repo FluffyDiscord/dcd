@@ -554,6 +554,14 @@ pub fn authoring_schema() -> Result<serde_json::Value> {
         .map_err(|e| DcdError::Config(format!("cannot render the schema: {e}")))?;
     drop_required(&mut document);
 
+    // schemars renders `hooks` as an open object, so without this the editor — the first
+    // place an author sees a key checked — green-lights the very slot `validate_hook_slots`
+    // refuses. Set before `properties` is cloned into the stage override, so a stage's
+    // `hooks:` is held to the same set.
+    if let Some(hooks) = document.pointer_mut("/properties/hooks") {
+        hooks["propertyNames"] = serde_json::json!({ "enum": hook_slots() });
+    }
+
     let properties = document
         .get("properties")
         .cloned()
@@ -805,6 +813,7 @@ fn validate(config: &Config) -> Result<()> {
     validate_health_gate(config)?;
     validate_worker_rules(config)?;
     validate_directories(config)?;
+    validate_hook_slots(config)?;
     validate_keep_images(config)?;
     validate_env_rules(config)?;
     validate_no_placeholders_left(config)?;
@@ -965,6 +974,37 @@ fn validate_directories(config: &Config) -> Result<()> {
             return Err(DcdError::Config(format!(
                 "directories path '{}' must not contain '..'",
                 directory.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Every slot the engine will ever look up, `before_`/`after_` over the fixed recipe with
+/// `:` written as `_`. Derived from `DEPLOY_STEPS` rather than listed, so the set cannot
+/// drift from the recipe; the rollback and resume recipes are subsets of it.
+pub fn hook_slots() -> Vec<String> {
+    crate::engine::DEPLOY_STEPS
+        .iter()
+        .flat_map(|step| {
+            let key = step.replace(':', "_");
+            [format!("before_{key}"), format!("after_{key}")]
+        })
+        .collect()
+}
+
+/// A hook slot is a map KEY, so `deny_unknown_fields` cannot see it, and the engine only
+/// ever *looks slots up* — nothing reads a key no step fires, so a misspelled one used to
+/// validate clean, print nothing, and never run. Same reasoning as the `exec_in` check in
+/// `validate_with_model`: a hook that silently does not happen is worse than a refusal,
+/// and worst of all around cutover, where the deploy is past the point of no return.
+fn validate_hook_slots(config: &Config) -> Result<()> {
+    let slots = hook_slots();
+    for slot in config.hooks.keys() {
+        if !slots.iter().any(|known| known == slot) {
+            return Err(DcdError::Config(format!(
+                "hooks: '{slot}' is not a step slot, so nothing would ever run it (known slots: {})",
+                slots.join(", ")
             )));
         }
     }

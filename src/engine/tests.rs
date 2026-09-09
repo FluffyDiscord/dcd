@@ -1284,6 +1284,36 @@ fn an_image_pin_for_an_unknown_service_is_a_config_error() {
     assert!(message.contains("app"), "the error must list the known services: {message}");
 }
 
+/// `config::hook_slots()` (what a config may declare) and `run_step` (what the engine
+/// actually fires) each spell a colon step `migrate:before` as `migrate_before` on their
+/// own. Both would move together if one were edited, leaving the engine firing a slot no
+/// config could name — so one colon-derived slot is pinned end to end here.
+#[test]
+fn a_slot_derived_from_a_colon_step_really_fires() {
+    let source = cfg_src().replace(
+        "stages:\n  prod: {}",
+        "hooks:\n  before_migrate_before:\n    - 'echo pinned'\nstages:\n  prod: {}",
+    );
+    let cfg = config::load(&source, Some("prod"), &[], &HashMap::new()).unwrap();
+
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture_verbose(Mode::Plain);
+    let interrupt = Interrupt::inert();
+
+    let mut engine = Engine::new(cfg, &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts(), model());
+    engine.deploy().unwrap();
+
+    let fired: Vec<String> = runner.calls().iter().map(Argv::display).collect();
+    assert!(
+        fired.iter().any(|call| call.contains("echo pinned")),
+        "before_migrate_before never fired: {fired:?}"
+    );
+}
+
 /// §8.2: `docker compose config` inlines every resolved env value, so its stdout is
 /// the whole secret set. dcd's own model resolution bypasses the reporter, but a
 /// `compose:` hook or `ctx.compose` routes through `run_argv` — where `-v` would

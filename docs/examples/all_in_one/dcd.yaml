@@ -206,7 +206,8 @@ plugins: [plugins/app.lua]  # default: none
 #   start:black · healthcheck · cutover · drain:red · migrate:after · workers ·
 #   finalize
 # A slot key is `before_<step>` or `after_<step>`, with ':' written as '_'
-# (e.g. after_healthcheck, before_migrate_before).
+# (e.g. after_healthcheck, before_migrate_before). Any other key is REFUSED at load:
+# nothing looks it up, so it would sit in the file looking wired and never run.
 
 hooks:                                       # default: {} (none)
   before_pull:

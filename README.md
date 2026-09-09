@@ -89,17 +89,20 @@ registers tasks/hooks at the top level; each hook gets a `ctx`.
 
 | Function | Does |
 |----------|------|
-| `task(name, fn)` | define a step you can hook onto (`fn` gets `ctx`) |
-| `before(step, hook)` | run `hook` before a step — `hook` is a task name or `function(ctx)` |
-| `after(step, hook)` | run `hook` after a step |
+| `task(name, fn)` | define a reusable body (`fn` gets `ctx`) to wire into a slot by name |
+| `before(step, hook)` | run `hook` before a step — `hook` is a task name or `function(ctx)`. A step that does not exist is an error at load, never a hook that quietly never fires |
+| `after(step, hook)` | run `hook` after a step — same check |
 | `configure(fn)` | adjust `cfg` **once, before the deploy** (reads `state`/`env` to decide) |
 | `set(k, v)` / `get(k)` | scratch vars (same store as `ctx.set/get`) |
 | `cfg` / `state` | the live config / deploy state — **mutable**, same tables as `ctx.cfg`/`ctx.state` |
 
-Hook steps for `before_`/`after_`:
+Hook steps for `before_`/`after_` — the complete list, and anything else is an error at load:
 `sync` · `preflight` · `ensure_upstream` · `pull` · `infra` · `migrate:before` · `start:black` ·
 `healthcheck` · `cutover` · `drain:red` · `migrate:after` · `workers` · `finalize`
-(plus the special `configure`).
+
+`configure` is **not** among them — it is registered with `configure(fn)`, not hooked, and runs
+once before the recipe. A `task()` is not a step either: wire one into a slot with
+`after('cutover', 'my_task')`.
 
 ### `ctx` — effects
 

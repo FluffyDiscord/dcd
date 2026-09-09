@@ -188,6 +188,10 @@ is expanded everywhere afterwards, so `{project}-foo` namespaces per stage.
 - `workers.provider` needs **either** `static: [...]` **or** `command_in_release: '...'`.
 - `ssh:` (and `--ssh`) must not start with `-` — ssh would read it as an option, and
   `-oProxyCommand=` runs on the deploying machine.
+- Every **`hooks:` key** is `before_<step>` / `after_<step>` over the §2 step list, `:` written
+  as `_`. A key is data, not a field, so `deny_unknown_fields` cannot catch a typo — and the
+  engine only ever *looks slots up*, so an unknown slot would never fire and never say so. The
+  same rule refuses a Lua `before('…')` / `after('…')` naming no step, at plugin load.
 - Unknown keys are rejected, and every **v1** key names its v2 replacement rather than
   surfacing as "unknown field".
 
@@ -284,6 +288,8 @@ is expanded everywhere afterwards, so `{project}-foo` namespaces per stage.
 | `cannot reach <target> to take the <stage> lock` | ssh itself failed (auth, DNS, dropped link) — exit 6, not a held lock | fix the connection |
 | `not sweeping 'X'` / `no repository of P can be shown` (from `dcd gc --all`) | the repository is a Docker Hub name, not a registry host | expected for public images; set `registry:` to one you own |
 | ``unknown field `X` `` | typo | fix the key |
+| `hooks: 'X' is not a step slot, so nothing would ever run it (known: …)` | a misspelled hook slot (`after_finalise`), or a step name with no `before_`/`after_` prefix | use one of the listed slots; `:` in a step name is written `_` |
+| `before('X'): no such step (known: …)` (from a plugin) | a Lua `before`/`after` naming a step that does not exist | use a real step name — the colon form (`migrate:before`) is correct here, unlike in a YAML slot key |
 | `${VAR} is not set` | var in no chain file and not exported | add it to a chain layer, export it, or write `${VAR:-default}` |
 | `X in <file> is reserved (configures dcd's own tooling)` | `DOCKER_*`/`COMPOSE_*`/`PATH`/proxy var in a chain file | remove it |
 | `Too many levels of variable indirection in env vars: …` | circular `${VAR}` references | break the cycle |
