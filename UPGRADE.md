@@ -1,5 +1,28 @@
 # Upgrade notes
 
+## 2.0.1 → 2.0.2 (worker containers carry the project)
+
+`workers.name_prefix` now defaults to `{project}-{workers.service}-` instead of the bare
+`worker-`, so worker containers are named the way every other container dcd touches already
+is — `release.container_prefix` defaults to `{project}-{release.service}`, and compose names
+its own `{project}-{service}-{n}`. A project called `acme` with `workers.service: worker`
+gets `acme-worker-async` where it used to get `worker-async`.
+
+Nothing is required of you. Discovery and drain are by compose **service label**, never the
+name (INV-14), so the next deploy stops and removes the old containers and creates the new
+ones under the new name.
+
+- **To keep the old names**, pin them: `workers.name_prefix: 'worker-'`.
+- **New failure at `dcd check`:** the prefix must still not overlap
+  `release.container_prefix`, and a project-scoped default can now collide where a bare
+  `worker-` could not — `release.service: app` with `workers.service: app-worker` yields
+  `acme-app` and `acme-app-worker-`, which overlap. The check names both; pin a
+  non-overlapping `workers.name_prefix`. The overlap is real: `docker ps --filter name=` is
+  an unanchored match, so the two reapers would sweep each other's containers.
+- **Upgrading from v1 directly**: the one-time v1 worker reap below now sweeps the literal
+  `worker-` prefix as well as the configured one, so v1 consumers cannot survive under a
+  project-scoped default and keep draining the queue beside the new set.
+
 ## 2.0.0 → 2.0.1 (hook slots are validated)
 
 Four hook shapes that used to pass `dcd check` and then never run are now **errors at load**.
@@ -72,8 +95,9 @@ containers carry `com.docker.compose.service=worker-async` — which v2's
 first v2 deploy collides on the container name after cutover.
 
 While a stage has no v2 release recorded, `preflight` removes every container under
-`workers.name_prefix` whose compose service label is not `workers.service`, naming each one.
-Once a stage has a recorded release, its live workers are never swept.
+`workers.name_prefix` — and under the literal `worker-` v1 itself used, since 2.0.2 made the
+default project-scoped — whose compose service label is not `workers.service`, naming each
+one. Once a stage has a recorded release, its live workers are never swept.
 
 ### `latest` is back, as a branch tag
 

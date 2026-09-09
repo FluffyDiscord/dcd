@@ -88,6 +88,7 @@ services:                  # POLICY ONLY — identity comes from compose. Option
 workers:                   # optional
   service: worker          # ONE compose service; must NOT be release.service
   provider: { command_in_release: '...' }   # or { static: [a, b] }
+  name_prefix: 'worker-'   # container naming only (default: {project}-{workers.service}-)
 
 retention: { keep_releases: 1, keep_managed_images: 1, keep_images: {} }
 plugins: [plugins/app.lua] # resolved against THIS FILE's directory; run locally
@@ -177,8 +178,9 @@ is expanded everywhere afterwards, so `{project}-foo` namespaces per stage.
 - Exactly **one** of `release.service` / `release.run`.
 - `workers.service` **must not equal** `release.service`. Discovery is by compose service
   label, so sharing it would make worker drain stop the container serving traffic.
-- `workers.name_prefix` must not overlap `release.container_prefix` — `docker ps --filter
-  name=` is an unanchored match, so overlapping prefixes make the reapers sweep each other.
+- `workers.name_prefix` defaults to `{project}-{workers.service}-` and must not overlap
+  `release.container_prefix` — `docker ps --filter name=` is an unanchored match, so
+  overlapping prefixes make the reapers sweep each other.
 - `release.healthcheck.cmd` **must contain `{container}`**. Never target a network alias: red
   and black share the service's aliases, so an alias resolves to red and passes falsely.
 - `directories[].path` must be **relative** with no `..` — it is interpolated into a
@@ -275,7 +277,7 @@ is expanded everywhere afterwards, so `{project}-foo` namespaces per stage.
 | `service 'X' has no health gate` | a managed service with no `healthcheck:` | add one to the compose service, or give it a `wait:` probe |
 | `release service 'X' has no health gate` | the release has no gate at all | add `healthcheck:` to the compose service, or set `release.healthcheck` |
 | `workers.service 'X' must not equal release.service` | one service used for both | declare a second compose service (same image is fine) |
-| `workers.name_prefix 'X' overlaps release container prefix` | prefixes collide | rename one; `--filter name=` is an unanchored match |
+| `workers.name_prefix 'X' overlaps release container prefix` | prefixes collide — the default is `{project}-{workers.service}-`, so `release.service: app` beside `workers.service: app-worker` overlaps | pin a non-overlapping `workers.name_prefix`; `--filter name=` is an unanchored match |
 | `release.healthcheck.cmd must reference {container}` | hardcoded host/alias in the probe | use `http://{container}:<port>/…` |
 | `flock is required on the target` / `base64 is required…` | a minimal target image without them | install `util-linux` / `coreutils` (busybox provides both) |
 | `state has more than one cutover_pending release` | corrupt state | `dcd unlock <stage>` accepts the newest and demotes the rest |

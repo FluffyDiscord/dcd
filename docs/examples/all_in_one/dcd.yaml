@@ -172,7 +172,8 @@ workers:
   args: ['--memory-limit=256M'] # appended after each worker name, overriding the service's
                                 # `command` while keeping its entrypoint            (default: none)
   drain: 'app workers:stop'     # run inside each worker before stopping it         (optional)
-  name_prefix: 'worker-'        # container naming ONLY, never discovery  (default: worker-)
+  name_prefix: 'worker-'        # container naming ONLY, never discovery
+                                # (default: {project}-{workers.service}-)
                                 # Must not overlap release.container_prefix.
   stop_timeout: 120s            # `docker stop --timeout` when draining   (default: 120s)
   stop_signal: SIGTERM          # `docker stop --signal`                  (default: SIGTERM)

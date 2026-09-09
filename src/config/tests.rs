@@ -301,6 +301,24 @@ fn healthcheck_without_container_placeholder_is_rejected() {
     assert!(err.to_string().contains("{container}"));
 }
 
+/// Unpinned, worker containers carry the project the way every other container
+/// dcd touches does — `{project}-{service}-`, mirroring `release.container_prefix`
+/// and compose's own naming, rather than a bare `worker-` shared across projects.
+#[test]
+fn worker_containers_default_to_a_project_scoped_prefix() {
+    let c = load(sample(), Some("prod"), &[], &env()).unwrap();
+    let workers = c.workers.as_ref().unwrap();
+    assert_eq!(workers.name_prefix(&c.project), "demo-worker-");
+}
+
+#[test]
+fn a_pinned_worker_name_prefix_still_wins() {
+    let pinned = sample().replace("  service: worker\n", "  service: worker\n  name_prefix: 'w-'\n");
+    let c = load(&pinned, Some("prod"), &[], &env()).unwrap();
+    let workers = c.workers.as_ref().unwrap();
+    assert_eq!(workers.name_prefix(&c.project), "w-");
+}
+
 /// An overlapping prefix makes `docker ps --filter name=` (an unanchored match)
 /// sweep the other set's containers.
 #[test]

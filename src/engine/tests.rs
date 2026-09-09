@@ -114,8 +114,8 @@ fn full_deploy_records_the_pipeline_and_advances_state() {
     assert!(has("docker exec demo-nginx sh -c 'nginx -s reload'"));
     assert!(has("docker exec demo-app-1000 migrate after"));
     // N containers from ONE compose service — no rendered workers file (spec §7.12)
-    assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run -d --name worker-async --no-deps worker async"));
-    assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run -d --name worker-scheduler --no-deps worker scheduler"));
+    assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run -d --name demo-worker-async --no-deps worker async"));
+    assert!(has("docker compose -p demo --env-file /dev/null -f base.yml -f dcd-image-override.prod.yml run -d --name demo-worker-scheduler --no-deps worker scheduler"));
 
     // healthcheck targets the container NAME, never a shared alias (spec §7.7)
     assert!(!calls.iter().any(|c| c.contains("http://app-rr:")));
@@ -872,8 +872,8 @@ stages:
         .iter()
         .any(|c| c == &format!("{compose} run -d --name blogapp-app-1234 --use-aliases --no-deps app")));
     // static workers, one container each from the SAME service
-    assert!(calls.iter().any(|c| c == &format!("{compose} run -d --name worker-default --no-deps worker default")));
-    assert!(calls.iter().any(|c| c == &format!("{compose} run -d --name worker-mail --no-deps worker mail")));
+    assert!(calls.iter().any(|c| c == &format!("{compose} run -d --name blogapp-worker-default --no-deps worker default")));
+    assert!(calls.iter().any(|c| c == &format!("{compose} run -d --name blogapp-worker-mail --no-deps worker mail")));
     assert!(calls
         .iter()
         .any(|c| c == "docker exec blogapp-web sh -c 'wget -qO- http://blogapp-app-1234:9000/up'"));
@@ -920,7 +920,7 @@ fn chain_env_reaches_containers_as_bare_keys_with_overlays() {
     // workers are created with bare `-e KEY`, names only
     assert!(calls
         .iter()
-        .any(|c| c.contains("run -d --name worker-async") && c.contains("-e APP_SECRET") && !c.contains("hunter2")));
+        .any(|c| c.contains("run -d --name demo-worker-async") && c.contains("-e APP_SECRET") && !c.contains("hunter2")));
     let state_json = String::from_utf8(fs.read(std::path::Path::new("./dcd-state.json")).unwrap()).unwrap();
     assert!(!state_json.contains("hunter2"));
     assert!(!calls.iter().any(|c| c.contains("hunter2")), "no value in any argv");
@@ -947,12 +947,12 @@ fn worker_creation_carries_the_compose_env_overlay() {
     let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts(), model());
     engine.deploy().unwrap();
 
-    let overlay = runner.env_overlay_of("run -d --name worker-async").unwrap();
+    let overlay = runner.env_overlay_of("run -d --name demo-worker-async").unwrap();
     assert_eq!(overlay.get("REGISTRY").map(String::as_str), Some("reg"));
 
     // and the restart policy is re-applied, or the worker dies at the next reboot
     let calls = runner.display_calls();
-    assert!(calls.iter().any(|c| c == "docker update --restart unless-stopped worker-async"));
+    assert!(calls.iter().any(|c| c == "docker update --restart unless-stopped demo-worker-async"));
 }
 
 #[test]
@@ -1211,6 +1211,27 @@ worker-keep worker
     assert!(calls.iter().any(|c| c == "docker rm -f worker-async"), "{calls:?}");
     // ...and one already carrying the v2 service label is left alone
     assert!(!calls.iter().any(|c| c == "docker rm -f worker-keep"), "{calls:?}");
+}
+
+/// The default prefix became `{project}-{service}-`, so a v1 install's `worker-async`
+/// no longer matches the configured one. The reap must still sweep the prefix v1
+/// itself used, or those consumers keep draining the queue beside the new set.
+#[test]
+fn the_v1_reap_also_sweeps_the_prefix_v1_itself_used() {
+    let cfg = cfg();
+    let runner = RecordingRunner::new()
+        .with_stdout("inspect demo-postgres", "reg:db-1")
+        .with_stdout("list-transports", "async");
+    let fs = MemoryFs::new();
+    let clock = FixedClock(1000);
+    let reporter = Reporter::capture(Mode::Plain);
+    let interrupt = Interrupt::inert();
+    let mut engine = Engine::new(cfg.clone(), &runner, &fs, &clock, &reporter, &interrupt, State::default(), opts(), model());
+    engine.deploy().unwrap();
+
+    let calls = runner.display_calls();
+    assert!(calls.iter().any(|c| c.contains("name=^demo-worker-")), "{calls:?}");
+    assert!(calls.iter().any(|c| c.contains("name=^worker-")), "{calls:?}");
 }
 
 /// It is a one-time migration, not a per-deploy sweep: a stage that already has a

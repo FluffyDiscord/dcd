@@ -262,8 +262,8 @@ pub struct Workers {
     #[serde(default)]
     pub drain: Option<String>,
     /// Container naming only, NEVER discovery (INV-14).
-    #[serde(default = "worker_prefix")]
-    pub name_prefix: String,
+    #[serde(default)]
+    pub name_prefix: Option<String>,
     #[serde(default = "onehundredtwenty", deserialize_with = "de_secs")]
     #[schemars(schema_with = "duration_schema")]
     pub stop_timeout: u64,
@@ -274,6 +274,22 @@ pub struct Workers {
     /// Appended after each worker name on the `compose run` argv.
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+/// The prefix v1 gave worker containers, and v2.0's default. `reap_v1_workers`
+/// still sweeps it so a v1 installation upgrading straight to a project-scoped
+/// default does not leave its old consumers running beside the new ones.
+pub const LEGACY_WORKER_PREFIX: &str = "worker-";
+
+impl Workers {
+    /// `{project}-{service}-` unless the operator pinned it, matching both
+    /// `Release::container_prefix` and compose's own `{project}-{service}` naming.
+    pub fn name_prefix(&self, project: &str) -> String {
+        match &self.name_prefix {
+            Some(prefix) => prefix.clone(),
+            None => format!("{project}-{}-", self.service),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -378,10 +394,6 @@ fn localhost_backend() -> String {
 
 fn unless_stopped() -> String {
     "unless-stopped".to_string()
-}
-
-fn worker_prefix() -> String {
-    "worker-".to_string()
 }
 
 fn sigterm() -> String {
@@ -950,10 +962,10 @@ fn validate_worker_rules(config: &Config) -> Result<()> {
     }
 
     let container_prefix = config.release.container_prefix(&config.project);
-    if workers.name_prefix.starts_with(&container_prefix) || container_prefix.starts_with(&workers.name_prefix) {
+    let name_prefix = workers.name_prefix(&config.project);
+    if name_prefix.starts_with(&container_prefix) || container_prefix.starts_with(&name_prefix) {
         return Err(DcdError::Config(format!(
-            "workers.name_prefix '{}' overlaps release container prefix '{container_prefix}':              `docker ps --filter name=` is an unanchored match, so the reapers would sweep each other",
-            workers.name_prefix
+            "workers.name_prefix '{name_prefix}' overlaps release container prefix '{container_prefix}':              `docker ps --filter name=` is an unanchored match, so the reapers would sweep each other"
         )));
     }
 

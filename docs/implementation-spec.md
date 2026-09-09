@@ -422,7 +422,8 @@ workers:
   provider: { command_in_release: 'php bin/console app:worker:list --no-ansi --env=prod' }
   # provider: { static: [async, scheduler] }     # alternative
   drain: 'php bin/console messenger:stop-workers --env=prod'
-  name_prefix: 'worker-'               # default; container naming only, NEVER discovery (INV-14)
+  name_prefix: 'worker-'               # container naming only, NEVER discovery (INV-14)
+                                       # default: {project}-{workers.service}-
   stop_timeout: 120s                   # default; `docker stop --timeout`. Compose's stop options are NOT
   stop_signal: SIGTERM                 # default; `docker stop --signal`. baked into a `compose run`
   exclude: [failed]                    # names dropped from whatever the provider returns  (default: none)
@@ -833,7 +834,7 @@ unless an action explicitly asks for `sh -c`.
 ### 7.1 `preflight`
 - Networks come from the resolved compose model; dcd does **not** create them — `compose up` does. `preflight` only runs `docker network inspect` *(Read)* on each, to fail early and clearly rather than mid-deploy. The v1 derived default `<project>_default` is gone: under ADR-013 the compose file names the network (the §15 fixture declares `blogapp_net` while `project: blogapp`), so deriving one would inspect a network nothing uses.
 - For each `directories[]`: `mkdir -p`; if `owner` → `docker run --rm -v {deploy_root}:/wd busybox chown {owner} /wd/{path}` (unprivileged-safe chown).
-- **One-time v1 worker reap.** v1 generated one compose *service per worker* (`worker-async`, `worker-sched`), so those containers carry `com.docker.compose.service=worker-async` — which v2's discovery filter (`service={workers.service}`) never matches. Left alone they are never drained or removed, and §7.12's `compose run --name worker-async` then collides post-cutover on the first v2 deploy of **every existing installation**. So: when the stage has no v2 release recorded, `docker ps -a --filter label=com.docker.compose.project={project} --filter name=^{escaped workers.name_prefix}` *(Read)* → `docker rm -f` each container whose `com.docker.compose.service` label is not `{workers.service}` *(Mutate)*. Documented in UPGRADE.md's v2 entry.
+- **One-time v1 worker reap.** v1 generated one compose *service per worker* (`worker-async`, `worker-sched`), so those containers carry `com.docker.compose.service=worker-async` — which v2's discovery filter (`service={workers.service}`) never matches. Left alone they are never drained or removed, and §7.12's `compose run --name worker-async` then collides post-cutover on the first v2 deploy of **every existing installation**. So: when the stage has no v2 release recorded, `docker ps -a --filter label=com.docker.compose.project={project} --filter name=^{escaped prefix}` *(Read)* → `docker rm -f` each container whose `com.docker.compose.service` label is not `{workers.service}` *(Mutate)*. Run once per prefix: the configured `workers.name_prefix`, **and** the literal `worker-` v1 itself used, deduplicated — since the default became `{project}-{workers.service}-`, the configured prefix no longer matches a v1 install's `worker-async`, and those consumers would keep draining the queue beside the new set. Documented in UPGRADE.md's v2 entry.
 - **Orphan reaping:** `docker ps -a --filter name=^{escaped release.container_prefix}- --format '{{.Names}}'` *(Read)* — the filter is an **unanchored regex**, so the `^` and regex-escaping are mandatory; without them a decoy like `my-acme-app-sidecar` is swept by `docker rm -f`; for each not present in `state.releases` → `docker rm -f {name}` *(Mutate)*.
 - Failure → abort, red untouched.
 

@@ -9,7 +9,7 @@ use std::time::Instant;
 use indexmap::IndexMap;
 
 use crate::compose::ComposeModel;
-use crate::config::{Config, HookAction, Recreate};
+use crate::config::{Config, HookAction, Recreate, LEGACY_WORKER_PREFIX};
 use crate::docker::Docker;
 use crate::effects::{Access, Argv, Clock, CommandRunner, FileSystem, RunOpts};
 use crate::error::{DcdError, Result};
@@ -1100,8 +1100,9 @@ impl<'a> Engine<'a> {
             return Ok(Outcome::Skipped);
         }
         let env_keys = self.release_env_keys()?;
+        let name_prefix = workers.name_prefix(&self.cfg.project);
         for name in &names {
-            let container = format!("{}{}", workers.name_prefix, name);
+            let container = format!("{name_prefix}{name}");
             let argv = self
                 .docker()
                 .run_worker(&container, &workers.service, name, &workers.args, &env_keys);
@@ -1392,6 +1393,17 @@ impl<'a> Engine<'a> {
     /// alone they are never drained or removed, and the first v2 deploy then
     /// collides on the container name post-cutover. Runs once, while the stage has
     /// no v2 release recorded.
+    /// The configured prefix, plus the prefix v1 itself used. Since the default
+    /// became `{project}-{service}-`, a v1 installation's `worker-async` no longer
+    /// matches the configured one, and would keep consuming beside the new set.
+    fn v1_reap_prefixes(&self, workers: &crate::config::Workers) -> Vec<String> {
+        let configured = workers.name_prefix(&self.cfg.project);
+        if configured == LEGACY_WORKER_PREFIX {
+            return vec![configured];
+        }
+        vec![configured, LEGACY_WORKER_PREFIX.to_string()]
+    }
+
     fn reap_v1_workers(&mut self) -> Result<()> {
         let Some(workers) = self.cfg.workers.clone() else {
             return Ok(());
@@ -1399,14 +1411,20 @@ impl<'a> Engine<'a> {
         if self.stage().is_some_and(|stage| !stage.releases.is_empty()) {
             return Ok(());
         }
-        let argv = self.docker().labelled_ps_names(&workers.name_prefix);
-        let listing = self.list(&argv)?;
-        let stale: Vec<String> = listing
-            .lines()
-            .filter_map(|line| line.trim().split_once(' '))
-            .filter(|(_, service)| service.trim() != workers.service)
-            .map(|(name, _)| name.to_string())
-            .collect();
+        let mut stale: Vec<String> = Vec::new();
+        for prefix in self.v1_reap_prefixes(&workers) {
+            let argv = self.docker().labelled_ps_names(&prefix);
+            let listing = self.list(&argv)?;
+            for line in listing.lines() {
+                let Some((name, service)) = line.trim().split_once(' ') else {
+                    continue;
+                };
+                if service.trim() == workers.service || stale.iter().any(|seen| seen == name) {
+                    continue;
+                }
+                stale.push(name.to_string());
+            }
+        }
         for name in &stale {
             self.reporter
                 .warn(&format!("removing {name}, a v1 worker v2 discovery cannot see"));
