@@ -1,5 +1,21 @@
 # Upgrade notes
 
+## 2.0.0 → 2.0.1 (hook slots are validated)
+
+Four hook shapes that used to pass `dcd check` and then never run are now **errors at load**.
+None of them has ever fired on any deploy, so the error is the first report of a dead hook, not
+a regression — fix the name (every message lists the valid set) or delete the block.
+
+| Now refused | Why it never worked |
+|----|----|
+| `hooks: { after_finalise: … }` — any key that is not `before_`/`after_` + a real step | the engine only ever *looks slots up*; a key nothing looks up is never read. A slot is a map key, so `deny_unknown_fields` could not see it |
+| `hooks: { configure: … }` | `configure` is a Lua-only registration (`configure(fn)`), fired off the plugin host. Nothing has ever read `configure` from the YAML `hooks:` map |
+| `after('my_task', fn)` where `my_task` came from `task()` | nothing fires a registered task, so hooking one is a no-op. A `task()` is a body to wire **into** a slot — `after('cutover', 'my_task')` — not a slot itself |
+| `after('cutover', 'no_such_task')` | previously a **run** error, raised when the slot fired — for an `after_cutover` hook, past the point of no return. Now checked once every plugin has loaded |
+
+A config whose slots were already spelled correctly is unaffected. `dcd schema` now also
+constrains the `hooks` keys, so an editor flags the same typos inline.
+
 ## 0.5.x → v2 (SSH transport, compose-owned containers)
 
 v2 does not read a v1 `dcd.yaml`. No automatic conversion — every removed key errors with its
