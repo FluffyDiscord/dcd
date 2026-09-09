@@ -1,23 +1,32 @@
 # dcd
 
-Zero-downtime **red-black** Docker deploys from a YAML file. One static binary that runs on
-**your** machine — a CI runner or a laptop — and drives the target over SSH. Nothing is
-installed on the server.
+Deploy Docker containers without dropping a request, driven by one YAML file.
 
-It creates the new ("black") container from your compose service next to the live ("red") one,
-waits for its health gate, flips the router to it, and drains the old one — without dropping a
-request.
+dcd is a single static binary that runs on **your** machine — a CI runner or a laptop — and
+drives the server over SSH. Nothing is installed on the server.
 
-**Your compose file declares the containers; `dcd.yaml` declares the orchestration.** Images,
-env, volumes, restart policies and network aliases stay where you already write them.
+## How a deploy works
+
+1. Start the new container, from your compose service, next to the one serving traffic.
+2. Wait for its health check to pass.
+3. Point the router at the new container.
+4. Drain and remove the old one.
+
+If the new container never gets healthy, the old one keeps serving and nothing changed.
+
+The old and new containers are called red and black, and that is the name you will see in the
+rest of the docs.
+
+**Your compose file declares the containers. `dcd.yaml` declares the deploy.** Images, env,
+volumes, restart policies and network aliases stay where you already write them.
 
 ## Quickstart
 
 ```bash
-dcd init --from-compose docker-compose.prod.yml   # derive a dcd.yaml from what you have
-$EDITOR dcd.yaml                                  # name the app + router services
-dcd check prod                                    # validate it (no ssh, touches nothing)
-dcd deploy prod --dry-run                         # see every action, run nothing
+dcd init --from-compose docker-compose.prod.yml   # write a dcd.yaml from what you have
+$EDITOR dcd.yaml                                  # name the app and router services
+dcd check prod                                    # validate it; no ssh, changes nothing
+dcd deploy prod --dry-run                         # print every action, run none of them
 dcd deploy prod                                   # do it
 ```
 
@@ -25,145 +34,165 @@ dcd deploy prod                                   # do it
 
 | Command | What it does |
 |---------|--------------|
-| `dcd deploy [stage]` | the red-black deploy |
-| `dcd deploy --resume [stage]` | finish a deploy that died after the cutover |
-| `dcd rollback [stage]` | re-point to the previous release (code only — no migrations) |
-| `dcd unlock [stage]` | escape hatch: accept the stuck release as deployed and clear the stage lock |
-| `dcd status [stage]` | current release + history |
-| `dcd tasks [stage]` | print the step plan |
-| `dcd deploy --dry-run` | print every command, touch nothing |
-| `dcd gc [stage]` | reclaim disk: remove image versions past the retention counts (`--all` also offers host tags dcd never recorded, after asking) |
-| `dcd check [stage]` | validate the config |
-| `dcd init` | scaffold a `dcd.yaml` (`--with-plugin` adds a Lua stub) |
-| `dcd init --from-compose <file>` | derive a `dcd.yaml` from an existing compose file |
-| `dcd schema` | print a JSON Schema for `dcd.yaml`, for editor completion |
-| `dcd deploy -v [stage]` | trace every command: argv, exit code, elapsed, output |
-| `dcd --version` | the built version (`-V`) |
+| `dcd deploy [stage]` | Deploy. |
+| `dcd deploy --resume [stage]` | Finish a deploy that died after the switchover. |
+| `dcd rollback [stage]` | Point back at the previous release. Code only — no migrations. |
+| `dcd status [stage]` | Show the current release and the history. |
+| `dcd tasks [stage]` | Print the list of steps. |
+| `dcd deploy --dry-run` | Print every command, change nothing. |
+| `dcd gc [stage]` | Free disk space by removing old images. |
+| `dcd check [stage]` | Validate the config. |
+| `dcd init` | Write a starter `dcd.yaml`. `--with-plugin` adds a Lua stub. |
+| `dcd init --from-compose <file>` | Write a `dcd.yaml` from an existing compose file. |
+| `dcd schema` | Print a JSON Schema for `dcd.yaml`, for editor completion. |
+| `dcd unlock [stage]` | Last resort. Accept a stuck release as deployed and clear the lock. |
+| `dcd deploy -v [stage]` | Trace every command: argv, exit code, elapsed time, output. |
+| `dcd --version` | Print the version (`-V`). |
 
-Global flags: `--config <path>` · `--ssh <target>` · `--env-dir <path>` · `--env-file <path>` ·
+`dcd gc --all` also offers tags on the host that dcd never recorded, after asking.
+
+Flags: `--config <path>` · `--ssh <target>` · `--env-dir <path>` · `--env-file <path>` ·
 `--env-stdin` · `--json` · `--dry-run` · `--resume` · `--image <service>=<ref>` (repeatable) ·
-`--set path=value` (repeatable) · `--yes` · `--reason <text>` · `-v/--verbose` · `-V/--version`.
+`--set path=value` (repeatable) · `--yes` · `--reason <text>` · `-v/--verbose` ·
+`-V/--version`.
 
-Env comes from a Symfony-style dotenv chain next to `dcd.yaml` (`.env` → `.env.local` →
-`.env.<stage>` → `.env.<stage>.local`, real env wins). Every chain-defined key reaches the
-containers as a bare `-e KEY`, values riding a document on ssh **stdin** — no value ever
-appears in an argv on either machine, and dcd writes no env file anywhere. `--env-file
-.env.deploy` rebases the whole chain onto another base name (`.env.deploy` →
-`.env.deploy.local` → `.env.deploy.<stage>` → `.env.deploy.<stage>.local`), so dcd's chain can
-live beside the app's own `.env` files without colliding.
+## Secrets and environment
+
+Env comes from dotenv files next to `dcd.yaml`, read in this order, with later files winning
+and the real process environment beating all of them:
+
+```
+.env → .env.local → .env.<stage> → .env.<stage>.local
+```
+
+Every key defined there reaches the container as a bare `-e KEY`. The values travel over SSH
+on stdin, so no value ever appears in a command line on either machine, and dcd writes no env
+file anywhere.
+
+If your project already uses `.env`, move dcd's files onto another base name:
+
+```bash
+dcd deploy prod --env-file .env.deploy
+```
+
+That reads `.env.deploy` → `.env.deploy.local` → `.env.deploy.<stage>` →
+`.env.deploy.<stage>.local` and leaves the app's own files alone.
 
 ## When a deploy gets stuck
 
-A deploy that dies **after** the cutover leaves the new container live and the release recorded
-as incomplete. `dcd deploy` then refuses (exit 4) until you pick a way out:
+A deploy that dies **after** the switchover leaves the new container serving traffic and the
+release recorded as incomplete. `dcd deploy` then refuses to run (exit 4) until you choose:
 
 ```bash
 dcd status prod                # what is live, what is incomplete
-dcd deploy --resume prod       # finish it: drain the old one, migrate:after, workers, done
+dcd deploy --resume prod       # finish it: drain the old one, migrations, workers
 dcd rollback prod              # go back to the previous release instead
-dcd unlock prod                # accept what is live as done, and clear the lock
+dcd unlock prod                # accept what is live as done, clear the lock
 ```
 
-`unlock` is the last resort — resuming keeps failing, or a killed deploy left the stage locked.
-It marks the incomplete release active and current, and removes the stage lock **even while
-another dcd holds it**. That is all it does:
+Use `unlock` only when resuming keeps failing, or a killed deploy left the stage locked. It
+marks the incomplete release as current and removes the lock **even if another dcd still holds
+it**. That is all it does:
 
-- No containers started, stopped or removed. No migrations. No workers recreated. No hooks fire
-  — so nothing that already failed can block it.
-- It warns about each leftover by name; the next `dcd deploy` runs fresh and cleans them up.
-- With nothing incomplete, it only clears the lock.
+- It starts, stops and removes nothing. No migrations, no workers, no hooks — so nothing that
+  already failed can block it.
+- It names every leftover it sees. The next `dcd deploy` starts fresh and cleans them up.
+- With nothing incomplete, it just clears the lock.
 
 ## dcd.yaml
 
-Drives the orchestration — which service is cut over to, how traffic switches, migrations,
-drain, worker discovery, recreate policy, retention, and simple `hooks`. Containers themselves
-are declared in your compose file. The **common case needs no Lua**. See the fully-worked
-[example](docs/examples/roadrunner_app/) — config *and* its compose file.
+Declares the deploy: which service to switch to, how traffic moves, migrations, drain, how
+workers are found, recreate policy, retention, and simple hooks. The containers themselves
+live in your compose file.
+
+**The common case needs no Lua.** See the [worked example](docs/examples/roadrunner_app/) —
+config and its compose file.
 
 ## Lua plugins
 
-Only when YAML isn't enough. List them under `plugins: [plugins/app.lua]`. A plugin file
-registers tasks/hooks at the top level; each hook gets a `ctx`.
+For the cases YAML cannot express. List them under `plugins: [plugins/app.lua]`. A plugin
+registers tasks and hooks at the top level, and every hook is handed a `ctx`.
 
 ### Top-level functions
 
-| Function | Does |
-|----------|------|
-| `task(name, fn)` | define a reusable body (`fn` gets `ctx`) to wire into a slot by name |
-| `before(step, hook)` | run `hook` before a step — `hook` is a task name or `function(ctx)`. A step that does not exist is an error at load, never a hook that quietly never fires |
-| `after(step, hook)` | run `hook` after a step — same check |
-| `configure(fn)` | adjust `cfg` **once, before the deploy** (reads `state`/`env` to decide) |
-| `set(k, v)` / `get(k)` | scratch vars (same store as `ctx.set/get`) |
-| `cfg` / `state` | the live config / deploy state — **mutable**, same tables as `ctx.cfg`/`ctx.state` |
+| Function | What it does |
+|----------|--------------|
+| `task(name, fn)` | Define a reusable body, to wire into a step by name. `fn` receives `ctx`. |
+| `before(step, hook)` | Run `hook` before a step. `hook` is a task name or `function(ctx)`. A step that does not exist is an error at load. |
+| `after(step, hook)` | Run `hook` after a step. Same check. |
+| `configure(fn)` | Adjust `cfg` once, before the deploy starts. |
+| `set(k, v)` / `get(k)` | Scratch variables, the same store as `ctx.set`/`ctx.get`. |
+| `cfg` / `state` | The live config and deploy state. Mutable; the same tables as `ctx.cfg`/`ctx.state`. |
 
-Hook steps for `before_`/`after_` — the complete list, and anything else is an error at load:
-`sync` · `preflight` · `ensure_upstream` · `pull` · `infra` · `migrate:before` · `start:black` ·
-`healthcheck` · `cutover` · `drain:red` · `migrate:after` · `workers` · `finalize`
+Steps you can hook with `before_`/`after_`. Anything else is an error at load:
 
-`configure` is **not** among them — it is registered with `configure(fn)`, not hooked, and runs
-once before the recipe. A `task()` is not a step either: wire one into a slot with
-`after('cutover', 'my_task')`.
+`sync` · `preflight` · `ensure_upstream` · `pull` · `infra` · `migrate:before` ·
+`start:black` · `healthcheck` · `cutover` · `drain:red` · `migrate:after` · `workers` ·
+`finalize`
 
-### `ctx` — effects
+`configure` is not one of them — register it with `configure(fn)`. A `task()` is not one
+either; wire it into a step with `after('cutover', 'my_task')`.
 
-Routed through the engine, so they are **dry-run-safe** (and observable in `--dry-run`).
+### ctx — doing things
 
-| Call | Returns | Does |
-|------|---------|------|
-| `ctx.run(cmd)` | stdout | shell command on the target (in `deploy_root`) |
-| `ctx.in_release(cmd)` | stdout | run **inside the new app container** |
-| `ctx.exec_in(svc, cmd)` | stdout | run inside a managed service (e.g. `'nginx'`) |
-| `ctx.docker({args})` | stdout | raw `docker …` |
-| `ctx.compose({args})` | stdout | `docker compose …` (project + files already wired) |
-| `ctx.cp_from_release(src, dst)` | — | copy a file **out of** the new container |
-| `ctx.cp_to_release(src, dst)` | — | copy a file **into** the new container |
-| `ctx.read_file(path)` | string | read a file (relative to `deploy_root`) |
-| `ctx.write_file(path, s)` | — | write a file (skipped in `--dry-run`) |
+These go through the engine, so they are safe in `--dry-run` and show up there.
+
+| Call | Returns | What it does |
+|------|---------|--------------|
+| `ctx.run(cmd)` | stdout | Run a shell command on the server, in `deploy_root`. |
+| `ctx.in_release(cmd)` | stdout | Run it inside the new app container. |
+| `ctx.exec_in(svc, cmd)` | stdout | Run it inside a managed service, e.g. `'nginx'`. |
+| `ctx.docker({args})` | stdout | Raw `docker …`. |
+| `ctx.compose({args})` | stdout | `docker compose …`, project and files already wired. |
+| `ctx.cp_from_release(src, dst)` | — | Copy a file out of the new container. |
+| `ctx.cp_to_release(src, dst)` | — | Copy a file into the new container. |
+| `ctx.read_file(path)` | string | Read a file, relative to `deploy_root`. |
+| `ctx.write_file(path, s)` | — | Write a file. Skipped in `--dry-run`. |
 | `ctx.file_exists(path)` | bool | |
-| `ctx.env(name)` | string \| nil | read the resolved environment (process env over the dotenv chain) |
+| `ctx.env(name)` | string or nil | Read the resolved environment. Process env wins over the dotenv chain. |
 
-### `ctx` — utilities & debug
+### ctx — helpers
 
-| Call | Returns | Does |
-|------|---------|------|
-| `ctx.json_decode(s)` / `ctx.json_encode(v)` | value / string | JSON |
-| `ctx.yaml_decode(s)` / `ctx.yaml_encode(v)` | value / string | YAML |
-| `ctx.log(msg)` / `ctx.warn(msg)` | — | print to the deploy output |
-| `ctx.inspect(v)` | string | pretty-print a value as YAML |
-| `ctx.dump(v)` | — | log `v` as YAML; **`ctx.dump()` with no arg = `cfg` + `state`** |
+| Call | Returns | What it does |
+|------|---------|--------------|
+| `ctx.json_decode(s)` / `ctx.json_encode(v)` | value / string | JSON. |
+| `ctx.yaml_decode(s)` / `ctx.yaml_encode(v)` | value / string | YAML. |
+| `ctx.log(msg)` / `ctx.warn(msg)` | — | Print to the deploy output. |
+| `ctx.inspect(v)` | string | Pretty-print a value as YAML. |
+| `ctx.dump(v)` | — | Log `v` as YAML. With no argument, logs `cfg` and `state`. |
 
-### `ctx` — data
+### ctx — data
 
-`cfg` and `state` are **live**: assign with plain Lua
-(`ctx.cfg.retention.keep_releases = 5`) and the engine reads the change back before the next
-step — there is no setter function. Config applies to steps not yet run; state to what gets
-persisted. Structural fields fixed at deploy start (`images`, the container name,
-`deploy_root`) are snapshots.
+`cfg` and `state` are live. Assign to them with plain Lua
+(`ctx.cfg.retention.keep_releases = 5`) and the engine picks the change up before the next
+step. There is no setter function. Config changes affect steps that have not run yet; state
+changes affect what gets saved. A few fields are fixed when the deploy starts and are
+snapshots: `images`, the container name, `deploy_root`.
 
-| Field | Is | Mutable |
-|-------|-----|---------|
-| `ctx.cfg` | the parsed config | **yes** — change for later steps (retention, healthcheck, cutover, drain, workers…) |
-| `ctx.state` | current stage: `{ current, releases = [ { id, container, status, images, ran_migrations, reason } ] }` | **yes** — read back into deploy state; persisted once past cutover |
-| `ctx.vars` | scratch table shared across all hooks in a run | yes (not part of cfg/state) |
-| `ctx.set(k, v)` / `ctx.get(k)` | the same scratch store, by key | — |
-| `ctx.container` | the new (black) container name | no |
-| `ctx.stage` | the stage, e.g. `'prod'` | no |
+| Field | What it is | Mutable |
+|-------|------------|---------|
+| `ctx.cfg` | The parsed config. | Yes — affects later steps: retention, healthcheck, cutover, drain, workers. |
+| `ctx.state` | The current stage: `{ current, releases = [ { id, container, status, images, ran_migrations, reason } ] }`. | Yes — read back into deploy state, saved once past the switchover. |
+| `ctx.vars` | Scratch table shared by every hook in a run. | Yes. Not part of cfg or state. |
+| `ctx.set(k, v)` / `ctx.get(k)` | The same scratch store, by key. | — |
+| `ctx.container` | The new container's name. | No. |
+| `ctx.stage` | The stage, e.g. `'prod'`. | No. |
 
-> `ctx.state` is full power: you can rewrite `releases`/`current`/`status`, and you can
-> break rollback/resume (≤1 `cutover_pending`, etc.) — the engine trusts what you write.
+> `ctx.state` is full power. You can rewrite `releases`, `current` and `status`, and you can
+> break rollback and resume. The engine trusts whatever you write.
 
-> Raw `os.execute` / `io.open` / `io.popen` are sandboxed out — use `ctx.run(...)` so the action
-> shows up in `--dry-run`. `ctx.run('jq …')`, `ctx.run('bash script.sh')` are fair game.
+> `os.execute`, `io.open` and `io.popen` are blocked. Use `ctx.run(...)` so the action shows up
+> in `--dry-run`. `ctx.run('jq …')` and `ctx.run('bash script.sh')` are fine.
 
 ### Examples
 
 ```lua
--- bump retention on a canary deploy, before anything runs (plain assignment — no setter)
+-- keep more releases on a canary deploy, before anything runs
 configure(function(ctx)
   if ctx.env('CANARY') == '1' then ctx.cfg.retention.keep_releases = 5 end
 end)
 
--- generate centrifugo config from the running app, after health passes
+-- generate a config file from the running app, once it is healthy
 task('centrifugo', function(ctx)
   ctx.in_release('php bin/console app:realtime:config --output=/tmp/c.json')
   ctx.cp_from_release('/tmp/c.json', '.docker/centrifugo/config.json')
@@ -171,52 +200,53 @@ task('centrifugo', function(ctx)
 end)
 after('healthcheck', 'centrifugo')
 
--- print cfg + state to the deploy log for debugging
+-- print cfg and state to the deploy log
 after('cutover', function(ctx) ctx.dump() end)
 ```
 
 ## Container images
 
-Every release publishes the binary as `linux/amd64` + `linux/arm64` images on GHCR, in a
-Debian-slim and an Alpine flavour. The binary is statically linked, so either flavour can be
-copied into the **CI image that runs the deploy** (dcd runs there, not on the server):
+Every release publishes `linux/amd64` and `linux/arm64` images on GHCR, in a Debian-slim and
+an Alpine flavour. The binary is statically linked, so either flavour can be copied into the
+CI image that runs your deploy — dcd runs there, not on the server:
 
 ```dockerfile
-COPY --from=ghcr.io/fluffydiscord/dcd:0.5.3 /usr/local/bin/dcd /usr/local/bin/dcd
+COPY --from=ghcr.io/fluffydiscord/dcd:2.0.2 /usr/local/bin/dcd /usr/local/bin/dcd
 ```
 
-**A version tag is immutable and names one exact release. Pin it.** No `0.5` tag is published —
-a partial-version tag can only ever move you onto a build you did not choose.
+**Pin an exact version.** A version tag is immutable and names one release. No `2.0` tag is
+published — a partial version can only ever move you onto a build you did not choose.
 
 | Tag | What it points at |
 |-----|-------------------|
-| `0.5.3` | Debian-slim, the release `v0.5.3` |
-| `0.5.3-alpine` | Alpine, the same release |
+| `2.0.2` | Debian-slim, release `v2.0.2` |
+| `2.0.2-alpine` | Alpine, the same release |
 | `latest` | Debian-slim, the current tip of `master` |
 | `latest-alpine` | Alpine, the same build |
 
-Tag a release to publish one:
+Publish a release by tagging it:
 
 ```bash
-git tag v0.5.3 && git push origin v0.5.3
+git tag v2.0.2 && git push origin v2.0.2
 ```
 
-> **`latest` is not a release — do not deploy it.** It is rebuilt on every push to `master`, so
-> it is whatever the branch happens to be: untagged, unreleased, and moving under you between
-> two CI runs of the same pipeline. It exists to try the newest work, nothing more. A version
-> tag is the real release; prefer it everywhere, and in production use nothing else.
+> **`latest` is not a release. Do not deploy it.** It is rebuilt on every push to `master`, so
+> it is whatever the branch happens to be, and it can change between two runs of the same
+> pipeline. Use it to try the newest work. In production, use a version tag.
 
-## Build & test
+## Build and test
 
 ```bash
-cargo test                                                  # unit + integration, no Docker
-cargo test --test e2e -- --test-threads=1 --include-ignored      # real-Docker integration
+cargo test                                                       # unit + integration, no Docker
+cargo test --test e2e -- --test-threads=1 --include-ignored      # real Docker
 cargo test --test e2e_ssh -- --test-threads=1 --include-ignored  # a full deploy over ssh
-cargo build --release --target x86_64-unknown-linux-musl    # static binary
+cargo build --release --target x86_64-unknown-linux-musl         # static binary
 ```
 
 ## Docs
 
+- [Upgrade notes](UPGRADE.md) — what changed in each version, and what you have to do.
 - [Implementation spec](docs/implementation-spec.md) — the buildable contract.
-- [Strategic blueprint](docs/strategic-blueprint.md) — decisions + ADRs.
-- [RoadRunner example](docs/examples/roadrunner_app/) — a full deploy-script → `dcd.yaml` translation + CI wiring.
+- [Strategic blueprint](docs/strategic-blueprint.md) — decisions and ADRs.
+- [RoadRunner example](docs/examples/roadrunner_app/) — a full deploy script translated to
+  `dcd.yaml`, with CI wiring.

@@ -1,148 +1,154 @@
 # Upgrade notes
 
-## 2.0.1 → 2.0.2 (worker containers carry the project)
+Each section lists what changed and what you have to do. If a section says "nothing to do",
+upgrade and move on.
 
-`workers.name_prefix` now defaults to `{project}-{workers.service}-` instead of the bare
-`worker-`, so worker containers are named the way every other container dcd touches already
-is — `release.container_prefix` defaults to `{project}-{release.service}`, and compose names
-its own `{project}-{service}-{n}`. A project called `acme` with `workers.service: worker`
-gets `acme-worker-async` where it used to get `worker-async`.
+## 2.0.1 → 2.0.2
 
-Nothing is required of you. Discovery and drain are by compose **service label**, never the
-name (INV-14), so the next deploy stops and removes the old containers and creates the new
-ones under the new name.
+Worker containers now carry the project name.
 
-- **To keep the old names**, pin them: `workers.name_prefix: 'worker-'`.
-- **New failure at `dcd check`:** the prefix must still not overlap
-  `release.container_prefix`, and a project-scoped default can now collide where a bare
-  `worker-` could not — `release.service: app` with `workers.service: app-worker` yields
-  `acme-app` and `acme-app-worker-`, which overlap. The check names both; pin a
-  non-overlapping `workers.name_prefix`. The overlap is real: `docker ps --filter name=` is
-  an unanchored match, so the two reapers would sweep each other's containers.
-- **Upgrading from v1 directly**: the one-time v1 worker reap below now sweeps the literal
-  `worker-` prefix as well as the configured one, so v1 consumers cannot survive under a
-  project-scoped default and keep draining the queue beside the new set.
-
-## 2.0.0 → 2.0.1 (hook slots are validated)
-
-Four hook shapes that used to pass `dcd check` and then never run are now **errors at load**.
-None of them has ever fired on any deploy, so the error is the first report of a dead hook, not
-a regression — fix the name (every message lists the valid set) or delete the block.
-
-| Now refused | Why it never worked |
+| Before | After |
 |----|----|
-| `hooks: { after_finalise: … }` — any key that is not `before_`/`after_` + a real step | the engine only ever *looks slots up*; a key nothing looks up is never read. A slot is a map key, so `deny_unknown_fields` could not see it |
-| `hooks: { configure: … }` | `configure` is a Lua-only registration (`configure(fn)`), fired off the plugin host. Nothing has ever read `configure` from the YAML `hooks:` map |
-| `after('my_task', fn)` where `my_task` came from `task()` | nothing fires a registered task, so hooking one is a no-op. A `task()` is a body to wire **into** a slot — `after('cutover', 'my_task')` — not a slot itself |
-| `after('cutover', 'no_such_task')` | previously a **run** error, raised when the slot fired — for an `after_cutover` hook, past the point of no return. Now checked once every plugin has loaded |
+| `worker-async` | `acme-worker-async` |
 
-A config whose slots were already spelled correctly is unaffected. `dcd schema` now also
-constrains the `hooks` keys, so an editor flags the same typos inline.
+The new default is `{project}-{workers.service}-`. It matches how dcd already names the
+release container, and how compose names everything else.
 
-## 0.5.x → v2 (SSH transport, compose-owned containers)
+**Nothing to do.** dcd finds workers by their compose service label, not by their name, so
+the next deploy removes the old containers and starts the new ones.
 
-v2 does not read a v1 `dcd.yaml`. No automatic conversion — every removed key errors with its
-replacement, so `dcd check` is the checklist.
+- Want the old names? Pin them: `workers.name_prefix: 'worker-'`.
+- `dcd check` can now fail with *overlaps release container prefix*. This happens when one
+  prefix starts with the other — `release.service: app` together with
+  `workers.service: app-worker` gives `acme-app` and `acme-app-worker-`. Docker's
+  `--filter name=` matches anywhere in a name, so dcd's two cleanup passes would delete each
+  other's containers. Set a `workers.name_prefix` that does not overlap.
+- Coming from v1? The one-time v1 worker cleanup further down now also looks for the old
+  `worker-` names, so old consumers cannot keep running beside the new ones.
 
-- dcd runs on the deploying machine, over SSH. Drop the
-  `scp dcd dcd.yaml … && ssh server "cd … && ./dcd deploy"` wrapper; run `dcd deploy prod`
-  from the checkout.
-- Your compose file declares the containers — image, env, volumes, restart policy, network
-  alias, entrypoint, command. The release container is created with `docker compose run`
+## 2.0.0 → 2.0.1
+
+Four kinds of hook used to pass `dcd check` and then never run. They are now errors when the
+config loads. None of them ever fired on any deploy, so the error is the first you hear of a
+dead hook, not a new problem. Fix the name or delete the block — every message lists the
+names that work.
+
+| Now refused | Why it never ran |
+|----|----|
+| `hooks: { after_finalise: … }`, or any key that is not `before_`/`after_` plus a real step | dcd looks slots up by name. A key nothing looks up is never read. |
+| `hooks: { configure: … }` | `configure` is Lua-only, registered with `configure(fn)`. dcd never read it from the YAML `hooks:` map. |
+| `after('my_task', fn)`, where `my_task` came from `task()` | A task is a body you wire into a step — `after('cutover', 'my_task')` — not a step you can hook. |
+| `after('cutover', 'no_such_task')` | It used to fail while the deploy ran, which for an `after_cutover` hook is past the point of no return. Now checked once plugins have loaded. |
+
+Configs whose hooks were already spelled right are unaffected. `dcd schema` now covers the
+`hooks` keys too, so your editor flags the same typos as you type.
+
+## 0.5.x → v2
+
+v2 does not read a v1 `dcd.yaml`. There is no automatic conversion, but every removed key
+gives you an error naming its replacement — so run `dcd check` and work down the list.
+
+Two big changes:
+
+- **dcd runs on your machine now** and drives the server over SSH. Delete the
+  `scp dcd dcd.yaml … && ssh server "cd … && ./dcd deploy"` wrapper. Run `dcd deploy prod`
+  from your checkout.
+- **Your compose file owns the containers** — image, env, volumes, restart policy, network
+  alias, entrypoint, command. dcd creates the release container with `docker compose run`
   against your own service.
 
 ### Key by key
 
 | v1 | v2 |
 |----|----|
-| *(nothing)* | `ssh: deploy@host` — omit to keep driving a local Docker socket |
-| `docker.images.<name>: <tag>` | delete. Images come from the compose file; pin one per run with `--image <service>=<ref>` |
-| `docker.services.<name>.image` / `.container` | delete. Identity comes from the compose service |
-| `docker.services.<name>.recreate` / `.on_recreate_drain_workers` / `.wait` | move to top-level `services.<name>` (policy only) |
-| `network: x` | delete. Networks are declared in compose; dcd no longer creates them |
-| `release.image: app` | `release.service: app` (a compose service) |
-| `release.run.*` | delete — declare it on the compose service. Kept as `release.run` **only** for a project with no compose service for the app, where it is mutually exclusive with `service:` |
-| `release.healthcheck` | optional now: the compose service's own `healthcheck:` is the default gate. Keep it as the escape hatch when the image cannot self-probe. `exec_in` is now a **service** name |
-| `cutover.reload.exec_in: my-nginx` | a **service** name, and `cutover.service:` is now required |
-| `workers.template.*` | delete — declare a worker compose service instead |
-| `workers.compose_file` | delete. dcd renders no workers file; N containers come from ONE service |
-| `workers.name_filter` | `workers.name_prefix` — naming only. Discovery is by compose service label |
-| *(nothing)* | `workers.service` — required, and must **not** equal `release.service` |
-| `retention.keep_images` keyed by image logical | keyed by **compose service name** |
-| `plugins:` relative to `deploy_root` | relative to the **config file's directory**; they run locally and are never uploaded |
+| *(nothing)* | `ssh: deploy@host`. Leave it out to keep using a local Docker socket. |
+| `docker.images.<name>: <tag>` | Delete. Images come from the compose file. Pin one for a single run with `--image <service>=<ref>`. |
+| `docker.services.<name>.image` / `.container` | Delete. The compose service decides both. |
+| `docker.services.<name>.recreate` / `.on_recreate_drain_workers` / `.wait` | Move to top-level `services.<name>`. |
+| `network: x` | Delete. Networks come from compose; dcd no longer creates them. |
+| `release.image: app` | `release.service: app`, a compose service. |
+| `release.run.*` | Delete and declare it on the compose service. `release.run` survives only for projects with no compose service for the app, and cannot be combined with `service:`. |
+| `release.healthcheck` | Optional now. The compose service's own `healthcheck:` is the default. Keep it when the image cannot check itself. `exec_in` now takes a service name. |
+| `cutover.reload.exec_in: my-nginx` | Now a service name. `cutover.service:` is required. |
+| `workers.template.*` | Delete and declare a worker compose service instead. |
+| `workers.compose_file` | Delete. dcd writes no workers file; every worker comes from one service. |
+| `workers.name_filter` | `workers.name_prefix`. It only names containers — dcd finds them by compose service label. |
+| *(nothing)* | `workers.service`, required, and it must differ from `release.service`. |
+| `retention.keep_images` keyed by image | Keyed by compose service name. |
+| `plugins:` relative to `deploy_root` | Relative to the config file's own directory. They run on your machine and are never uploaded. |
 
-### Before the first deploy
+### Before your first v2 deploy
 
-- Health gate on every managed service. The release service and every service under
-  `services:` needs a compose `healthcheck:` or a `wait:` probe. Now an error:
-  `compose up --wait` returns as soon as a gate-less container is *running*.
-- `profiles: ["dcd-release"]` on the app and worker services. Optional; without it a hand-run
-  `docker compose up` starts a second app container beside the release.
-- Mount `{deploy_root}/{cutover.upstream_file}` into the router. dcd writes it; only your
-  compose file can put it inside the container.
-- Relative paths in compose are not uploaded — bind-mount sources, `env_file:` targets and
-  build contexts must already exist on the target. `dcd check` warns for bind-mount sources
-  only; check the other two yourself.
-- Deploying machine: `docker` with the compose plugin, plus `ssh`. Target: `docker`, `sshd`,
-  a POSIX shell, `flock`, `base64` (busybox covers the last two). `preflight` names what is
-  missing.
+- **Give every managed service a health check.** The release service and everything under
+  `services:` needs a compose `healthcheck:` or a `wait:` probe. Missing one is now an error:
+  `compose up --wait` returns as soon as a container without a check is merely running.
+- **Add `profiles: ["dcd-release"]`** to the app and worker services. Optional, but without it
+  a hand-run `docker compose up` starts a second app container next to the release.
+- **Mount `{deploy_root}/{cutover.upstream_file}` into the router.** dcd writes the file; only
+  your compose file can put it inside the container.
+- **Create anything compose refers to by relative path** on the server first — bind-mount
+  sources, `env_file:` targets, build contexts. dcd uploads none of them. `dcd check` warns
+  about bind-mount sources only; check the other two yourself.
+- **Install the tools.** Your machine needs `docker` with the compose plugin, plus `ssh`. The
+  server needs `docker`, `sshd`, a POSIX shell, `flock` and `base64` (busybox covers the last
+  two). `preflight` tells you what is missing.
 
-### v1 workers are reaped once
+### v1 workers are cleaned up once
 
-v1 generated one compose *service per worker* (`worker-async`, `worker-sched`), so those
-containers carry `com.docker.compose.service=worker-async` — which v2's
-`service=<workers.service>` filter never matches. Left alone they are never drained, and the
-first v2 deploy collides on the container name after cutover.
+v1 made one compose service per worker, so those containers are labelled
+`com.docker.compose.service=worker-async` — which v2's `service=<workers.service>` filter
+never matches. Left alone they are never drained, and the first v2 deploy hits a name clash
+after cutover.
 
-While a stage has no v2 release recorded, `preflight` removes every container under
-`workers.name_prefix` — and under the literal `worker-` v1 itself used, since 2.0.2 made the
-default project-scoped — whose compose service label is not `workers.service`, naming each
-one. Once a stage has a recorded release, its live workers are never swept.
+So while a stage has no v2 release recorded, `preflight` removes every container whose name
+starts with `workers.name_prefix` — or with the plain `worker-` that v1 used, since 2.0.2
+made the default include the project — and whose compose service label is not
+`workers.service`. It names each one as it goes. Once a stage has a recorded release, live
+workers are never touched.
 
 ### `latest` is back, as a branch tag
 
-`ghcr.io/fluffydiscord/dcd:latest` (and `latest-alpine`) is rebuilt on every push to `master`.
-It is the tip of the branch, not a release: untagged, unreleased, and free to move between two
-runs of the same pipeline. Use it to try unreleased work; never deploy it. A version tag is the
-release, and production pins one. Pushing a version tag can no longer repoint `latest` — the
-workflow emits it for a default-branch push alone, so the 0.5.2 downgrade cannot recur.
+`ghcr.io/fluffydiscord/dcd:latest` and `latest-alpine` are rebuilt on every push to `master`.
+
+That is the tip of the branch, not a release. It is untagged and unreleased, and it can move
+between two runs of the same pipeline. Use it to try unreleased work. Never deploy it —
+pin a version tag in production. Pushing a version tag no longer moves `latest`, so the 0.5.2
+downgrade cannot happen again.
 
 ## 0.5.1 → 0.5.3
 
-Bug fix, no configuration change. Retention converges instead of repeating itself.
+A bug fix. No configuration change.
 
-**0.5.2 was withdrawn** — same fix, but tagged before `latest` was removed, so its build
-published moving tags. Its images are deleted. Use 0.5.3.
+**Skip 0.5.2 — it was withdrawn.** Same fix, but it was tagged before `latest` was removed, so
+its build published moving tags. Its images are deleted.
 
-- No moving tags. `latest`, `latest-alpine`, `edge`, `edge-alpine` and the
-  `{{major}}.{{minor}}` tags are gone from the registry: the publish workflow sets
-  `latest=false`, emits only `{{version}}`, and runs on tag pushes alone. `latest` marked
-  whichever non-prerelease semver built last rather than the newest, so pushing an old tag
-  silently downgraded every consumer. Pin an exact version —
-  `ghcr.io/fluffydiscord/dcd:0.5.3`. (v2 brings `latest` back on different terms — see the v2
-  notes above.)
-- Evicting a release removed its container and image but never marked the release row done,
-  so `evictions`/`gc_candidates` re-derived the same long-dead work from `releases[]` on
-  **every** later deploy. `docker rm -f` answers `0` for a container that is already gone and
-  `docker image rm` answers `1 / No such image`, so no exit code ever showed it — it just
-  grew with the release history.
-- `Release` gains `reaped: bool` in `dcd-state.json`, set once teardown is complete. It
-  defaults to `false`, so no migration is needed: an existing state file gets one final
-  cleanup pass on the next deploy and settles afterwards.
-- History is not deleted. Evicted releases keep their rows and stay visible in `dcd status`;
-  only the retention pass ignores them.
-- A release is reaped only when Docker confirmed its container gone *and* its image settled.
-  An image proposed for removal and refused leaves the release unreaped, so it stays
-  proposable — that row is the only evidence dcd put the image on the host (INV-11).
-- `dcd gc` settles rows too, but only for releases whose container is already gone: `gc`
+- **Pin an exact version**, e.g. `ghcr.io/fluffydiscord/dcd:0.5.3`. `latest`, `latest-alpine`,
+  `edge`, `edge-alpine` and the `{{major}}.{{minor}}` tags are gone from the registry. The
+  publish workflow now sets `latest=false`, emits only `{{version}}`, and runs on tag pushes
+  alone. `latest` used to mark whichever release built last rather than the newest, so pushing
+  an old tag silently downgraded everyone. (v2 brings `latest` back on different terms — see
+  above.)
+- **The fix:** evicting a release removed its container and image but never marked the release
+  row as done, so every later deploy re-derived the same long-dead cleanup work. Nothing
+  showed it — `docker rm -f` answers 0 for a container that is already gone — it just grew
+  with the release history.
+- `Release` gains `reaped: bool` in `dcd-state.json`, set once teardown finishes. It defaults
+  to `false`, so no migration is needed: an existing state file gets one final cleanup pass on
+  the next deploy and then settles.
+- History is kept. Evicted releases keep their rows and still show in `dcd status`; only the
+  retention pass ignores them.
+- A release is marked done only once Docker confirms the container is gone *and* the image has
+  settled. An image that was proposed for removal and refused leaves the release open, so it
+  stays proposable — that row is the only record that dcd put the image on the host.
+- `dcd gc` settles rows too, but only for releases whose container is already gone. `gc`
   removes images, never containers.
 
 ## 0.5.0 → 0.5.1
 
-**Breaking default change, shipped in a patch release.** Retention keeps one previous release
-instead of three. Configs that already set `retention` explicitly are unaffected.
+**A default changed in a patch release.** Retention now keeps one previous release instead of
+three. Configs that set `retention` explicitly are unaffected.
 
-Keep the old behaviour:
+To keep the old behaviour:
 
 ```yaml
 retention:
@@ -150,111 +156,110 @@ retention:
   keep_managed_images: 2
 ```
 
-- `keep_releases` 3 → 1, `keep_managed_images` 2 → 1. Superseded releases count *in addition
-  to* the current one, so a stage holds current + 1 = 2 release images, down from current + 3
-  = 4.
+- `keep_releases` went 3 → 1 and `keep_managed_images` 2 → 1. Superseded releases count on top
+  of the current one, so a stage now holds 2 release images instead of 4.
 - `keep_managed_images` counts tags kept per managed image, newest first, **including the one
-  in use** — 1 keeps the running tag and no previous version.
-- Rollback to the immediately previous release still works. INV-6 is enforced directly:
-  retention spares the rollback target whatever `keep_releases` says. Before, a same-tag
-  redeploy could put the real target outside the keep window and delete its image, which
-  `keep_releases: 1` would have made routine.
-- `retention.keep_releases: 0` is rejected at `dcd check` — at 0 there is no local rollback
-  target and `dcd rollback` depends on the tag still being pullable.
+  in use**. At 1 you keep the running tag and nothing older.
+- Rolling back one release still works. Retention always spares the rollback target, whatever
+  `keep_releases` says. Before, redeploying the same tag could push the real target out of the
+  keep window and delete its image — which `keep_releases: 1` would have made routine.
+- `retention.keep_releases: 0` is rejected by `dcd check`. At 0 there is no local rollback
+  target, and `dcd rollback` needs the tag to still be pullable.
 - **Upgrading because the disk is full? Run `dcd gc <stage>` first.** A deploy pulls its new
-  image (step 3) long before it reclaims anything (step 12). `dcd gc` reclaims images only —
-  evicted release containers are reaped by the next deploy, and a tag a stopped container
-  still pins is kept.
+  image at step 3 and only reclaims space at step 12. `dcd gc` reclaims images only — evicted
+  containers are cleaned up by the next deploy, and a tag that a stopped container still holds
+  is kept.
 
 ## 0.4 → 0.5
 
-Image GC only ever saw tags from finished deploys, so images pulled by a deploy that later
-failed stayed on the host forever. Disks filled up while retention looked fine.
+Image cleanup only ever saw tags from finished deploys, so images pulled by a deploy that
+later failed stayed on the host forever. Disks filled up while retention looked healthy.
 
-- Every tag is recorded in `dcd-state.json` before it is pulled. Old state files work as-is;
-  the record starts empty and fills from the next deploy.
-- Tags no old state file recorded are NOT reclaimed by deploying — dcd has no record of them.
-  A host that is already full needs one `dcd gc <stage> --all`.
-- From then on, images left by a failed deploy are reclaimed like any other. Images of
-  retained releases are still never removed, and a stage no longer removes another stage's
-  rollback target (stages sharing one `deploy_root`, i.e. one state file).
-- New `dcd gc [stage]` — retention without deploying, for a host that is already full.
-  Removes only what dcd recorded.
-- New `dcd gc [stage] --all` — also offers tags on the host that dcd never recorded (pulled
-  by hand, or before the upgrade). Lists everything and asks first; `-y` skips the prompt,
-  `--dry-run` changes nothing. Skips Docker Hub repositories (`postgres`,
-  `bitnami/postgresql`) — those are not yours to delete.
-- New optional `retention.keep_images: {<image>: <count>}` — per-image override of
-  `keep_managed_images`. Rejected for `release.image`; `keep_releases` bounds that.
-- `workers.template.image` is now pulled and retention-bounded like every other image. Built
-  on the host and never pushed → the deploy now fails at `pull`. Push it, or point the
+- Every tag is now recorded in `dcd-state.json` before it is pulled. Old state files work as
+  they are; the record starts empty and fills from the next deploy.
+- **Tags that no old state file recorded are not reclaimed by deploying** — dcd has no record
+  of them. A host that is already full needs one `dcd gc <stage> --all`.
+- From then on, images left behind by a failed deploy are reclaimed like any other. Images of
+  retained releases are still never removed, and one stage no longer deletes another stage's
+  rollback target when they share a `deploy_root`.
+- New: `dcd gc [stage]` — retention without deploying, for a host that is already full. It
+  removes only what dcd recorded.
+- New: `dcd gc [stage] --all` — also offers tags on the host that dcd never recorded, pulled
+  by hand or before the upgrade. It lists everything and asks first. `-y` skips the prompt,
+  `--dry-run` changes nothing. Docker Hub repositories such as `postgres` and
+  `bitnami/postgresql` are skipped — those are not yours to delete.
+- New, optional: `retention.keep_images: {<image>: <count>}`, a per-image override of
+  `keep_managed_images`. Not allowed for `release.image`, which `keep_releases` already bounds.
+- `workers.template.image` is now pulled and retention-bounded like every other image. If you
+  build it on the host and never push it, the deploy now fails at `pull`. Push it, or point the
   template at an image dcd already pulls.
 
 ## 0.3 → 0.4
 
-`-v` is `--verbose`, not `--version`. The version short flag is now `-V`.
+**`-v` now means `--verbose`, not `--version`. The version flag is `-V`.**
 
-- `-v/--verbose` traces every command dcd spawns — argv, exit code, elapsed, and the
-  stdout/stderr that is otherwise captured and dropped unless the command fails. Under
-  `--json` it is two extra event kinds (`exec`, `exec_result`/`exec_error`).
-- Anything scripted against `dcd -v` for the version string must move to `-V`; `--version` is
+- `-v/--verbose` traces every command dcd runs: argv, exit code, elapsed time, and the output
+  that is otherwise dropped unless the command fails. Under `--json` it adds two event kinds,
+  `exec` and `exec_result`/`exec_error`.
+- Anything scripted against `dcd -v` for the version string must move to `-V`. `--version` is
   unchanged.
-- Env values still never appear in the trace: chain keys reach containers as a bare `-e KEY`,
-  so no argv carries a value.
+- Env values still never show up in the trace. Chain keys reach containers as a bare `-e KEY`,
+  so no argv ever carries a value.
 
 ## 0.2 → 0.3
 
-`--env-stdin` on its own is now the WHOLE chain: no `.env` is discovered next to `dcd.yaml`.
-Before, a stdin-only run still absorbed an implicitly discovered `.env`/`.env.local` from the
-config directory — shipping an application's own dotenv, dev credentials included, into every
-container.
+**`--env-stdin` on its own is now the whole chain.** No `.env` is picked up next to
+`dcd.yaml` any more. Before, a stdin-only run still absorbed whatever `.env`/`.env.local` sat
+in the config directory — which shipped the application's own dotenv, dev credentials
+included, into every container.
 
-- Piped secrets on stdin *and* relied on those implicit file layers? Add `--env-dir .` (or
-  `--env-file <base>`) to keep them — both still stack a stdin layer on top.
-- Run `dcd check <stage>` and compare the `env: loaded …` lines before and after upgrading; a
-  shrunken key set means you needed the flag.
-- `--env-file` and `--env-dir` runs are unaffected, as are runs without `--env-stdin`.
+- Piping secrets on stdin *and* relying on those files? Add `--env-dir .` or
+  `--env-file <base>` to keep them. Both still stack a stdin layer on top.
+- Run `dcd check <stage>` before and after upgrading and compare the `env: loaded …` lines. A
+  smaller key set means you needed the flag.
+- Runs using `--env-file` or `--env-dir`, and runs without `--env-stdin`, are unaffected.
 
 ## 0.1 → 0.2
 
-Env is loaded from a dotenv chain where dcd runs and passed through the process environment
-(`-e KEY`). dcd writes no env file. See `docs/implementation-spec.md` §5.2.
+Env now comes from a dotenv chain where dcd runs, and reaches containers through the process
+environment as `-e KEY`. dcd writes no env file. Details in
+`docs/implementation-spec.md` §5.2.
 
-Check the installed binary with `dcd --version` (`-V`).
+Check what you have installed with `dcd --version` (`-V`).
 
 ### Config
 
-- Remove `compose.env_file`; use the `compose.env` map — it is injected into the process
+- Remove `compose.env_file`. Use the `compose.env` map — it is injected into the process
   environment of every `docker compose` call.
-- Add the dotenv chain next to `dcd.yaml` (`--env-dir` overrides). Later wins, and the real
-  process environment wins over every file. Only keys defined in a chain file are delivered
-  to containers:
+- Put the dotenv chain next to `dcd.yaml` (`--env-dir` overrides the location). Later files
+  win, and the real process environment beats every file. Only keys defined in a chain file
+  reach containers:
 
   ```
   .env (or .env.dist) → .env.local → .env.<stage> → .env.<stage>.local → --env-stdin
   ```
 
-- The parser and layering are a port of symfony/dotenv 8.1: cross-layer `${VAR}` references
-  resolve deferred (a later layer overriding `REDIS_HOST` rewrites an earlier
-  `redis://${REDIS_HOST}`, forward references work, self-referencing `${VAR:-default}` sees
-  the pre-chain value), circular references are an error.
-- One deliberate divergence from upstream: an apostrophe *inside* a value is a literal
-  apostrophe unless its partner is on the same line, so `PASS=pa'ss` parses instead of opening
-  a run that swallows the following lines. Everything else is unchanged — `FOO="a b"`,
+- The parser and layering are a port of symfony/dotenv 8.1. `${VAR}` references across layers
+  resolve late, so a later layer overriding `REDIS_HOST` also rewrites an earlier
+  `redis://${REDIS_HOST}`; forward references work; a self-referencing `${VAR:-default}` sees
+  the value from before the chain. Circular references are an error.
+- One deliberate difference from upstream: an apostrophe inside a value is a literal
+  apostrophe unless its partner is on the same line, so `PASS=pa'ss` parses instead of
+  swallowing the following lines. Everything else behaves as upstream — `FOO="a b"`,
   `FOO='a'"$B"`, multi-line quoted values, `'bar '\'' baz'`, and `"` still has to be closed.
-- Project has its own `.env`/`.env.<stage>`? Rebase the whole chain onto a separate base with
-  `--env-file .env.deploy` (`.env.deploy` → `.env.deploy.local` → `.env.deploy.<stage>` →
-  `.env.deploy.<stage>.local`); the app's files are never read.
-- Remove `DOCKER_*`, `COMPOSE_*`, `PATH`, `HOME`, `LD_*`, `BUILDX_*` and proxy vars from chain
-  files — they are refused.
-- Add `env_include`/`env_exclude` (full-match regexes, exclude wins) to `release.run` and
-  `workers.template` to filter per container.
+- Project has its own `.env`/`.env.<stage>`? Move dcd's whole chain onto another base name
+  with `--env-file .env.deploy`, giving `.env.deploy` → `.env.deploy.local` →
+  `.env.deploy.<stage>` → `.env.deploy.<stage>.local`. The app's own files are never read.
+- Remove `DOCKER_*`, `COMPOSE_*`, `PATH`, `HOME`, `LD_*`, `BUILDX_*` and proxy variables from
+  chain files. They are refused.
+- `env_include`/`env_exclude` (full-match regexes, exclude wins) on `release.run` and
+  `workers.template` filter which keys each container gets.
 - `release.run.env_file` is unchanged.
 
 ### Compose
 
-- Remove service-level `env_file`; use bare `environment` names. Compose no longer reads an
-  implicit `.env` (`--env-file /dev/null` is pinned).
+- Remove service-level `env_file` and list bare `environment` names instead. Compose no longer
+  reads an implicit `.env` — dcd pins `--env-file /dev/null`.
 
   ```yaml
   # before
@@ -270,23 +275,23 @@ Check the installed binary with `dcd --version` (`-V`).
         - APP_SECRET
   ```
 
-- Compose runs with `deploy_root` as its working directory; relative `-f` paths resolve
+- Compose runs with `deploy_root` as its working directory, so relative `-f` paths resolve
   against it.
 - Recreate workers with `dcd deploy`. The generated workers compose file holds key names only
   and no longer works with a hand-run `docker compose up`.
 
 ### Runtime
 
-- `docker run -e KEY=VALUE` becomes `-e KEY`. Export the keys before replaying a printed
-  command by hand.
-- `dcd check <stage>` prints the loaded chain files and the key names each container class
-  receives.
-- Rollback and resume re-read today's chain and warn when the delivered key set differs from
-  the release's `env_keys` in `dcd-state.json`.
+- `docker run -e KEY=VALUE` is now `-e KEY`. Export the keys yourself before replaying a
+  printed command by hand.
+- `dcd check <stage>` prints which chain files loaded and which key names each kind of
+  container receives.
+- Rollback and resume re-read today's chain and warn when the delivered keys differ from the
+  release's `env_keys` in `dcd-state.json`.
 
-### Server
+### On the server
 
-Remove the leftover env file and rotate its secrets:
+Delete the leftover env file and rotate the secrets that were in it:
 
 ```bash
 rm <deploy_root>/compose.env
